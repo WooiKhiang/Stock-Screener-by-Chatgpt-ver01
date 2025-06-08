@@ -205,11 +205,22 @@ def scan_stock_all(
             pred_15b = today_close + np.std(closes[-15:]) * 2
         elif len(closes) >= 5:
             pred_5b = today_close + np.std(closes[-5:]) * 1.5
-            pred_15b = ""
+            pred_15b = None
         else:
-            pred_5b = pred_15b = ""
+            pred_5b = None
+            pred_15b = None
+        # Ensure scalar (not Series) and not NaN
+        def safe_fmt(val):
+            try:
+                if val is None or (isinstance(val, float) and np.isnan(val)):
+                    return ""
+                return f"{float(val):.2f}"
+            except Exception:
+                return ""
+        pred_5b_fmt = safe_fmt(pred_5b)
+        pred_15b_fmt = safe_fmt(pred_15b)
     except Exception:
-        pred_5b = pred_15b = ""
+        pred_5b_fmt = pred_15b_fmt = ""
     # --- AI confidence, reason, top pick logic ---
     score = 0
     reasons = []
