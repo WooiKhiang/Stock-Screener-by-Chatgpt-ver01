@@ -108,9 +108,8 @@ else:
 
 st.caption("Data source: Yahoo Finance")
 
-# --- Step 2: Institutional Accumulation Screener on NO-GO Days ---
+# --- Step 2: Institutional Accumulation Screener (always runs for testing) ---
 
-# --- 1. Your Watchlist (edit anytime) ---
 watchlist = ["SPY", "QQQ", "NVDA", "AAPL", "TSLA", "AMD", "META", "AMZN", "MSFT", "GOOGL"]
 
 def get_intraday_data(ticker):
@@ -167,48 +166,51 @@ def scan_stock(ticker, spy_change):
 
     # Reasoning
     reasons = []
-    if rs_score > 1:
+    if rs_score > 0:
         reasons.append("Strong RS")
     if price_above_vwap:
         reasons.append("VWAP Reclaim")
-    if price_above_ema10 and price_above_ema20 and price_above_ema50:
-        reasons.append("EMA Stack")
+    if price_above_ema10 and price_above_ema20:
+        reasons.append("EMA Alignment")
     if volume_spike:
         reasons.append("Volume Spike")
     if macd_bullish:
         reasons.append("MACD Bullish")
 
-    all_criteria = (rs_score > 1 and price_above_vwap and price_above_ema10 and
-                    price_above_ema20 and price_above_ema50 and volume_spike and macd_bullish)
+    # Less strict for debug (only needs RS, EMA10, EMA20)
+    all_criteria = (rs_score > 0 and price_above_ema10 and price_above_ema20)
 
     return {
         "Ticker": ticker,
         "Change %": f"{today_change:.2f}",
         "RS vs SPY": f"{rs_score:.2f}",
         "VWAP": "Yes" if price_above_vwap else "No",
-        "EMA Stack": "Yes" if price_above_ema10 and price_above_ema20 and price_above_ema50 else "No",
+        "EMA Align": "Yes" if price_above_ema10 and price_above_ema20 else "No",
         "Volume Spike": "Yes" if volume_spike else "No",
         "MACD Bullish": "Yes" if macd_bullish else "No",
         "Reasons": ", ".join(reasons),
         "Qualified": all_criteria
     }
 
-# --- 2. Run Screener only on NO-GO days ---
-if not go_day:
-    st.subheader("Institutional Accumulation Candidates (NO-GO Day)")
+# --- Run Screener (always, for now) ---
+st.subheader("Institutional Accumulation Screener (DEBUG)")
 
-    results = []
-    for ticker in watchlist:
-        result = scan_stock(ticker, spy_change)
-        if result and result["Qualified"]:
+results = []
+all_results = []
+for ticker in watchlist:
+    result = scan_stock(ticker, spy_change)
+    if result:
+        all_results.append(result)
+        if result["Qualified"]:
             results.append(result)
 
-    if results:
-        df_results = pd.DataFrame(results)
-        st.dataframe(df_results[["Ticker", "Change %", "RS vs SPY", "VWAP", "EMA Stack", "Volume Spike", "MACD Bullish", "Reasons"]])
-    else:
-        st.info("No accumulation setups found in current watchlist. Try again later in the day or expand your watchlist!")
-
+if results:
+    st.success("Qualified Accumulation Setups:")
+    st.dataframe(pd.DataFrame(results)[["Ticker", "Change %", "RS vs SPY", "VWAP", "EMA Align", "Volume Spike", "MACD Bullish", "Reasons"]])
 else:
-    st.subheader("GO Day: Focus on momentum/momentum scalping opportunities.")
+    st.info("No accumulation setups found in current watchlist with current criteria.")
 
+# DEBUG: Show all scan results, not just qualified
+if all_results:
+    st.write("All scan results (for debugging):")
+    st.dataframe(pd.DataFrame(all_results)[["Ticker", "Change %", "RS vs SPY", "VWAP", "EMA Align", "Volume Spike", "MACD Bullish", "Reasons"]])
