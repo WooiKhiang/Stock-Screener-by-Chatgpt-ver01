@@ -32,6 +32,12 @@ with st.sidebar.expander("Profit & Risk Planner", expanded=True):
     take_profit_pct = st.number_input("Take Profit (%)", value=2.0, min_value=0.5, max_value=10.0, step=0.1) / 100
     cut_loss_pct = st.number_input("Cut Loss (%)", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
 
+with st.sidebar.expander("Backtest (GO Day Open Breakout)", expanded=False):
+    run_backtest = st.checkbox("Run GO Day Backtest Now")
+    lookback_days = st.number_input("Backtest: Days", value=10, min_value=2, max_value=30, step=1)
+    backtest_tp = st.number_input("Backtest: Take Profit %", value=2.0, min_value=0.5, max_value=10.0, step=0.1) / 100
+    backtest_sl = st.number_input("Backtest: Stop Loss %", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
+
 watchlist = [
     "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMGN","AMT","AMZN","AVGO",
     "AXP","BA","BAC","BK","BKNG","BLK","BMY","BRK.B","C","CAT",
@@ -107,9 +113,6 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     if not (min_price <= price <= max_price and avg_vol >= min_avg_vol):
         return None
 
-    # --- Indicators
-    rs_score = today_change - spy_change
-
     vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
     price_above_vwap = today_close > float(vwap.iloc[-1])
     ema10 = float(today["Close"].ewm(span=10).mean().iloc[-1])
@@ -122,7 +125,7 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     price_above_ema50 = today_close > ema50
     price_above_ema200 = today_close > ema200
 
-    # EMA200 Breakout
+    # EMA200 Breakout (favorite)
     ema200_breakout = False
     if len(today) > ema200_lookback:
         for i in range(1, ema200_lookback + 1):
@@ -135,6 +138,20 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
                 break
         ema200_breakout = ema200_breakout and (today_close > ema200)
 
+    # VWAP/EMA20 Pullback logic
+    pullback = False
+    if len(today) > pullback_lookback:
+        for i in range(2, pullback_lookback + 1):
+            prev_low = float(today["Low"].iloc[-i])
+            prev_vwap = float(vwap.iloc[-i])
+            prev_ema20 = float(today["Close"].ewm(span=20).mean().iloc[-i])
+            if (
+                (abs(prev_low - prev_vwap) / prev_vwap < 0.0025 or abs(prev_low - prev_ema20) / prev_ema20 < 0.0025)
+                and (today_close > prev_vwap or today_close > prev_ema20)
+            ):
+                pullback = True
+                break
+
     # MACD
     exp12 = today["Close"].ewm(span=12).mean()
     exp26 = today["Close"].ewm(span=26).mean()
@@ -146,6 +163,9 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     last_hour = today.iloc[-12:]
     volume_spike = any(last_hour["Volume"] > 2 * avg_vol)
 
+    # RS vs SPY
+    rs_score = today_change - spy_change
+
     # Reasons
     reasons = []
     if rs_score > 0: reasons.append("Strong RS")
@@ -154,6 +174,7 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     if volume_spike: reasons.append("Volume Spike")
     if macd_bullish: reasons.append("MACD Bullish")
     if ema200_breakout: reasons.append(f"EMA200 Breakout ({ema200_lookback} bars)")
+    if pullback: reasons.append(f"VWAP/EMA20 Pullback ({pullback_lookback} bars)")
 
     # --- Trade management values ---
     target_price = price * (1 + take_profit_pct)
@@ -162,7 +183,7 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     position_size = int(capital / price) if price > 0 else 0
     max_loss = position_size * risk_per_share
 
-    # --- Prediction columns (simple extrapolation for fun)
+    # --- Prediction columns (simple extrapolation, daily not bar)
     pred_1d = price + price * (today_change/100)
     pred_3d = price + price * (today_change/100 * 3)
 
@@ -177,11 +198,6 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     accumulation_criteria = (
         rs_score > 0 and price_above_ema10 and price_above_ema20
     )
-
-    # --- AI PICK column ---
-    ai_pick = ""
-    pick_reason = ""
-    # Only pick 1 "AI pick" per run, we'll do it after all data loaded
 
     return {
         "Ticker": ticker,
@@ -206,30 +222,51 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         "GO": go_criteria,
         "NO-GO": nogo_criteria,
         "Accumulation": accumulation_criteria,
+        "EMA200 Breakout": ema200_breakout,
+        "Pullback Bounce": pullback,
         "Target Price": f"{target_price:.2f}",
         "Cut Loss Price": f"{cut_loss_price:.2f}",
         "Position Size": position_size,
         "Max Loss at Stop": f"{max_loss:.2f}",
-        "+1d Prediction": f"{pred_1d:.2f}",
-        "+3d Prediction": f"{pred_3d:.2f}",
-        "AI Pick": ai_pick,      # to be filled after
-        "Pick Reason": pick_reason
+        "Pred Close (+1d)": f"{pred_1d:.2f}",
+        "Pred Close (+3d)": f"{pred_3d:.2f}",
+        "AI Pick": "",
+        "Pick Reason": ""
     }
 
-# ---- Market Health
+# ---- Market Health + Sentiment Panel ----
 spy = get_data('SPY')
 qqq = get_data('QQQ')
+
+market_info = {}
 
 if not spy.empty and not qqq.empty:
     try:
         spy_change = (float(spy['Close'].iloc[-1]) - float(spy['Close'].iloc[-2])) / float(spy['Close'].iloc[-2]) * 100
         qqq_change = (float(qqq['Close'].iloc[-1]) - float(qqq['Close'].iloc[-2])) / float(qqq['Close'].iloc[-2]) * 100
+        spy_volume = float(spy['Volume'].iloc[-1])
+        spy_avg_volume = float(spy['Volume'].rolling(window=10).mean().iloc[-1])
+        spy_atr = float((spy['High'] - spy['Low']).rolling(window=14).mean().iloc[-1])
+        spy_vol_factor = spy_volume / spy_avg_volume if spy_avg_volume else 0
+        close_last = float(spy['Close'].iloc[-1])
+        atr_percent = spy_atr / close_last if close_last else 0
     except Exception:
-        spy_change = qqq_change = 0
-    st.subheader("Today's Market Conditions")
-    st.markdown(f"**SPY Change:** {spy_change:.2f}%")
-    st.markdown(f"**QQQ Change:** {qqq_change:.2f}%")
-    go_day = spy_change >= min_index_change and qqq_change >= min_index_change
+        spy_change = qqq_change = spy_volume = spy_avg_volume = spy_atr = spy_vol_factor = close_last = atr_percent = 0
+    go_day = (
+        spy_change >= min_index_change and
+        qqq_change >= min_index_change and
+        spy_vol_factor >= volume_factor and
+        atr_percent <= max_atr_percent
+    )
+    st.subheader("Today's Market Sentiment Breakdown")
+    st.markdown(f"- **GO/NO-GO Signal:** {'🟢 GO DAY' if go_day else '🔴 NO-GO DAY'}")
+    st.markdown(f"- **Market Trend:** {'Up' if spy_change > 0 else 'Down' if spy_change < 0 else 'Flat'}")
+    st.markdown(f"- **SPY Change:** {spy_change:.2f}% &nbsp;&nbsp; **QQQ Change:** {qqq_change:.2f}%")
+    st.markdown(f"- **Liquidity:** {spy_vol_factor:.2f}x vs avg")
+    st.markdown(f"- **Volatility (ATR%):** {atr_percent:.3f}")
+    st.markdown(f"- **Big Players:** {'High' if spy_vol_factor > 1.5 else 'Normal'} (via rel vol)")
+    st.markdown(f"- **Sentiment:** {'Greedy' if spy_change > 0.5 else 'Cautious' if spy_change < 0 else 'Neutral'}")
+    st.markdown(f"- **Catalyst/Risk:** {'Watch economic events, earnings season' if abs(spy_change) > 1 else 'No major event'}")
 else:
     st.warning("Could not load recent market data. Try again later.")
     go_day = False
@@ -255,31 +292,23 @@ if not df_results.empty:
         picks = df[(df['GO']) & (df['Rel Vol'].astype(float) > 1) & (df['Price'].astype(float) > 10) & (df['Price'].astype(float) < 100)]
         if not picks.empty:
             best_idx = picks['RS vs SPY'].astype(float).idxmax()
-            df.at[best_idx, 'AI Pick'] = "YES"
-            df.at[best_idx, 'Pick Reason'] = "Top RS, high volume, breakout play"
+            df_results.at[best_idx, "AI Pick"] = "🔥"
+            df_results.at[best_idx, "Pick Reason"] = "Top RS & Rel Vol"
     else:
-        # Pick: NO-GO, lowest drop, highest volume
-        picks = df[(df['NO-GO'])]
-        if not picks.empty:
-            best_idx = picks['Change %'].astype(float).idxmax()
-            df.at[best_idx, 'AI Pick'] = "YES"
-            df.at[best_idx, 'Pick Reason'] = "Most resilient, defensive setup"
-    # If no above, fallback to Accumulation/EMA200 Breakout
-    if "YES" not in df['AI Pick'].values:
-        picks = df[(df['Accumulation'])]
+        # Pick: Defensive or Accumulation
+        picks = df[df['NO-GO'] | df['Accumulation']]
         if not picks.empty:
             best_idx = picks['Rel Vol'].astype(float).idxmax()
-            df.at[best_idx, 'AI Pick'] = "YES"
-            df.at[best_idx, 'Pick Reason'] = "High volume, early institutional move"
-    df_results = df
+            df_results.at[best_idx, "AI Pick"] = "🛡️"
+            df_results.at[best_idx, "Pick Reason"] = "Defensive/Accum"
 
-# ---- SHOW DASHBOARDS ----
-cols = [
-    "Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol",
-    "RS vs SPY", "VWAP", "EMA 10", "EMA 20", "EMA 50", "EMA 200",
-    "MACD Bullish", "Volume Spike", "Reasons",
-    "Target Price", "Cut Loss Price", "Position Size", "Max Loss at Stop",
-    "+1d Prediction", "+3d Prediction", "AI Pick", "Pick Reason"
+# ---- Table Sections ----
+common_cols = [
+    "Ticker", "Price", "Open", "Close", "High", "Low", "Change %",
+    "Volume", "Avg Volume", "Rel Vol", "RS vs SPY",
+    "VWAP", "EMA 10", "EMA 20", "EMA 50", "EMA 200", "MACD Bullish", "Volume Spike",
+    "Reasons", "Pred Close (+1d)", "Pred Close (+3d)", "AI Pick", "Pick Reason",
+    "Target Price", "Cut Loss Price", "Position Size", "Max Loss at Stop"
 ]
 
 def show_section(title, filter_column):
@@ -287,15 +316,17 @@ def show_section(title, filter_column):
     if not df_results.empty:
         df = df_results[df_results[filter_column] == True]
         if not df.empty:
-            st.dataframe(df[cols])
+            st.dataframe(df[common_cols])
         else:
             st.info(f"No stocks meet {title.lower()} criteria.")
     else:
         st.info("No data for stock screening.")
 
-show_section("Go Day Stock Recommendations", "GO")
-show_section("No-Go Day Stock Recommendations", "NO-GO")
-show_section("Potential Institutional Accumulation", "Accumulation")
+show_section("Go Day Stock Recommendations (Momentum/Breakout)", "GO")
+show_section("No-Go Day Stock Recommendations (Defensive)", "NO-GO")
+show_section("Institutional Accumulation Screener", "Accumulation")
+show_section("EMA200 Breakout Reversal Screener", "EMA200 Breakout")
+show_section("VWAP/EMA20 Pullback Bounce Screener", "Pullback Bounce")
 
 # ---- ALERTS: Only for new, one per session ----
 if 'alerted_tickers' not in st.session_state:
@@ -306,7 +337,9 @@ for _, row in df_results.iterrows():
     for section_name, filter_col in [
         ("GO Day", "GO"),
         ("No-Go Day", "NO-GO"),
-        ("Institutional Accumulation", "Accumulation")
+        ("Institutional Accumulation", "Accumulation"),
+        ("EMA200 Breakout", "EMA200 Breakout"),
+        ("VWAP/EMA20 Pullback", "Pullback Bounce")
     ]:
         if row[filter_col]:
             ticker = row["Ticker"]
@@ -322,5 +355,44 @@ for _, row in df_results.iterrows():
                 add_to_alert_log(ticker, section_name)
                 alerted_tickers.add((ticker, section_name))
 st.session_state['alerted_tickers'] = alerted_tickers
+
+# ---- BACKTEST MODULE ----
+if run_backtest:
+    st.subheader(f"GO Day Backtest Results (last {lookback_days} days)")
+    bt_results = []
+    for ticker in watchlist:
+        df = yf.download(ticker, period=f"{lookback_days+2}d", interval='5m', progress=False)
+        if df.empty: continue
+        df['Date'] = df.index.date
+        day_groups = df.groupby('Date')
+        for d, group in day_groups:
+            if len(group) < 20: continue
+            o = group['Open'].iloc[0]
+            h = group['High'].max()
+            l = group['Low'].min()
+            c = group['Close'].iloc[-1]
+            tp = o * (1 + backtest_tp)
+            sl = o * (1 - backtest_sl)
+            hit_tp = (group['High'] >= tp).any()
+            hit_sl = (group['Low'] <= sl).any()
+            win = None
+            if hit_tp and hit_sl:
+                tp_idx = group[group['High'] >= tp].index[0]
+                sl_idx = group[group['Low'] <= sl].index[0]
+                win = tp_idx < sl_idx
+            elif hit_tp:
+                win = True
+            elif hit_sl:
+                win = False
+            else:
+                win = c > o
+            bt_results.append({'Ticker': ticker, 'Date': d, 'Open': o, 'Close': c, 'TP_hit': hit_tp, 'SL_hit': hit_sl, 'Win': win})
+    if bt_results:
+        df_bt = pd.DataFrame(bt_results)
+        win_rate = df_bt['Win'].mean() * 100
+        st.markdown(f"**Backtest Win Rate:** {win_rate:.2f}%  (sample size: {len(df_bt)})")
+        st.dataframe(df_bt.tail(100))
+    else:
+        st.info("No backtest results found. Try a smaller watchlist or different settings.")
 
 # END OF SCRIPT
