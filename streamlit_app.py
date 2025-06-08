@@ -3,6 +3,9 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 import requests
+import os
+import csv
+from datetime import date
 
 st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
@@ -382,17 +385,20 @@ alerted_tickers = st.session_state['alerted_tickers']
 
 def alert_for_section(section_name, filter_col):
     if not df_results.empty:
-        new_hits = df_results[(df_results[filter_col] == True) & (~df_results["Ticker"].isin(alerted_tickers))]
+        new_hits = df_results[df_results[filter_col] == True]
         for _, row in new_hits.iterrows():
-            alert_msg = (
-                f"📈 {section_name} ALERT!\n"
-                f"Ticker: {row['Ticker']}\n"
-                f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
-                f"Position: {row['Position Size']} shares | Max Loss: ${row['Max Loss at Stop']}\n"
-                f"Reasons: {row['Reasons']}"
-            )
-            send_telegram_alert(alert_msg)
-            alerted_tickers.add(row["Ticker"])
+            ticker = row["Ticker"]
+            # Only alert if not alerted today
+            if not was_alerted_today(ticker, section_name):
+                alert_msg = (
+                    f"📈 {section_name} ALERT!\n"
+                    f"Ticker: {ticker}\n"
+                    f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
+                    f"Position: {row['Position Size']} shares | Max Loss: ${row['Max Loss at Stop']}\n"
+                    f"Reasons: {row['Reasons']}"
+                )
+                send_telegram_alert(alert_msg)
+                add_to_alert_log(ticker, section_name)
 
 alert_for_section("GO Day", "GO")
 alert_for_section("No-Go Day", "NO-GO")
@@ -401,3 +407,20 @@ alert_for_section("EMA200 Breakout", "EMA200 Breakout")
 alert_for_section("VWAP/EMA Pullback", "Pullback Bounce")
 
 st.session_state['alerted_tickers'] = alerted_tickers
+
+ALERT_LOG = "alerts_log.csv"
+
+def was_alerted_today(ticker, section_name):
+    today_str = str(date.today())
+    if os.path.exists(ALERT_LOG):
+        with open(ALERT_LOG, "r") as f:
+            for row in csv.reader(f):
+                if len(row) == 3 and row[0] == today_str and row[1] == section_name and row[2] == ticker:
+                    return True
+    return False
+
+def add_to_alert_log(ticker, section_name):
+    today_str = str(date.today())
+    with open(ALERT_LOG, "a", newline="") as f:
+        csv.writer(f).writerow([today_str, section_name, ticker])
+
