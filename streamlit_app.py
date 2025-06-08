@@ -183,9 +183,9 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     position_size = int(capital / price) if price > 0 else 0
     max_loss = position_size * risk_per_share
 
-    # --- Prediction columns (simple extrapolation, daily not bar)
-    pred_1d = price + price * (today_change/100)
-    pred_3d = price + price * (today_change/100 * 3)
+    # --- Prediction columns (simple extrapolation, not a true model)
+    proj_1x = price * (1 + today_change/100)
+    proj_3x = price * (1 + today_change/100*3)
 
     # --- GO/NO-GO/ACCUMULATION (strategy as before) ---
     go_criteria = (
@@ -198,6 +198,17 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     accumulation_criteria = (
         rs_score > 0 and price_above_ema10 and price_above_ema20
     )
+
+    # Confidence Score for AI pick (max 7 pts, turn to %)
+    ai_conf = (
+        int(rs_score > 0) +
+        int(price_above_vwap) +
+        int(price_above_ema10 and price_above_ema20) +
+        int(volume_spike) +
+        int(macd_bullish) +
+        int(ema200_breakout) +
+        int(pullback)
+    ) / 7 * 100
 
     return {
         "Ticker": ticker,
@@ -228,17 +239,15 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         "Cut Loss Price": f"{cut_loss_price:.2f}",
         "Position Size": position_size,
         "Max Loss at Stop": f"{max_loss:.2f}",
-        "Pred Close (+1d)": f"{pred_1d:.2f}",
-        "Pred Close (+3d)": f"{pred_3d:.2f}",
+        "Momentum Proj (+1x)": f"{proj_1x:.2f}",
+        "Momentum Proj (+3x)": f"{proj_3x:.2f}",
         "AI Pick": "",
-        "Pick Reason": ""
+        "AI Confidence": f"{ai_conf:.0f}%"
     }
 
 # ---- Market Health + Sentiment Panel ----
 spy = get_data('SPY')
 qqq = get_data('QQQ')
-
-market_info = {}
 
 if not spy.empty and not qqq.empty:
     try:
@@ -263,136 +272,3 @@ if not spy.empty and not qqq.empty:
     st.markdown(f"- **Market Trend:** {'Up' if spy_change > 0 else 'Down' if spy_change < 0 else 'Flat'}")
     st.markdown(f"- **SPY Change:** {spy_change:.2f}% &nbsp;&nbsp; **QQQ Change:** {qqq_change:.2f}%")
     st.markdown(f"- **Liquidity:** {spy_vol_factor:.2f}x vs avg")
-    st.markdown(f"- **Volatility (ATR%):** {atr_percent:.3f}")
-    st.markdown(f"- **Big Players:** {'High' if spy_vol_factor > 1.5 else 'Normal'} (via rel vol)")
-    st.markdown(f"- **Sentiment:** {'Greedy' if spy_change > 0.5 else 'Cautious' if spy_change < 0 else 'Neutral'}")
-    st.markdown(f"- **Catalyst/Risk:** {'Watch economic events, earnings season' if abs(spy_change) > 1 else 'No major event'}")
-else:
-    st.warning("Could not load recent market data. Try again later.")
-    go_day = False
-
-results = []
-for ticker in watchlist:
-    result = scan_stock_all(
-        ticker,
-        spy_change if 'spy_change' in locals() else 0,
-        min_price, max_price, min_avg_vol,
-        ema200_lookback, pullback_lookback,
-        capital, take_profit_pct, cut_loss_pct
-    )
-    if result:
-        results.append(result)
-df_results = pd.DataFrame(results) if results else pd.DataFrame()
-
-# --- AI PICK column logic ---
-if not df_results.empty:
-    df = df_results.copy()
-    if go_day:
-        # Pick: GO candidates with highest RS, high rel vol, price between 10~100
-        picks = df[(df['GO']) & (df['Rel Vol'].astype(float) > 1) & (df['Price'].astype(float) > 10) & (df['Price'].astype(float) < 100)]
-        if not picks.empty:
-            best_idx = picks['RS vs SPY'].astype(float).idxmax()
-            df_results.at[best_idx, "AI Pick"] = "🔥"
-            df_results.at[best_idx, "Pick Reason"] = "Top RS & Rel Vol"
-    else:
-        # Pick: Defensive or Accumulation
-        picks = df[df['NO-GO'] | df['Accumulation']]
-        if not picks.empty:
-            best_idx = picks['Rel Vol'].astype(float).idxmax()
-            df_results.at[best_idx, "AI Pick"] = "🛡️"
-            df_results.at[best_idx, "Pick Reason"] = "Defensive/Accum"
-
-# ---- Table Sections ----
-common_cols = [
-    "Ticker", "Price", "Open", "Close", "High", "Low", "Change %",
-    "Volume", "Avg Volume", "Rel Vol", "RS vs SPY",
-    "VWAP", "EMA 10", "EMA 20", "EMA 50", "EMA 200", "MACD Bullish", "Volume Spike",
-    "Reasons", "Pred Close (+1d)", "Pred Close (+3d)", "AI Pick", "Pick Reason",
-    "Target Price", "Cut Loss Price", "Position Size", "Max Loss at Stop"
-]
-
-def show_section(title, filter_column):
-    st.subheader(title)
-    if not df_results.empty:
-        df = df_results[df_results[filter_column] == True]
-        if not df.empty:
-            st.dataframe(df[common_cols])
-        else:
-            st.info(f"No stocks meet {title.lower()} criteria.")
-    else:
-        st.info("No data for stock screening.")
-
-show_section("Go Day Stock Recommendations (Momentum/Breakout)", "GO")
-show_section("No-Go Day Stock Recommendations (Defensive)", "NO-GO")
-show_section("Institutional Accumulation Screener", "Accumulation")
-show_section("EMA200 Breakout Reversal Screener", "EMA200 Breakout")
-show_section("VWAP/EMA20 Pullback Bounce Screener", "Pullback Bounce")
-
-# ---- ALERTS: Only for new, one per session ----
-if 'alerted_tickers' not in st.session_state:
-    st.session_state['alerted_tickers'] = set()
-alerted_tickers = st.session_state['alerted_tickers']
-
-for _, row in df_results.iterrows():
-    for section_name, filter_col in [
-        ("GO Day", "GO"),
-        ("No-Go Day", "NO-GO"),
-        ("Institutional Accumulation", "Accumulation"),
-        ("EMA200 Breakout", "EMA200 Breakout"),
-        ("VWAP/EMA20 Pullback", "Pullback Bounce")
-    ]:
-        if row[filter_col]:
-            ticker = row["Ticker"]
-            if not was_alerted_today(ticker, section_name):
-                msg = (
-                    f"📈 {section_name} ALERT!\n"
-                    f"Ticker: {ticker}\n"
-                    f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
-                    f"Position: {row['Position Size']} shares | Max Loss: ${row['Max Loss at Stop']}\n"
-                    f"Reasons: {row['Reasons']}"
-                )
-                send_telegram_alert(msg)
-                add_to_alert_log(ticker, section_name)
-                alerted_tickers.add((ticker, section_name))
-st.session_state['alerted_tickers'] = alerted_tickers
-
-# ---- BACKTEST MODULE ----
-if run_backtest:
-    st.subheader(f"GO Day Backtest Results (last {lookback_days} days)")
-    bt_results = []
-    for ticker in watchlist:
-        df = yf.download(ticker, period=f"{lookback_days+2}d", interval='5m', progress=False)
-        if df.empty: continue
-        df['Date'] = df.index.date
-        day_groups = df.groupby('Date')
-        for d, group in day_groups:
-            if len(group) < 20: continue
-            o = group['Open'].iloc[0]
-            h = group['High'].max()
-            l = group['Low'].min()
-            c = group['Close'].iloc[-1]
-            tp = o * (1 + backtest_tp)
-            sl = o * (1 - backtest_sl)
-            hit_tp = (group['High'] >= tp).any()
-            hit_sl = (group['Low'] <= sl).any()
-            win = None
-            if hit_tp and hit_sl:
-                tp_idx = group[group['High'] >= tp].index[0]
-                sl_idx = group[group['Low'] <= sl].index[0]
-                win = tp_idx < sl_idx
-            elif hit_tp:
-                win = True
-            elif hit_sl:
-                win = False
-            else:
-                win = c > o
-            bt_results.append({'Ticker': ticker, 'Date': d, 'Open': o, 'Close': c, 'TP_hit': hit_tp, 'SL_hit': hit_sl, 'Win': win})
-    if bt_results:
-        df_bt = pd.DataFrame(bt_results)
-        win_rate = df_bt['Win'].mean() * 100
-        st.markdown(f"**Backtest Win Rate:** {win_rate:.2f}%  (sample size: {len(df_bt)})")
-        st.dataframe(df_bt.tail(100))
-    else:
-        st.info("No backtest results found. Try a smaller watchlist or different settings.")
-
-# END OF SCRIPT
