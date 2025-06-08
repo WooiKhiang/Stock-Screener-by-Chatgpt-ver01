@@ -26,6 +26,9 @@ min_index_change = st.sidebar.number_input("Min Index Change (%)", value=0.05)
 max_atr_percent = st.sidebar.number_input("Max ATR (%)", value=0.015)
 volume_factor = st.sidebar.number_input("Min Volume Factor", value=0.7)
 
+# New: EMA200 breakout lookback window
+ema200_lookback = st.sidebar.number_input("EMA200 Breakout Lookback Bars", value=6, min_value=1, max_value=48)
+
 # -------- Data Fetching --------
 def get_data(ticker):
     end = datetime.now()
@@ -40,7 +43,7 @@ def get_intraday_data(ticker):
         return None
     return df
 
-def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol):
+def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200_lookback):
     df = get_intraday_data(ticker)
     if df is None or len(df) < 22:
         return None
@@ -88,7 +91,8 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol):
         ema10 = float(today["Close"].ewm(span=10).mean().iloc[-1])
         ema20 = float(today["Close"].ewm(span=20).mean().iloc[-1])
         ema50 = float(today["Close"].ewm(span=50).mean().iloc[-1])
-        ema200 = float(today["Close"].ewm(span=200).mean().iloc[-1])
+        ema200_series = today["Close"].ewm(span=200).mean()
+        ema200 = float(ema200_series.iloc[-1])
         price_above_ema10 = today_close > ema10
         price_above_ema20 = today_close > ema20
         price_above_ema50 = today_close > ema50
@@ -97,11 +101,20 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol):
         price_above_ema10 = price_above_ema20 = price_above_ema50 = price_above_ema200 = False
         ema200 = 0
 
+    # Improved EMA200 Breakout: crossed within last N bars and still above
     try:
-        # EMA200 Breakout: Was below EMA200, now above
-        prev_ema200 = float(today["Close"].ewm(span=200).mean().shift(1).iloc[-1])
-        prev_close = float(today["Close"].shift(1).iloc[-1])
-        ema200_breakout = (prev_close < prev_ema200) and (today_close > ema200)
+        ema200_breakout = False
+        if len(today) > ema200_lookback:
+            for i in range(1, ema200_lookback + 1):
+                prev_close = float(today["Close"].iloc[-i-1])
+                prev_ema200 = float(ema200_series.iloc[-i-1])
+                curr_close = float(today["Close"].iloc[-i])
+                curr_ema200 = float(ema200_series.iloc[-i])
+                if (prev_close < prev_ema200) and (curr_close > curr_ema200):
+                    ema200_breakout = True
+                    break
+            # Must still be above EMA200 now
+            ema200_breakout = ema200_breakout and (today_close > ema200)
     except Exception:
         ema200_breakout = False
 
@@ -139,7 +152,7 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol):
     if macd_bullish:
         reasons.append("MACD Bullish")
     if ema200_breakout:
-        reasons.append("EMA200 Breakout")
+        reasons.append("EMA200 Breakout (last {} bars)".format(ema200_lookback))
 
     return {
         "Ticker": ticker,
@@ -244,7 +257,12 @@ st.caption("Data source: Yahoo Finance")
 
 results = []
 for ticker in watchlist:
-    result = scan_stock_all(ticker, spy_change if 'spy_change' in locals() else 0, min_price, max_price, min_avg_vol)
+    result = scan_stock_all(
+        ticker,
+        spy_change if 'spy_change' in locals() else 0,
+        min_price, max_price, min_avg_vol,
+        ema200_lookback
+    )
     if result:
         results.append(result)
 df_results = pd.DataFrame(results) if results else pd.DataFrame()
