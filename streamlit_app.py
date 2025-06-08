@@ -19,6 +19,32 @@ volume_factor = st.sidebar.number_input("Min Volume Factor", value=0.7)
 ema200_lookback = st.sidebar.number_input("EMA200 Breakout Lookback Bars", value=6, min_value=1, max_value=48)
 pullback_lookback = st.sidebar.number_input("VWAP/EMA Pullback Lookback Bars", value=6, min_value=2, max_value=20)
 
+# --- Position Size Calculator (in sidebar) ---
+st.sidebar.markdown("---")
+st.sidebar.header("Position Size Calculator")
+
+account_size = st.sidebar.number_input("Account Size ($)", value=10000.0, step=100.0)
+risk_per_trade_pct = st.sidebar.number_input("Risk per Trade (%)", value=1.0, min_value=0.1, max_value=10.0, step=0.1)
+entry_price = st.sidebar.number_input("Entry Price", value=100.0, min_value=0.01, step=0.01)
+stop_loss_price = st.sidebar.number_input("Stop-Loss Price", value=99.0, min_value=0.01, step=0.01)
+
+# Calculation
+risk_dollars = account_size * (risk_per_trade_pct / 100)
+stop_distance = abs(entry_price - stop_loss_price)
+if stop_distance > 0:
+    position_size = risk_dollars / stop_distance
+else:
+    position_size = 0
+
+st.sidebar.markdown(f"**Max Risk per Trade:** ${risk_dollars:,.2f}")
+st.sidebar.markdown(f"**Position Size (shares):** {position_size:,.0f}")
+
+# Optional: Show max loss if stopped out
+if position_size > 0:
+    max_loss = position_size * stop_distance
+    st.sidebar.markdown(f"**Max Loss at Stop:** ${max_loss:,.2f}")
+
+
 # -------- S&P 100 Watchlist (super liquid, active stocks) --------
 watchlist = [
     "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMGN","AMT","AMZN","AVGO",
