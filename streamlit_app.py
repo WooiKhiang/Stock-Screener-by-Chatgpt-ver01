@@ -401,7 +401,3 @@ alert_for_section("EMA200 Breakout", "EMA200 Breakout")
 alert_for_section("VWAP/EMA Pullback", "Pullback Bounce")
 
 st.session_state['alerted_tickers'] = alerted_tickers
-
-# --- Test Telegram Alert ---
-# Uncomment these lines, run your app, then comment them back after testing.
-send_telegram_alert("🚀 Telegram bot setup successful! This is a test alert from your Streamlit app.")
