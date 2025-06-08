@@ -166,7 +166,6 @@ def scan_stock_all(
     except Exception:
         price_above_ema10 = price_above_ema20 = price_above_ema50 = price_above_ema200 = False
         ema200 = 0
-    # EMA200 Breakout: crossed within last N bars and still above
     try:
         ema200_breakout = False
         if len(today) > ema200_lookback:
@@ -181,7 +180,6 @@ def scan_stock_all(
             ema200_breakout = ema200_breakout and (today_close > ema200)
     except Exception:
         ema200_breakout = False
-    # VWAP/EMA20 Pullback Bounce logic
     try:
         pullback = False
         if len(today) > pullback_lookback:
@@ -200,16 +198,6 @@ def scan_stock_all(
     # --- Predictions (future bars, e.g. next ~25min and ~75min) ---
     try:
         closes = today["Close"]
-        if len(closes) >= 15:
-            pred_5b = today_close + np.std(closes[-5:]) * 1.5
-            pred_15b = today_close + np.std(closes[-15:]) * 2
-        elif len(closes) >= 5:
-            pred_5b = today_close + np.std(closes[-5:]) * 1.5
-            pred_15b = None
-        else:
-            pred_5b = None
-            pred_15b = None
-        # Ensure scalar (not Series) and not NaN
         def safe_fmt(val):
             try:
                 if val is None or (isinstance(val, float) and np.isnan(val)):
@@ -217,11 +205,18 @@ def scan_stock_all(
                 return f"{float(val):.2f}"
             except Exception:
                 return ""
+        if len(closes) >= 15:
+            pred_5b = today_close + float(np.std(closes[-5:])) * 1.5
+            pred_15b = today_close + float(np.std(closes[-15:])) * 2
+        elif len(closes) >= 5:
+            pred_5b = today_close + float(np.std(closes[-5:])) * 1.5
+            pred_15b = None
+        else:
+            pred_5b = pred_15b = None
         pred_5b_fmt = safe_fmt(pred_5b)
         pred_15b_fmt = safe_fmt(pred_15b)
     except Exception:
         pred_5b_fmt = pred_15b_fmt = ""
-    # --- AI confidence, reason, top pick logic ---
     score = 0
     reasons = []
     if rs_score > 0:
@@ -245,7 +240,6 @@ def scan_stock_all(
     if pullback:
         reasons.append(f"VWAP/EMA20 Pullback ({pullback_lookback} bars)")
         score += 1
-    # --- Trade management values ---
     target_price = price * (1 + take_profit_pct)
     cut_loss_price = price * (1 - cut_loss_pct)
     risk_per_share = price - cut_loss_price
@@ -277,8 +271,8 @@ def scan_stock_all(
         "Cut Loss Price": f"{cut_loss_price:.2f}",
         "Position Size": position_size,
         "Max Loss at Stop": f"{max_loss:.2f}",
-        "Pred +5 Bars (~25min)": f"{pred_5b:.2f}" if pred_5b != "" else "",
-        "Pred +15 Bars (~75min)": f"{pred_15b:.2f}" if pred_15b != "" else "",
+        "Pred +5 Bars (~25min)": pred_5b_fmt,
+        "Pred +15 Bars (~75min)": pred_15b_fmt,
         "AI Score": score,
         "GO": go_criteria,
         "NO-GO": nogo_criteria,
