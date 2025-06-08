@@ -460,3 +460,15 @@ def add_to_alert_log(ticker, section_name):
     with open(ALERT_LOG, "a", newline="") as f:
         csv.writer(f).writerow([today_str, section_name, ticker])
 
+# TEST Google Sheet Logging
+# Remove or comment this after testing
+test_row = {
+    "Ticker": "TEST",
+    "Price": "123.45",
+    "Target Price": "130.00",
+    "Cut Loss Price": "120.00",
+    "Position Size": 10,
+    "Max Loss at Stop": "30.00",
+    "Reasons": "Test log entry"
+}
+log_to_google_sheet(test_row, "Test Section")
