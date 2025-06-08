@@ -3,49 +3,28 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="US Day Trading Screener", layout="wide")
+st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
 
-# -------- Sidebar Parameters --------
-currency = "USD"
+# ------------------- SIDEBAR -------------------
+# -- Screener Criteria Group --
+with st.sidebar.expander("🔎 Screener Criteria", expanded=True):
+    min_price = st.number_input("Min Price ($)", value=5.0)
+    max_price = st.number_input("Max Price ($)", value=500.0)
+    min_avg_vol = st.number_input("Min Average Volume", value=1_000_000)
+    min_index_change = st.number_input("Min Index Change (%)", value=0.05)
+    max_atr_percent = st.number_input("Max ATR (%)", value=0.015)
+    volume_factor = st.number_input("Min Volume Factor", value=0.7)
+    ema200_lookback = st.number_input("EMA200 Breakout Lookback Bars", value=6, min_value=1, max_value=48)
+    pullback_lookback = st.number_input("VWAP/EMA Pullback Lookback Bars", value=6, min_value=2, max_value=20)
 
-min_price = st.sidebar.number_input(f"Min Price ({currency})", value=5.0)
-max_price = st.sidebar.number_input(f"Max Price ({currency})", value=500.0)
-min_avg_vol = st.sidebar.number_input("Min Average Volume", value=1_000_000)
+# -- Profit & Risk Planner Group --
+with st.sidebar.expander("💰 Profit & Risk Planner", expanded=True):
+    capital = st.number_input("Capital per Trade ($)", value=1000.0, step=100.0)
+    take_profit_pct = st.number_input("Take Profit (%)", value=2.0, min_value=0.5, max_value=10.0, step=0.1) / 100
+    cut_loss_pct = st.number_input("Cut Loss (%)", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
 
-min_index_change = st.sidebar.number_input("Min Index Change (%)", value=0.05)
-max_atr_percent = st.sidebar.number_input("Max ATR (%)", value=0.015)
-volume_factor = st.sidebar.number_input("Min Volume Factor", value=0.7)
-ema200_lookback = st.sidebar.number_input("EMA200 Breakout Lookback Bars", value=6, min_value=1, max_value=48)
-pullback_lookback = st.sidebar.number_input("VWAP/EMA Pullback Lookback Bars", value=6, min_value=2, max_value=20)
-
-# --- Position Size Calculator (in sidebar) ---
-st.sidebar.markdown("---")
-st.sidebar.header("Position Size Calculator")
-
-account_size = st.sidebar.number_input("Account Size ($)", value=10000.0, step=100.0)
-risk_per_trade_pct = st.sidebar.number_input("Risk per Trade (%)", value=1.0, min_value=0.1, max_value=10.0, step=0.1)
-entry_price = st.sidebar.number_input("Entry Price", value=100.0, min_value=0.01, step=0.01)
-stop_loss_price = st.sidebar.number_input("Stop-Loss Price", value=99.0, min_value=0.01, step=0.01)
-
-# Calculation
-risk_dollars = account_size * (risk_per_trade_pct / 100)
-stop_distance = abs(entry_price - stop_loss_price)
-if stop_distance > 0:
-    position_size = risk_dollars / stop_distance
-else:
-    position_size = 0
-
-st.sidebar.markdown(f"**Max Risk per Trade:** ${risk_dollars:,.2f}")
-st.sidebar.markdown(f"**Position Size (shares):** {position_size:,.0f}")
-
-# Optional: Show max loss if stopped out
-if position_size > 0:
-    max_loss = position_size * stop_distance
-    st.sidebar.markdown(f"**Max Loss at Stop:** ${max_loss:,.2f}")
-
-
-# -------- S&P 100 Watchlist (super liquid, active stocks) --------
+# -------------- S&P 100 Watchlist --------------
 watchlist = [
     "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMGN","AMT","AMZN","AVGO",
     "AXP","BA","BAC","BK","BKNG","BLK","BMY","BRK.B","C","CAT",
@@ -60,7 +39,7 @@ watchlist = [
     "WFC","WMT","XOM"
 ]
 
-# -------- Data Fetching --------
+# -------------- Data Fetching --------------
 def get_data(ticker):
     end = datetime.now()
     start = end - timedelta(days=5)
@@ -74,7 +53,8 @@ def get_intraday_data(ticker):
         return None
     return df
 
-def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200_lookback, pullback_lookback):
+def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200_lookback, pullback_lookback,
+                   capital, take_profit_pct, cut_loss_pct):
     df = get_intraday_data(ticker)
     if df is None or len(df) < 22:
         return None
@@ -202,6 +182,13 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     if pullback:
         reasons.append(f"VWAP/EMA20 Pullback ({pullback_lookback} bars)")
 
+    # --- Trade management values ---
+    target_price = price * (1 + take_profit_pct)
+    cut_loss_price = price * (1 - cut_loss_pct)
+    risk_per_share = price - cut_loss_price
+    position_size = int(capital / price) if price > 0 else 0
+    max_loss = position_size * risk_per_share
+
     return {
         "Ticker": ticker,
         "Price": f"{price:.2f}",
@@ -227,6 +214,10 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         "Accumulation": accumulation_criteria,
         "EMA200 Breakout": ema200_breakout,
         "Pullback Bounce": pullback,
+        "Target Price": f"{target_price:.2f}",
+        "Cut Loss Price": f"{cut_loss_price:.2f}",
+        "Position Size": position_size,
+        "Max Loss at Stop": f"{max_loss:.2f}",
     }
 
 # ---- Go/No-Go Dashboard Logic ----
@@ -305,7 +296,8 @@ for ticker in watchlist:
         ticker,
         spy_change if 'spy_change' in locals() else 0,
         min_price, max_price, min_avg_vol,
-        ema200_lookback, pullback_lookback
+        ema200_lookback, pullback_lookback,
+        capital, take_profit_pct, cut_loss_pct
     )
     if result:
         results.append(result)
@@ -322,37 +314,49 @@ def show_section(title, filter_column, columns):
     else:
         st.info("No data for stock screening.")
 
-# Section 1: Go Day Recommendations
+common_trade_cols = ["Target Price", "Cut Loss Price", "Position Size", "Max Loss at Stop"]
+
 show_section(
     "Go Day Stock Recommendations (Momentum/Breakout)",
     "GO",
-    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs SPY", "VWAP", "EMA 10", "EMA 20", "EMA 50", "MACD Bullish", "Reasons"]
+    [
+        "Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol",
+        "RS vs SPY", "VWAP", "EMA 10", "EMA 20", "EMA 50", "MACD Bullish", "Reasons"
+    ] + common_trade_cols
 )
 
-# Section 2: No-Go Day Defensive/Resilient Picks
 show_section(
     "No-Go Day Stock Recommendations (Defensive/Resilient)",
     "NO-GO",
-    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs SPY", "EMA 50", "Reasons"]
+    [
+        "Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol",
+        "RS vs SPY", "EMA 50", "Reasons"
+    ] + common_trade_cols
 )
 
-# Section 3: Potential Institutional Accumulation
 show_section(
     "Potential Institutional Accumulation Screener",
     "Accumulation",
-    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs SPY", "VWAP", "EMA 10", "EMA 20", "Reasons"]
+    [
+        "Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol",
+        "RS vs SPY", "VWAP", "EMA 10", "EMA 20", "Reasons"
+    ] + common_trade_cols
 )
 
-# Section 4: EMA200 Breakout Reversal
 show_section(
     "EMA200 Breakout Reversal Screener",
     "EMA200 Breakout",
-    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs SPY", "EMA 200", "VWAP", "Reasons"]
+    [
+        "Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol",
+        "RS vs SPY", "EMA 200", "VWAP", "Reasons"
+    ] + common_trade_cols
 )
 
-# Section 5: VWAP/EMA Pullback Bounce Screener
 show_section(
     "VWAP/EMA20 Pullback Bounce Screener",
     "Pullback Bounce",
-    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs SPY", "VWAP", "EMA 20", "Reasons"]
+    [
+        "Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol",
+        "RS vs SPY", "VWAP", "EMA 20", "Reasons"
+    ] + common_trade_cols
 )
