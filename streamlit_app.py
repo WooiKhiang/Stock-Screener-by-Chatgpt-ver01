@@ -3,20 +3,11 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Go/No-Go Screener", layout="wide")
-
-st.title("Market Go/No-Go Dashboard")
+st.set_page_config(page_title="US Day Trading Screener", layout="wide")
+st.title("US Market Go/No-Go Dashboard")
 
 # -------- Sidebar Parameters --------
-market = st.sidebar.selectbox("Select Market", ["US Market", "Malaysia (Bursa)"])
-
-if market == "US Market":
-    watchlist = ["SPY", "QQQ", "NVDA", "AAPL", "TSLA", "AMD", "META", "AMZN", "MSFT", "GOOGL"]
-    currency = "USD"
-else:
-    # Example active Bursa stocks—customize as you like
-    watchlist = ["CIMB.KL", "MAYBANK.KL", "TENAGA.KL", "PCHEM.KL", "TOPGLOV.KL", "SIME.KL", "PETGAS.KL", "GENTING.KL", "AXIATA.KL", "KLCC.KL"]
-    currency = "MYR"
+currency = "USD"
 
 min_price = st.sidebar.number_input(f"Min Price ({currency})", value=5.0)
 max_price = st.sidebar.number_input(f"Max Price ({currency})", value=500.0)
@@ -25,9 +16,23 @@ min_avg_vol = st.sidebar.number_input("Min Average Volume", value=1_000_000)
 min_index_change = st.sidebar.number_input("Min Index Change (%)", value=0.05)
 max_atr_percent = st.sidebar.number_input("Max ATR (%)", value=0.015)
 volume_factor = st.sidebar.number_input("Min Volume Factor", value=0.7)
-
-# New: EMA200 breakout lookback window
 ema200_lookback = st.sidebar.number_input("EMA200 Breakout Lookback Bars", value=6, min_value=1, max_value=48)
+pullback_lookback = st.sidebar.number_input("VWAP/EMA Pullback Lookback Bars", value=6, min_value=2, max_value=20)
+
+# -------- S&P 100 Watchlist (super liquid, active stocks) --------
+watchlist = [
+    "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMGN","AMT","AMZN","AVGO",
+    "AXP","BA","BAC","BK","BKNG","BLK","BMY","BRK.B","C","CAT",
+    "CHTR","CL","CMCSA","COF","COP","COST","CRM","CSCO","CVS","CVX",
+    "DHR","DIS","DOW","DUK","EMR","EXC","F","FDX","FOX","FOXA",
+    "GD","GE","GILD","GM","GOOG","GOOGL","GS","HD","HON","IBM",
+    "INTC","JNJ","JPM","KHC","KMI","KO","LIN","LLY","LMT","LOW",
+    "MA","MCD","MDLZ","MDT","MET","META","MMM","MO","MRK","MS",
+    "MSFT","NEE","NFLX","NKE","NVDA","ORCL","PEP","PFE","PG","PM",
+    "PYPL","QCOM","RTX","SBUX","SCHW","SO","SPG","T","TGT","TMO",
+    "TMUS","TSLA","TXN","UNH","UNP","UPS","USB","V","VZ","WBA",
+    "WFC","WMT","XOM"
+]
 
 # -------- Data Fetching --------
 def get_data(ticker):
@@ -43,7 +48,7 @@ def get_intraday_data(ticker):
         return None
     return df
 
-def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200_lookback):
+def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200_lookback, pullback_lookback):
     df = get_intraday_data(ticker)
     if df is None or len(df) < 22:
         return None
@@ -69,7 +74,6 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     except Exception:
         avg_vol = volume = rel_vol = 0
 
-    # Price/Volume Filter
     if not (min_price <= price <= max_price and avg_vol >= min_avg_vol):
         return None
 
@@ -101,7 +105,7 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         price_above_ema10 = price_above_ema20 = price_above_ema50 = price_above_ema200 = False
         ema200 = 0
 
-    # Improved EMA200 Breakout: crossed within last N bars and still above
+    # EMA200 Breakout: crossed within last N bars and still above
     try:
         ema200_breakout = False
         if len(today) > ema200_lookback:
@@ -113,7 +117,6 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
                 if (prev_close < prev_ema200) and (curr_close > curr_ema200):
                     ema200_breakout = True
                     break
-            # Must still be above EMA200 now
             ema200_breakout = ema200_breakout and (today_close > ema200)
     except Exception:
         ema200_breakout = False
@@ -126,6 +129,23 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         macd_bullish = float(macd.iloc[-1]) > float(signal.iloc[-1])
     except Exception:
         macd_bullish = False
+
+    # VWAP/EMA20 Pullback Bounce logic
+    try:
+        pullback = False
+        if len(today) > pullback_lookback:
+            for i in range(2, pullback_lookback + 1):
+                prev_low = float(today["Low"].iloc[-i])
+                prev_vwap = float(vwap.iloc[-i])
+                prev_ema20 = float(today["Close"].ewm(span=20).mean().iloc[-i])
+                if (
+                    (abs(prev_low - prev_vwap) / prev_vwap < 0.0025 or abs(prev_low - prev_ema20) / prev_ema20 < 0.0025)
+                    and (today_close > prev_vwap or today_close > prev_ema20)
+                ):
+                    pullback = True
+                    break
+    except Exception:
+        pullback = False
 
     go_criteria = (
         price_above_ema10 and price_above_ema20 and price_above_ema50 and
@@ -152,7 +172,9 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     if macd_bullish:
         reasons.append("MACD Bullish")
     if ema200_breakout:
-        reasons.append("EMA200 Breakout (last {} bars)".format(ema200_lookback))
+        reasons.append(f"EMA200 Breakout ({ema200_lookback} bars)")
+    if pullback:
+        reasons.append(f"VWAP/EMA20 Pullback ({pullback_lookback} bars)")
 
     return {
         "Ticker": ticker,
@@ -165,7 +187,7 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         "Avg Volume": f"{avg_vol:,.0f}",
         "Volume": f"{volume:,.0f}",
         "Rel Vol": f"{rel_vol:.2f}",
-        "RS vs Index": f"{rs_score:.2f}",
+        "RS vs SPY": f"{rs_score:.2f}",
         "VWAP": "Yes" if price_above_vwap else "No",
         "EMA 10": "Yes" if price_above_ema10 else "No",
         "EMA 20": "Yes" if price_above_ema20 else "No",
@@ -178,12 +200,12 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         "NO-GO": nogo_criteria,
         "Accumulation": accumulation_criteria,
         "EMA200 Breakout": ema200_breakout,
+        "Pullback Bounce": pullback,
     }
 
-# ---- Go/No-Go Dashboard Logic (unchanged) ----
-spy = get_data('SPY') if market == "US Market" else get_data("FBMKLCI.KL")
-qqq = get_data('QQQ') if market == "US Market" else get_data("KLSE.KL")
-vxx = get_data('VXZ') if market == "US Market" else get_data("KLSE.KL")  # Placeholder
+# ---- Go/No-Go Dashboard Logic ----
+spy = get_data('SPY')
+qqq = get_data('QQQ')
 
 if not spy.empty and not qqq.empty:
     if len(spy) > 2 and len(qqq) > 2:
@@ -226,23 +248,19 @@ if not spy.empty and not qqq.empty:
     else:
         spy_volume = spy_avg_volume = spy_atr = atr_percent = vol_factor_val = 0
 
-    # For Malaysia, VXZ not relevant, just use dummy
-    vxx_diff = 0
-
-    market_health = spy_change >= min_index_change and qqq_change >= min_index_change
-    liquidity = vol_factor_val >= volume_factor
-    volatility = atr_percent <= max_atr_percent
-    sentiment = vxx_diff < 0.03
-
-    go_day = market_health and liquidity and volatility and sentiment
-
     st.subheader("Today's Market Conditions")
-    st.markdown(f"**Index 1 Change:** {spy_change:.2f}%")
-    st.markdown(f"**Index 2 Change:** {qqq_change:.2f}%")
+    st.markdown(f"**SPY Change:** {spy_change:.2f}%")
+    st.markdown(f"**QQQ Change:** {qqq_change:.2f}%")
     st.markdown(f"**Volume Factor:** {vol_factor_val:.2f}x")
     st.markdown(f"**ATR %:** {atr_percent:.3f}")
 
     st.subheader("GO/NO-GO Signal")
+    go_day = (
+        spy_change >= min_index_change and
+        qqq_change >= min_index_change and
+        vol_factor_val >= volume_factor and
+        atr_percent <= max_atr_percent
+    )
     if go_day:
         st.success("GO DAY! Risk-on opportunities detected.")
     else:
@@ -261,7 +279,7 @@ for ticker in watchlist:
         ticker,
         spy_change if 'spy_change' in locals() else 0,
         min_price, max_price, min_avg_vol,
-        ema200_lookback
+        ema200_lookback, pullback_lookback
     )
     if result:
         results.append(result)
@@ -282,26 +300,33 @@ def show_section(title, filter_column, columns):
 show_section(
     "Go Day Stock Recommendations (Momentum/Breakout)",
     "GO",
-    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs Index", "VWAP", "EMA 10", "EMA 20", "EMA 50", "MACD Bullish", "Reasons"]
+    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs SPY", "VWAP", "EMA 10", "EMA 20", "EMA 50", "MACD Bullish", "Reasons"]
 )
 
 # Section 2: No-Go Day Defensive/Resilient Picks
 show_section(
     "No-Go Day Stock Recommendations (Defensive/Resilient)",
     "NO-GO",
-    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs Index", "EMA 50", "Reasons"]
+    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs SPY", "EMA 50", "Reasons"]
 )
 
 # Section 3: Potential Institutional Accumulation
 show_section(
     "Potential Institutional Accumulation Screener",
     "Accumulation",
-    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs Index", "VWAP", "EMA 10", "EMA 20", "Reasons"]
+    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs SPY", "VWAP", "EMA 10", "EMA 20", "Reasons"]
 )
 
 # Section 4: EMA200 Breakout Reversal
 show_section(
     "EMA200 Breakout Reversal Screener",
     "EMA200 Breakout",
-    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs Index", "EMA 200", "VWAP", "Reasons"]
+    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs SPY", "EMA 200", "VWAP", "Reasons"]
+)
+
+# Section 5: VWAP/EMA Pullback Bounce Screener
+show_section(
+    "VWAP/EMA20 Pullback Bounce Screener",
+    "Pullback Bounce",
+    ["Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol", "RS vs SPY", "VWAP", "EMA 20", "Reasons"]
 )
