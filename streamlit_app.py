@@ -24,17 +24,31 @@ vxx = get_data('VXZ')  # VXZ as replacement for VXX
 if not spy.empty and not qqq.empty and not vxx.empty:
     # --- Change Calculations ---
     if len(spy) > 2 and len(qqq) > 2:
-        spy_change = (spy['Close'].iloc[-1] - spy['Close'].iloc[-2]) / spy['Close'].iloc[-2] * 100
-        qqq_change = (qqq['Close'].iloc[-1] - qqq['Close'].iloc[-2]) / qqq['Close'].iloc[-2] * 100
+        try:
+            spy_change = (float(spy['Close'].iloc[-1]) - float(spy['Close'].iloc[-2])) / float(spy['Close'].iloc[-2]) * 100
+        except Exception:
+            spy_change = 0
+        try:
+            qqq_change = (float(qqq['Close'].iloc[-1]) - float(qqq['Close'].iloc[-2])) / float(qqq['Close'].iloc[-2]) * 100
+        except Exception:
+            qqq_change = 0
     else:
         spy_change = qqq_change = 0
 
     # --- Volume & ATR ---
     if len(spy) > 15:
-        spy_volume = spy['Volume'].iloc[-1]
-        spy_avg_volume = spy['Volume'].rolling(window=10).mean().iloc[-1]
-        spy_atr = (spy['High'] - spy['Low']).rolling(window=14).mean().iloc[-1]
-        # Defensive get last close as float
+        try:
+            spy_volume = float(spy['Volume'].iloc[-1])
+        except Exception:
+            spy_volume = 0
+        try:
+            spy_avg_volume = float(spy['Volume'].rolling(window=10).mean().iloc[-1])
+        except Exception:
+            spy_avg_volume = 0
+        try:
+            spy_atr = float((spy['High'] - spy['Low']).rolling(window=14).mean().iloc[-1])
+        except Exception:
+            spy_atr = 0
         try:
             close_last = float(spy['Close'].iloc[-1])
         except Exception:
@@ -43,14 +57,23 @@ if not spy.empty and not qqq.empty and not vxx.empty:
             atr_percent = spy_atr / close_last
         else:
             atr_percent = 0
-        vol_factor_val = spy_volume / spy_avg_volume if spy_avg_volume != 0 else 0
+        if pd.notna(spy_avg_volume) and spy_avg_volume != 0:
+            vol_factor_val = spy_volume / spy_avg_volume
+        else:
+            vol_factor_val = 0
     else:
         spy_volume = spy_avg_volume = spy_atr = atr_percent = vol_factor_val = 0
 
     # --- Sentiment (VXZ) ---
     if len(vxx) > 20:
-        vxx_fast = vxx['Close'].rolling(window=5).mean().iloc[-1]
-        vxx_slow = vxx['Close'].rolling(window=20).mean().iloc[-1]
+        try:
+            vxx_fast = float(vxx['Close'].rolling(window=5).mean().iloc[-1])
+        except Exception:
+            vxx_fast = 0
+        try:
+            vxx_slow = float(vxx['Close'].rolling(window=20).mean().iloc[-1])
+        except Exception:
+            vxx_slow = 0
         if pd.notna(vxx_slow) and vxx_slow != 0:
             vxx_diff = (vxx_fast - vxx_slow) / vxx_slow
         else:
