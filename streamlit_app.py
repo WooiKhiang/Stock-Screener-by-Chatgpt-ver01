@@ -12,9 +12,9 @@ from oauth2client.service_account import ServiceAccountCredentials
 st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
 
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
-GOOGLE_SHEET_ID = "YOUR_GOOGLE_SHEET_ID"
+TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
+TELEGRAM_CHAT_ID = "713264762"
+GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "Sheet1"
 
 ALERT_LOG = "alerts_log.csv"
