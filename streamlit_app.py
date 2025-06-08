@@ -51,8 +51,6 @@ watchlist = [
     "WFC","WMT","XOM"
 ]
 
-# --- Utility Functions ---
-
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
@@ -97,33 +95,20 @@ def log_to_google_sheet(row_dict, section_name):
         st.warning(f"Failed to log to Google Sheet: {e}")
 
 def get_data(ticker):
-    end = datetime.now()
-    start = end - timedelta(days=5)
-    df = yf.download(ticker, start=start, end=end, interval='5m', progress=False)
-    return df
+    try:
+        end = datetime.now()
+        start = end - timedelta(days=5)
+        df = yf.download(ticker, start=start, end=end, interval='5m', progress=False)
+        return df if not df.empty else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 def get_intraday_data(ticker):
     try:
         df = yf.download(ticker, period="2d", interval="5m", progress=False)
-        return df
+        return df if not df.empty else None
     except Exception:
         return None
-
-def calc_support_resistance(prices, lookback=48):
-    try:
-        clean = prices.dropna()
-        if len(clean) < lookback:
-            return "-", "-"
-        sub = clean.iloc[-lookback:]
-        if sub.empty or sub.isnull().any():
-            return "-", "-"
-        support = sub.min()
-        resistance = sub.max()
-        if pd.isnull(support) or pd.isnull(resistance):
-            return "-", "-"
-        return f"{support:.2f}", f"{resistance:.2f}"
-    except Exception:
-        return "-", "-"
 
 def scan_stock_all(
     ticker, min_price, max_price, min_avg_vol, ema200_lookback, pullback_lookback, capital, take_profit_pct, cut_loss_pct
@@ -152,12 +137,10 @@ def scan_stock_all(
     if not (min_price <= price <= max_price and avg_vol >= min_avg_vol):
         return None
 
-    support, resistance = calc_support_resistance(today["Close"], lookback=48)
-
-    # Simple signals for demo
-    go_criteria = price > today["Close"].mean()
+    # Only use boolean primitives, not Series!
+    go_criteria = bool(price > today["Close"].mean())
     nogo_criteria = not go_criteria
-    accumulation_criteria = avg_vol > min_avg_vol
+    accumulation_criteria = bool(avg_vol > min_avg_vol)
 
     target_price = price * (1 + take_profit_pct)
     cut_loss_price = price * (1 - cut_loss_pct)
@@ -170,8 +153,6 @@ def scan_stock_all(
         "Price": f"{price:.2f}",
         "Volume": f"{volume:,.0f}",
         "Avg Volume": f"{avg_vol:,.0f}",
-        "Support": support,
-        "Resistance": resistance,
         "GO": go_criteria,
         "NO-GO": nogo_criteria,
         "Accumulation": accumulation_criteria,
@@ -185,7 +166,6 @@ def scan_stock_all(
 spy = get_data('SPY')
 qqq = get_data('QQQ')
 
-# --- Market Sentiment Analysis ---
 go_day = False
 if not spy.empty and not qqq.empty:
     try:
@@ -196,7 +176,7 @@ if not spy.empty and not qqq.empty:
     st.subheader("Today's Market Conditions")
     st.markdown(f"**SPY Change:** {spy_change:.2f}%")
     st.markdown(f"**QQQ Change:** {qqq_change:.2f}%")
-    go_day = spy_change > 0.05 and qqq_change > 0.05
+    go_day = bool(spy_change > 0.05 and qqq_change > 0.05)
     if go_day:
         st.success("GO DAY! Risk-on sentiment.")
     else:
@@ -231,17 +211,17 @@ trade_cols = ["Target Price", "Cut Loss Price", "Position Size", "Max Loss at St
 show_section(
     "Go Day Stock Recommendations",
     "GO",
-    ["Ticker", "Price", "Volume", "Avg Volume", "Support", "Resistance"] + trade_cols
+    ["Ticker", "Price", "Volume", "Avg Volume"] + trade_cols
 )
 show_section(
     "No-Go Day Stock Recommendations",
     "NO-GO",
-    ["Ticker", "Price", "Volume", "Avg Volume", "Support", "Resistance"] + trade_cols
+    ["Ticker", "Price", "Volume", "Avg Volume"] + trade_cols
 )
 show_section(
     "Potential Institutional Accumulation",
     "Accumulation",
-    ["Ticker", "Price", "Volume", "Avg Volume", "Support", "Resistance"] + trade_cols
+    ["Ticker", "Price", "Volume", "Avg Volume"] + trade_cols
 )
 
 # --- ALERTS ---
@@ -263,7 +243,6 @@ for _, row in df_results.iterrows():
                     f"Ticker: {ticker}\n"
                     f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
                     f"Position: {row['Position Size']} shares | Max Loss: ${row['Max Loss at Stop']}\n"
-                    f"Support: {row['Support']} | Resistance: {row['Resistance']}\n"
                     f"Reasons: {row['Reasons']}"
                 )
                 send_telegram_alert(msg)
@@ -310,4 +289,3 @@ if run_backtest:
         st.dataframe(df_bt.tail(100))
     else:
         st.info("No backtest results found. Try a smaller watchlist or different settings.")
-
