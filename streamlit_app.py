@@ -34,7 +34,11 @@ if not spy.empty and not qqq.empty and not vxx.empty:
         spy_volume = spy['Volume'].iloc[-1]
         spy_avg_volume = spy['Volume'].rolling(window=10).mean().iloc[-1]
         spy_atr = (spy['High'] - spy['Low']).rolling(window=14).mean().iloc[-1]
-        atr_percent = spy_atr / spy['Close'].iloc[-1] if spy['Close'].iloc[-1] != 0 else 0
+        close_last = spy['Close'].iloc[-1]
+        if pd.notna(close_last) and close_last != 0:
+            atr_percent = spy_atr / close_last
+        else:
+            atr_percent = 0
         vol_factor_val = spy_volume / spy_avg_volume if spy_avg_volume != 0 else 0
     else:
         spy_volume = spy_avg_volume = spy_atr = atr_percent = vol_factor_val = 0
