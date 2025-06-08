@@ -6,6 +6,9 @@ import requests
 import os
 import csv
 from datetime import date
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import json
 
 st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
@@ -399,6 +402,39 @@ def alert_for_section(section_name, filter_col):
                 )
                 send_telegram_alert(alert_msg)
                 add_to_alert_log(ticker, section_name)
+                log_to_google_sheet(row, section_name)
+
+def log_to_google_sheet(row_dict, section_name):
+    # Sheet setup
+    SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
+    SHEET_NAME = "Sheet1"  # Change if you rename your worksheet
+
+    # Get credentials
+    if "gcp_service_account" in st.secrets:
+        creds_dict = st.secrets["gcp_service_account"]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
+    else:
+        creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", SCOPE)
+
+    gc = gspread.authorize(creds)
+    worksheet = gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+
+    # Prepare row to write
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Pick key columns for logging (add/remove as needed)
+    log_row = [
+        now,
+        section_name,
+        row_dict.get("Ticker"),
+        row_dict.get("Price"),
+        row_dict.get("Target Price"),
+        row_dict.get("Cut Loss Price"),
+        row_dict.get("Position Size"),
+        row_dict.get("Max Loss at Stop"),
+        row_dict.get("Reasons"),
+    ]
+    worksheet.append_row(log_row, value_input_option="USER_ENTERED")
 
 alert_for_section("GO Day", "GO")
 alert_for_section("No-Go Day", "NO-GO")
