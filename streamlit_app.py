@@ -2,9 +2,22 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
+import requests
 
 st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
+
+# ---- Telegram Alert Settings ----
+TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
+TELEGRAM_CHAT_ID = "713264762"
+
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        requests.post(url, data=payload)
+    except Exception as e:
+        st.warning(f"Failed to send Telegram alert: {e}")
 
 # ------------------- SIDEBAR -------------------
 # -- Screener Criteria Group --
@@ -360,3 +373,31 @@ show_section(
         "RS vs SPY", "VWAP", "EMA 20", "Reasons"
     ] + common_trade_cols
 )
+
+# --- ALERTS ---
+# Only send alerts for NEW screener hits each run (in-memory)
+if 'alerted_tickers' not in st.session_state:
+    st.session_state['alerted_tickers'] = set()
+alerted_tickers = st.session_state['alerted_tickers']
+
+def alert_for_section(section_name, filter_col):
+    if not df_results.empty:
+        new_hits = df_results[(df_results[filter_col] == True) & (~df_results["Ticker"].isin(alerted_tickers))]
+        for _, row in new_hits.iterrows():
+            alert_msg = (
+                f"📈 {section_name} ALERT!\n"
+                f"Ticker: {row['Ticker']}\n"
+                f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
+                f"Position: {row['Position Size']} shares | Max Loss: ${row['Max Loss at Stop']}\n"
+                f"Reasons: {row['Reasons']}"
+            )
+            send_telegram_alert(alert_msg)
+            alerted_tickers.add(row["Ticker"])
+
+alert_for_section("GO Day", "GO")
+alert_for_section("No-Go Day", "NO-GO")
+alert_for_section("Institutional Accumulation", "Accumulation")
+alert_for_section("EMA200 Breakout", "EMA200 Breakout")
+alert_for_section("VWAP/EMA Pullback", "Pullback Bounce")
+
+st.session_state['alerted_tickers'] = alerted_tickers
