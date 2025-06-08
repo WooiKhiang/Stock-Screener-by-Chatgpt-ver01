@@ -107,3 +107,108 @@ else:
     st.warning("Could not load recent market data. Try again later.")
 
 st.caption("Data source: Yahoo Finance")
+
+# --- Step 2: Institutional Accumulation Screener on NO-GO Days ---
+
+# --- 1. Your Watchlist (edit anytime) ---
+watchlist = ["SPY", "QQQ", "NVDA", "AAPL", "TSLA", "AMD", "META", "AMZN", "MSFT", "GOOGL"]
+
+def get_intraday_data(ticker):
+    try:
+        df = yf.download(ticker, period="2d", interval="5m", progress=False)
+    except Exception:
+        return None
+    return df
+
+def scan_stock(ticker, spy_change):
+    df = get_intraday_data(ticker)
+    if df is None or len(df) < 22:
+        return None
+
+    today = df[df.index.date == df.index[-1].date()]
+    if today.empty or len(today) < 10:
+        return None
+
+    # Today's % change
+    try:
+        today_change = (float(today["Close"].iloc[-1]) - float(today["Open"].iloc[0])) / float(today["Open"].iloc[0]) * 100
+    except Exception:
+        today_change = 0
+
+    # Relative Strength Score
+    rs_score = today_change - spy_change
+
+    # Volume Spike (any 5m bar in last hour >2x average)
+    try:
+        last_hour = today.iloc[-12:]
+        avg_vol = today["Volume"].rolling(10).mean().iloc[-1]
+        volume_spike = any(last_hour["Volume"] > 2 * avg_vol)
+    except Exception:
+        volume_spike = False
+
+    # Above VWAP
+    vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
+    price_above_vwap = float(today["Close"].iloc[-1]) > float(vwap.iloc[-1])
+
+    # Above EMAs (10, 20, 50)
+    ema10 = today["Close"].ewm(span=10).mean().iloc[-1]
+    ema20 = today["Close"].ewm(span=20).mean().iloc[-1]
+    ema50 = today["Close"].ewm(span=50).mean().iloc[-1]
+    price_above_ema10 = float(today["Close"].iloc[-1]) > ema10
+    price_above_ema20 = float(today["Close"].iloc[-1]) > ema20
+    price_above_ema50 = float(today["Close"].iloc[-1]) > ema50
+
+    # MACD (12,26,9) bullish?
+    exp12 = today["Close"].ewm(span=12).mean()
+    exp26 = today["Close"].ewm(span=26).mean()
+    macd = exp12 - exp26
+    signal = macd.ewm(span=9).mean()
+    macd_bullish = macd.iloc[-1] > signal.iloc[-1]
+
+    # Reasoning
+    reasons = []
+    if rs_score > 1:
+        reasons.append("Strong RS")
+    if price_above_vwap:
+        reasons.append("VWAP Reclaim")
+    if price_above_ema10 and price_above_ema20 and price_above_ema50:
+        reasons.append("EMA Stack")
+    if volume_spike:
+        reasons.append("Volume Spike")
+    if macd_bullish:
+        reasons.append("MACD Bullish")
+
+    all_criteria = (rs_score > 1 and price_above_vwap and price_above_ema10 and
+                    price_above_ema20 and price_above_ema50 and volume_spike and macd_bullish)
+
+    return {
+        "Ticker": ticker,
+        "Change %": f"{today_change:.2f}",
+        "RS vs SPY": f"{rs_score:.2f}",
+        "VWAP": "Yes" if price_above_vwap else "No",
+        "EMA Stack": "Yes" if price_above_ema10 and price_above_ema20 and price_above_ema50 else "No",
+        "Volume Spike": "Yes" if volume_spike else "No",
+        "MACD Bullish": "Yes" if macd_bullish else "No",
+        "Reasons": ", ".join(reasons),
+        "Qualified": all_criteria
+    }
+
+# --- 2. Run Screener only on NO-GO days ---
+if not go_day:
+    st.subheader("Institutional Accumulation Candidates (NO-GO Day)")
+
+    results = []
+    for ticker in watchlist:
+        result = scan_stock(ticker, spy_change)
+        if result and result["Qualified"]:
+            results.append(result)
+
+    if results:
+        df_results = pd.DataFrame(results)
+        st.dataframe(df_results[["Ticker", "Change %", "RS vs SPY", "VWAP", "EMA Stack", "Volume Spike", "MACD Bullish", "Reasons"]])
+    else:
+        st.info("No accumulation setups found in current watchlist. Try again later in the day or expand your watchlist!")
+
+else:
+    st.subheader("GO Day: Focus on momentum/momentum scalping opportunities.")
+
