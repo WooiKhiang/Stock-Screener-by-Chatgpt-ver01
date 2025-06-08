@@ -9,6 +9,7 @@ from datetime import date
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
+import numpy as np
 
 st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
@@ -380,6 +381,93 @@ show_section(
     ] + common_trade_cols
 )
 
+# ---------------- BACKTEST MODULE ----------------
+
+st.sidebar.markdown("---")
+with st.sidebar.expander("🧪 Backtest Module", expanded=False):
+    run_backtest = st.checkbox("Run GO Day Backtest", value=False)
+    lookback_days = st.number_input("Backtest Days", value=10, min_value=5, max_value=60)
+    backtest_tp = st.number_input("Backtest Take Profit (%)", value=2.0, step=0.1) / 100
+    backtest_sl = st.number_input("Backtest Stop Loss (%)", value=1.0, step=0.1) / 100
+
+if run_backtest:
+    st.subheader("Backtest Results (GO Day Strategy)")
+    backtest_results = []
+    for ticker in watchlist:
+        df = yf.download(ticker, period=f"{lookback_days+2}d", interval="5m", progress=False)
+        if df.empty or len(df) < 100:
+            continue
+        df['Date'] = df.index.date
+        for date in sorted(df['Date'].unique())[-lookback_days:]:
+            day = df[df['Date'] == date]
+            if len(day) < 10:
+                continue
+
+            day['EMA10'] = day['Close'].ewm(span=10).mean()
+            day['EMA20'] = day['Close'].ewm(span=20).mean()
+            day['EMA50'] = day['Close'].ewm(span=50).mean()
+            exp12 = day['Close'].ewm(span=12).mean()
+            exp26 = day['Close'].ewm(span=26).mean()
+            day['MACD'] = exp12 - exp26
+            day['Signal'] = day['MACD'].ewm(span=9).mean()
+
+            last = day.iloc[-1]
+            go_signal = (
+                last['Close'] > last['EMA10'] and
+                last['Close'] > last['EMA20'] and
+                last['Close'] > last['EMA50'] and
+                last['MACD'] > last['Signal']
+            )
+            if not go_signal:
+                continue
+
+            entry = float(last['Close'])
+            tp = entry * (1 + backtest_tp)
+            sl = entry * (1 - backtest_sl)
+            exit_price = entry
+            hit_tp = hit_sl = False
+
+            # Simulate TP/SL for the next X bars (first 5 bars of next day)
+            next_days = sorted(df['Date'].unique())
+            next_idx = next_days.index(date) + 1
+            if next_idx < len(next_days):
+                next_day = df[df['Date'] == next_days[next_idx]]
+                for _, bar in next_day.iloc[:5].iterrows():
+                    if bar['High'] >= tp:
+                        exit_price = tp
+                        hit_tp = True
+                        break
+                    if bar['Low'] <= sl:
+                        exit_price = sl
+                        hit_sl = True
+                        break
+                    exit_price = bar['Close']
+
+            pnl = exit_price - entry
+            pnl_pct = pnl / entry * 100
+
+            backtest_results.append({
+                "Ticker": ticker,
+                "Date": date,
+                "Entry": f"{entry:.2f}",
+                "Exit": f"{exit_price:.2f}",
+                "PnL %": f"{pnl_pct:.2f}",
+                "TP?": "✅" if hit_tp else "",
+                "SL?": "✅" if hit_sl else "",
+            })
+
+    if backtest_results:
+        df_bt = pd.DataFrame(backtest_results)
+        st.dataframe(df_bt)
+        wins = df_bt[df_bt['PnL %'].astype(float) > 0]
+        losses = df_bt[df_bt['PnL %'].astype(float) <= 0]
+        st.markdown(f"**Total Trades:** {len(df_bt)}")
+        st.markdown(f"**Win Rate:** {len(wins) / len(df_bt) * 100:.1f}%")
+        st.markdown(f"**Avg Win:** {wins['PnL %'].astype(float).mean():.2f}%")
+        st.markdown(f"**Avg Loss:** {losses['PnL %'].astype(float).mean():.2f}%")
+    else:
+        st.warning("No GO Day signals found in backtest window.")
+
 # --- ALERTS ---
 # Only send alerts for NEW screener hits each run (in-memory)
 if 'alerted_tickers' not in st.session_state:
@@ -420,9 +508,7 @@ def log_to_google_sheet(row_dict, section_name):
     gc = gspread.authorize(creds)
     worksheet = gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
 
-    # Prepare row to write
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Pick key columns for logging (add/remove as needed)
     log_row = [
         now,
         section_name,
