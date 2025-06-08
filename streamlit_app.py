@@ -34,8 +34,12 @@ if not spy.empty and not qqq.empty and not vxx.empty:
         spy_volume = spy['Volume'].iloc[-1]
         spy_avg_volume = spy['Volume'].rolling(window=10).mean().iloc[-1]
         spy_atr = (spy['High'] - spy['Low']).rolling(window=14).mean().iloc[-1]
-        close_last = spy['Close'].iloc[-1]
-        if pd.notna(close_last) and close_last != 0:
+        # Defensive get last close as float
+        try:
+            close_last = float(spy['Close'].iloc[-1])
+        except Exception:
+            close_last = 0
+        if close_last != 0:
             atr_percent = spy_atr / close_last
         else:
             atr_percent = 0
