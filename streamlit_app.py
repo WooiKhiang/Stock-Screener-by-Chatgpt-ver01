@@ -8,18 +8,18 @@ import csv
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ========== USER CONFIG ==========
+# --------- SETTINGS (FILL THESE!) ---------
 TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
 TELEGRAM_CHAT_ID = "713264762"
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "Sheet1"
 ALERT_LOG = "alerts_log.csv"
 
-# ====== STREAMLIT CONFIG ======
+# --------- STREAMLIT PAGE CONFIG ---------
 st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
 
-# ---- Sidebar: Screener Criteria ----
+# --------- SIDEBAR ---------
 with st.sidebar.expander("🔎 Screener Criteria", expanded=True):
     min_price = st.number_input("Min Price ($)", value=5.0)
     max_price = st.number_input("Max Price ($)", value=500.0)
@@ -30,20 +30,18 @@ with st.sidebar.expander("🔎 Screener Criteria", expanded=True):
     ema200_lookback = st.number_input("EMA200 Breakout Lookback Bars", value=6, min_value=1, max_value=48)
     pullback_lookback = st.number_input("VWAP/EMA Pullback Lookback Bars", value=6, min_value=2, max_value=20)
 
-# ---- Sidebar: Profit & Risk Planner ----
 with st.sidebar.expander("💰 Profit & Risk Planner", expanded=True):
     capital = st.number_input("Capital per Trade ($)", value=1000.0, step=100.0)
     take_profit_pct = st.number_input("Take Profit (%)", value=2.0, min_value=0.5, max_value=10.0, step=0.1) / 100
     cut_loss_pct = st.number_input("Cut Loss (%)", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
 
-# ---- Sidebar: Backtest ----
 with st.sidebar.expander("🕰️ Backtest (GO Day Open Breakout)", expanded=False):
     run_backtest = st.checkbox("Run GO Day Backtest Now")
     lookback_days = st.number_input("Backtest: Days", value=10, min_value=2, max_value=30, step=1)
     backtest_tp = st.number_input("Backtest: Take Profit %", value=2.0, min_value=0.5, max_value=10.0, step=0.1) / 100
     backtest_sl = st.number_input("Backtest: Stop Loss %", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
 
-# ---- Watchlist (S&P 100) ----
+# --------- WATCHLIST ---------
 watchlist = [
     "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMGN","AMT","AMZN","AVGO",
     "AXP","BA","BAC","BK","BKNG","BLK","BMY","BRK.B","C","CAT",
@@ -58,7 +56,7 @@ watchlist = [
     "WFC","WMT","XOM"
 ]
 
-# ====== Utility Functions ======
+# --------- UTILS ---------
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
@@ -89,22 +87,25 @@ def log_to_google_sheet(row_dict, section_name):
         worksheet = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_row = [
-            now,
-            section_name,
-            row_dict.get("Ticker"),
-            row_dict.get("Price"),
-            row_dict.get("Target Price"),
-            row_dict.get("Cut Loss Price"),
-            row_dict.get("Position Size"),
-            row_dict.get("Max Loss at Stop"),
-            row_dict.get("Support"),
-            row_dict.get("Resistance"),
+            now, section_name,
+            row_dict.get("Ticker"), row_dict.get("Price"),
+            row_dict.get("Target Price"), row_dict.get("Cut Loss Price"),
+            row_dict.get("Position Size"), row_dict.get("Max Loss at Stop"),
             row_dict.get("Reasons"),
         ]
         worksheet.append_row(log_row, value_input_option="USER_ENTERED")
     except Exception as e:
         st.warning(f"Failed to log to Google Sheet: {e}")
 
+def calc_support_resistance(prices, lookback=48):
+    sub = prices.iloc[-lookback:] if len(prices) >= lookback else prices
+    if sub.empty or sub.isnull().any():
+        return "", ""
+    support = sub.min()
+    resistance = sub.max()
+    return f"{support:.2f}", f"{resistance:.2f}"
+
+# --------- DATA FETCH ---------
 def get_data(ticker):
     end = datetime.now()
     start = end - timedelta(days=5)
@@ -118,20 +119,13 @@ def get_intraday_data(ticker):
         return None
     return df
 
-def calc_support_resistance(prices, lookback=48):
-    if len(prices) < lookback or prices.iloc[-lookback:].isnull().any():
-        return "", ""
-    support = prices.iloc[-lookback:].min()
-    resistance = prices.iloc[-lookback:].max()
-    return f"{support:.2f}", f"{resistance:.2f}"
-
-def scan_stock_all(
-    ticker, spy_change, min_price, max_price, min_avg_vol,
-    ema200_lookback, pullback_lookback, capital, take_profit_pct, cut_loss_pct
-):
+# --------- SCAN STOCK ---------
+def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200_lookback, pullback_lookback,
+                   capital, take_profit_pct, cut_loss_pct):
     df = get_intraday_data(ticker)
     if df is None or len(df) < 22:
         return None
+
     today = df[df.index.date == df.index[-1].date()]
     if today.empty or len(today) < 10:
         return None
@@ -157,9 +151,13 @@ def scan_stock_all(
         return None
 
     rs_score = today_change - spy_change
-    support, resistance = calc_support_resistance(today["Close"], lookback=48)
 
-    # EMA, VWAP, MACD, etc
+    try:
+        last_hour = today.iloc[-12:]
+        volume_spike = any(last_hour["Volume"] > 2 * avg_vol)
+    except Exception:
+        volume_spike = False
+
     try:
         vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
         price_above_vwap = today_close > float(vwap.iloc[-1])
@@ -180,7 +178,7 @@ def scan_stock_all(
         price_above_ema10 = price_above_ema20 = price_above_ema50 = price_above_ema200 = False
         ema200 = 0
 
-    # EMA200 Breakout
+    # EMA200 Breakout: crossed within last N bars and still above
     try:
         ema200_breakout = False
         if len(today) > ema200_lookback:
@@ -195,6 +193,15 @@ def scan_stock_all(
             ema200_breakout = ema200_breakout and (today_close > ema200)
     except Exception:
         ema200_breakout = False
+
+    try:
+        exp12 = today["Close"].ewm(span=12).mean()
+        exp26 = today["Close"].ewm(span=26).mean()
+        macd = exp12 - exp26
+        signal = macd.ewm(span=9).mean()
+        macd_bullish = float(macd.iloc[-1]) > float(signal.iloc[-1])
+    except Exception:
+        macd_bullish = False
 
     # VWAP/EMA20 Pullback Bounce logic
     try:
@@ -213,14 +220,17 @@ def scan_stock_all(
     except Exception:
         pullback = False
 
-    # Core strategies
+    support, resistance = calc_support_resistance(today["Close"], lookback=48)
+
     go_criteria = (
         price_above_ema10 and price_above_ema20 and price_above_ema50 and
-        price_above_vwap and rs_score > 0
+        macd_bullish and volume_spike and rs_score > 0
     )
+
     nogo_criteria = (
         price_above_ema50 and not (price_above_ema10 and price_above_ema20) and rs_score > -1
     )
+
     accumulation_criteria = (
         rs_score > 0 and price_above_ema10 and price_above_ema20
     )
@@ -232,12 +242,16 @@ def scan_stock_all(
         reasons.append("VWAP Reclaim")
     if price_above_ema10 and price_above_ema20:
         reasons.append("EMA Alignment")
+    if volume_spike:
+        reasons.append("Volume Spike")
+    if macd_bullish:
+        reasons.append("MACD Bullish")
     if ema200_breakout:
         reasons.append(f"EMA200 Breakout ({ema200_lookback} bars)")
     if pullback:
         reasons.append(f"VWAP/EMA20 Pullback ({pullback_lookback} bars)")
 
-    # Trade management
+    # --- Trade management values ---
     target_price = price * (1 + take_profit_pct)
     cut_loss_price = price * (1 - cut_loss_pct)
     risk_per_share = price - cut_loss_price
@@ -252,51 +266,98 @@ def scan_stock_all(
         "High": f"{today_high:.2f}",
         "Low": f"{today_low:.2f}",
         "Change %": f"{today_change:.2f}",
+        "Support": support,
+        "Resistance": resistance,
         "Avg Volume": f"{avg_vol:,.0f}",
         "Volume": f"{volume:,.0f}",
         "Rel Vol": f"{rel_vol:.2f}",
-        "Support": support,
-        "Resistance": resistance,
+        "RS vs SPY": f"{rs_score:.2f}",
         "VWAP": "Yes" if price_above_vwap else "No",
         "EMA 10": "Yes" if price_above_ema10 else "No",
         "EMA 20": "Yes" if price_above_ema20 else "No",
         "EMA 50": "Yes" if price_above_ema50 else "No",
         "EMA 200": f"{ema200:.2f}",
+        "Volume Spike": "Yes" if volume_spike else "No",
+        "MACD Bullish": "Yes" if macd_bullish else "No",
+        "Reasons": ", ".join(reasons),
         "GO": go_criteria,
         "NO-GO": nogo_criteria,
         "Accumulation": accumulation_criteria,
         "EMA200 Breakout": ema200_breakout,
-        "VWAP/EMA20 Pullback": pullback,
+        "Pullback Bounce": pullback,
         "Target Price": f"{target_price:.2f}",
         "Cut Loss Price": f"{cut_loss_price:.2f}",
         "Position Size": position_size,
         "Max Loss at Stop": f"{max_loss:.2f}",
-        "Reasons": ", ".join(reasons),
     }
 
-# ==== Load Market Data (SPY/QQQ) and Screen Stocks ====
+# --------- MARKET SENTIMENT ---------
 spy = get_data('SPY')
 qqq = get_data('QQQ')
+spy_change = 0
+qqq_change = 0
+vol_factor_val = 0
+atr_percent = 0
+
 if not spy.empty and not qqq.empty:
     try:
         spy_change = (float(spy['Close'].iloc[-1]) - float(spy['Close'].iloc[-2])) / float(spy['Close'].iloc[-2]) * 100
         qqq_change = (float(qqq['Close'].iloc[-1]) - float(qqq['Close'].iloc[-2])) / float(qqq['Close'].iloc[-2]) * 100
     except Exception:
         spy_change = qqq_change = 0
+    if len(spy) > 15:
+        try:
+            spy_volume = float(spy['Volume'].iloc[-1])
+        except Exception:
+            spy_volume = 0
+        try:
+            spy_avg_volume = float(spy['Volume'].rolling(window=10).mean().iloc[-1])
+        except Exception:
+            spy_avg_volume = 0
+        try:
+            spy_atr = float((spy['High'] - spy['Low']).rolling(window=14).mean().iloc[-1])
+        except Exception:
+            spy_atr = 0
+        try:
+            close_last = float(spy['Close'].iloc[-1])
+        except Exception:
+            close_last = 0
+        if close_last != 0:
+            atr_percent = spy_atr / close_last
+        else:
+            atr_percent = 0
+        if pd.notna(spy_avg_volume) and spy_avg_volume != 0:
+            vol_factor_val = spy_volume / spy_avg_volume
+        else:
+            vol_factor_val = 0
+    else:
+        spy_volume = spy_avg_volume = spy_atr = atr_percent = vol_factor_val = 0
+
     st.subheader("Today's Market Conditions")
     st.markdown(f"**SPY Change:** {spy_change:.2f}%")
     st.markdown(f"**QQQ Change:** {qqq_change:.2f}%")
-    # Sentiment summary
-    go_day = spy_change >= min_index_change and qqq_change >= min_index_change
+    st.markdown(f"**Volume Factor:** {vol_factor_val:.2f}x")
+    st.markdown(f"**ATR %:** {atr_percent:.3f}")
+
+    st.subheader("GO/NO-GO Signal")
+    go_day = (
+        spy_change >= min_index_change and
+        qqq_change >= min_index_change and
+        vol_factor_val >= volume_factor and
+        atr_percent <= max_atr_percent
+    )
     if go_day:
-        st.success("🟢 GO DAY: Market is risk-on! Look for breakouts and momentum trades.")
+        st.success("GO DAY! Risk-on opportunities detected.")
     else:
-        st.warning("🔴 NO-GO DAY: Market risk is high, focus on capital protection or defensive plays.")
+        st.error("NO-GO DAY. Consider capital protection strategies.")
+
 else:
     st.warning("⚠️ Could not load recent market data. Try again later.")
     go_day = False
 
-# ==== Main Screening ====
+st.caption("Data source: Yahoo Finance")
+
+# --------- SCREENER RESULTS ---------
 results = []
 for ticker in watchlist:
     result = scan_stock_all(
@@ -310,7 +371,17 @@ for ticker in watchlist:
         results.append(result)
 df_results = pd.DataFrame(results) if results else pd.DataFrame()
 
-def show_section(title, filter_column, cols):
+trade_cols = [
+    "Target Price", "Cut Loss Price", "Position Size", "Max Loss at Stop"
+]
+cols = [
+    "Ticker", "Price", "Open", "Close", "High", "Low", "Change %",
+    "Support", "Resistance", "Avg Volume", "Volume", "Rel Vol",
+    "RS vs SPY", "VWAP", "EMA 10", "EMA 20", "EMA 50", "EMA 200",
+    "Volume Spike", "MACD Bullish", "Reasons"
+] + trade_cols
+
+def show_section(title, filter_column):
     st.subheader(title)
     if not df_results.empty:
         df = df_results[df_results[filter_column] == True]
@@ -321,32 +392,24 @@ def show_section(title, filter_column, cols):
     else:
         st.info("No data for stock screening.")
 
-trade_cols = [
-    "Target Price", "Cut Loss Price", "Position Size", "Max Loss at Stop"
-]
-main_cols = [
-    "Ticker", "Price", "Open", "Close", "High", "Low", "Change %",
-    "Volume", "Avg Volume", "Rel Vol", "Support", "Resistance",
-    "VWAP", "EMA 10", "EMA 20", "EMA 50", "EMA 200", "Reasons"
-]
-# Main strategies
-show_section("Go Day Stock Recommendations (Momentum/Breakout)", "GO", main_cols + trade_cols)
-show_section("No-Go Day Stock Recommendations (Defensive/Resilient)", "NO-GO", main_cols + trade_cols)
-show_section("Potential Institutional Accumulation Screener", "Accumulation", main_cols + trade_cols)
-show_section("EMA200 Breakout Reversal Screener", "EMA200 Breakout", main_cols + trade_cols)
-show_section("VWAP/EMA20 Pullback Bounce Screener", "VWAP/EMA20 Pullback", main_cols + trade_cols)
+show_section("Go Day Stock Recommendations (Momentum/Breakout)", "GO")
+show_section("No-Go Day Stock Recommendations (Defensive/Resilient)", "NO-GO")
+show_section("Potential Institutional Accumulation Screener", "Accumulation")
+show_section("EMA200 Breakout Reversal Screener", "EMA200 Breakout")
+show_section("VWAP/EMA20 Pullback Bounce Screener", "Pullback Bounce")
 
-# ====== ALERTS & LOGGING ======
+# --------- ALERTS & GOOGLE SHEET LOG ---------
 if 'alerted_tickers' not in st.session_state:
     st.session_state['alerted_tickers'] = set()
 alerted_tickers = st.session_state['alerted_tickers']
-for idx, row in df_results.iterrows():
+
+for _, row in df_results.iterrows():
     for section_name, filter_col in [
         ("GO Day", "GO"),
         ("No-Go Day", "NO-GO"),
         ("Institutional Accumulation", "Accumulation"),
         ("EMA200 Breakout", "EMA200 Breakout"),
-        ("VWAP/EMA20 Pullback", "VWAP/EMA20 Pullback")
+        ("VWAP/EMA Pullback", "Pullback Bounce")
     ]:
         if row[filter_col]:
             ticker = row["Ticker"]
@@ -356,7 +419,6 @@ for idx, row in df_results.iterrows():
                     f"Ticker: {ticker}\n"
                     f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
                     f"Position: {row['Position Size']} shares | Max Loss: ${row['Max Loss at Stop']}\n"
-                    f"Support: {row['Support']} | Resistance: {row['Resistance']}\n"
                     f"Reasons: {row['Reasons']}"
                 )
                 send_telegram_alert(msg)
@@ -365,44 +427,39 @@ for idx, row in df_results.iterrows():
                 alerted_tickers.add((ticker, section_name))
 st.session_state['alerted_tickers'] = alerted_tickers
 
-# ====== AI Top 5 Picks Table ======
+# --------- AI TOP 5 PICKS ---------
 if not df_results.empty:
-    ai_picks = df_results.copy()
-    # Score: higher RS, price above support, within 5% of support, GO flag
-    def score_fn(row):
+    # Use a simple AI scoring: strong RS, volume spike, EMA alignment, MACD bullish, support close to price, etc.
+    def ai_score(row):
         score = 0
-        if row["GO"]: score += 2
-        if row["EMA200 Breakout"]: score += 1.5
-        if row["VWAP/EMA20 Pullback"]: score += 1.5
+        if "Strong RS" in row["Reasons"]: score += 2
+        if "EMA Alignment" in row["Reasons"]: score += 1
+        if "MACD Bullish" in row["Reasons"]: score += 1
+        if "Volume Spike" in row["Reasons"]: score += 1
+        if row["VWAP"] == "Yes": score += 1
+        if row["EMA200 Breakout"]: score += 1
+        if row["Pullback Bounce"]: score += 1
         try:
-            support = float(row["Support"])
             price = float(row["Price"])
-            if price > support and (price - support)/support < 0.05:
-                score += 1.2
-        except: pass
-        try:
-            rs = float(row["Change %"])
-            score += max(0, rs/2)
-        except: pass
+            support = float(row["Support"]) if row["Support"] != "" else 0
+            if price - support < 1.5: score += 1
+        except:
+            pass
         return score
-    ai_picks["AI Score"] = ai_picks.apply(score_fn, axis=1)
-    ai_picks = ai_picks.sort_values("AI Score", ascending=False)
-    top5 = ai_picks.head(5).copy()
-    # Dummy logic for confidence and reason
-    top5["Confidence Level"] = (top5["AI Score"] / top5["AI Score"].max() * 90 + 10).round(1).astype(str) + "%"
-    top5["AI Reasoning"] = [
-        "Strong RS, technical alignment" if r["GO"] else "Technical setup, but watch liquidity"
-        for _, r in top5.iterrows()
-    ]
-    ai_cols = ["Ticker", "Price", "AI Score", "Confidence Level", "AI Reasoning"] + trade_cols + ["Support", "Resistance"]
-    st.subheader("🤖 Top 5 AI Picks of the Day")
-    st.dataframe(top5[ai_cols])
 
-# ====== Backtest Module ======
+    df_results["AI Score"] = df_results.apply(ai_score, axis=1)
+    top5 = df_results.sort_values("AI Score", ascending=False).head(5).copy()
+    top5["Confidence Level"] = (top5["AI Score"] / top5["AI Score"].max() * 100).astype(int).astype(str) + "%"
+    top5["AI Reasoning"] = "High score from RS/EMA/MACD/Volume/support."
+    st.subheader("🔝 Top 5 AI Picks of the Day")
+    st.dataframe(top5[["Ticker", "Price", "AI Score", "Confidence Level", "AI Reasoning"] + trade_cols])
+
+# --------- BACKTEST MODULE ---------
 if run_backtest:
     st.subheader(f"GO Day Backtest Results (last {lookback_days} days)")
+    from tqdm import tqdm
     bt_results = []
-    for ticker in watchlist:
+    for ticker in tqdm(watchlist):
         df = yf.download(ticker, period=f"{lookback_days+2}d", interval='5m', progress=False)
         if df.empty: continue
         df['Date'] = df.index.date
@@ -436,6 +493,4 @@ if run_backtest:
         st.dataframe(df_bt.tail(100))
     else:
         st.info("No backtest results found. Try a smaller watchlist or different settings.")
-
-st.caption("Data source: Yahoo Finance")
 
