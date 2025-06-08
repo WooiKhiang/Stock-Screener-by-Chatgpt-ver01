@@ -8,23 +8,18 @@ import csv
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# --- CONFIG ---
+# ------------------- CONFIGURATION -------------------
 st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
 
-# ---- Telegram Alert Settings ----
 TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
+GOOGLE_SHEET_ID = "YOUR_GOOGLE_SHEET_ID"
+GOOGLE_SHEET_NAME = "Sheet1"
 
-def send_telegram_alert(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    try:
-        requests.post(url, data=payload)
-    except Exception as e:
-        st.warning(f"Failed to send Telegram alert: {e}")
+ALERT_LOG = "alerts_log.csv"
 
-# ---- Sidebar: Screener Criteria ----
+# ------------------- SIDEBAR -------------------
 with st.sidebar.expander("🔎 Screener Criteria", expanded=True):
     min_price = st.number_input("Min Price ($)", value=5.0)
     max_price = st.number_input("Max Price ($)", value=500.0)
@@ -35,20 +30,18 @@ with st.sidebar.expander("🔎 Screener Criteria", expanded=True):
     ema200_lookback = st.number_input("EMA200 Breakout Lookback Bars", value=6, min_value=1, max_value=48)
     pullback_lookback = st.number_input("VWAP/EMA Pullback Lookback Bars", value=6, min_value=2, max_value=20)
 
-# ---- Sidebar: Profit & Risk Planner ----
 with st.sidebar.expander("💰 Profit & Risk Planner", expanded=True):
     capital = st.number_input("Capital per Trade ($)", value=1000.0, step=100.0)
     take_profit_pct = st.number_input("Take Profit (%)", value=2.0, min_value=0.5, max_value=10.0, step=0.1) / 100
     cut_loss_pct = st.number_input("Cut Loss (%)", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
 
-# ---- Sidebar: Backtest ----
-with st.sidebar.expander("🕰️ Backtest (GO Day Open Breakout)", expanded=False):
-    run_backtest = st.checkbox("Run GO Day Backtest Now")
-    lookback_days = st.number_input("Backtest: Days", value=10, min_value=2, max_value=30, step=1)
-    backtest_tp = st.number_input("Backtest: Take Profit %", value=2.0, min_value=0.5, max_value=10.0, step=0.1) / 100
-    backtest_sl = st.number_input("Backtest: Stop Loss %", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
+with st.sidebar.expander("🔁 Backtest", expanded=False):
+    run_backtest = st.checkbox("Run GO Day Backtest")
+    lookback_days = st.slider("Backtest Lookback Days", 5, 30, 10)
+    backtest_tp = st.number_input("Backtest Take Profit %", value=2.0) / 100
+    backtest_sl = st.number_input("Backtest Cut Loss %", value=1.0) / 100
 
-# ---- S&P 100 Watchlist ----
+# ------------------- WATCHLIST -------------------
 watchlist = [
     "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMGN","AMT","AMZN","AVGO",
     "AXP","BA","BAC","BK","BKNG","BLK","BMY","BRK.B","C","CAT",
@@ -63,7 +56,75 @@ watchlist = [
     "WFC","WMT","XOM"
 ]
 
-# ---- Data Fetching ----
+# ------------------- FUNCTION DEFINITIONS -------------------
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        requests.post(url, data=payload)
+    except Exception as e:
+        st.warning(f"Failed to send Telegram alert: {e}")
+
+def was_alerted_today(ticker, section_name):
+    today_str = str(date.today())
+    if os.path.exists(ALERT_LOG):
+        with open(ALERT_LOG, "r") as f:
+            for row in csv.reader(f):
+                if len(row) == 3 and row[0] == today_str and row[1] == section_name and row[2] == ticker:
+                    return True
+    return False
+
+def add_to_alert_log(ticker, section_name):
+    today_str = str(date.today())
+    with open(ALERT_LOG, "a", newline="") as f:
+        csv.writer(f).writerow([today_str, section_name, ticker])
+
+def log_to_google_sheet(row_dict, section_name):
+    SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    try:
+        if "gcp_service_account" in st.secrets:
+            creds_dict = st.secrets["gcp_service_account"]
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
+        else:
+            creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", SCOPE)
+        gc = gspread.authorize(creds)
+        worksheet = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_row = [
+            now,
+            section_name,
+            row_dict.get("Ticker"),
+            row_dict.get("Price"),
+            row_dict.get("Target Price"),
+            row_dict.get("Cut Loss Price"),
+            row_dict.get("Position Size"),
+            row_dict.get("Max Loss at Stop"),
+            row_dict.get("Reasons"),
+        ]
+        worksheet.append_row(log_row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        st.warning(f"Failed to log to Google Sheet: {e}")
+
+def alert_for_section(section_name, filter_col, df_results, alerted_tickers):
+    if not df_results.empty:
+        new_hits = df_results[df_results[filter_col] == True]
+        for _, row in new_hits.iterrows():
+            ticker = row["Ticker"]
+            # Only alert if not alerted today
+            if not was_alerted_today(ticker, section_name):
+                alert_msg = (
+                    f"📈 {section_name} ALERT!\n"
+                    f"Ticker: {ticker}\n"
+                    f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
+                    f"Position: {row['Position Size']} shares | Max Loss: ${row['Max Loss at Stop']}\n"
+                    f"Reasons: {row['Reasons']}"
+                )
+                send_telegram_alert(alert_msg)
+                add_to_alert_log(ticker, section_name)
+                log_to_google_sheet(row, section_name)
+                alerted_tickers.add((ticker, section_name))
+    return alerted_tickers
+
 def get_data(ticker):
     end = datetime.now()
     start = end - timedelta(days=5)
@@ -135,7 +196,6 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         price_above_ema10 = price_above_ema20 = price_above_ema50 = price_above_ema200 = False
         ema200 = 0
 
-    # EMA200 Breakout: crossed within last N bars and still above
     try:
         ema200_breakout = False
         if len(today) > ema200_lookback:
@@ -160,7 +220,6 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     except Exception:
         macd_bullish = False
 
-    # VWAP/EMA20 Pullback Bounce logic
     try:
         pullback = False
         if len(today) > pullback_lookback:
@@ -181,15 +240,12 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         price_above_ema10 and price_above_ema20 and price_above_ema50 and
         macd_bullish and volume_spike and rs_score > 0
     )
-
     nogo_criteria = (
         price_above_ema50 and not (price_above_ema10 and price_above_ema20) and rs_score > -1
     )
-
     accumulation_criteria = (
         rs_score > 0 and price_above_ema10 and price_above_ema20
     )
-
     reasons = []
     if rs_score > 0:
         reasons.append("Strong RS")
@@ -206,7 +262,6 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
     if pullback:
         reasons.append(f"VWAP/EMA20 Pullback ({pullback_lookback} bars)")
 
-    # --- Trade management values ---
     target_price = price * (1 + take_profit_pct)
     cut_loss_price = price * (1 - cut_loss_pct)
     risk_per_share = price - cut_loss_price
@@ -244,71 +299,18 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         "Max Loss at Stop": f"{max_loss:.2f}",
     }
 
-# ---- ALERTS, LOGGING, AND TELEGRAM ----
-
-ALERT_LOG = "alerts_log.csv"
-
-def was_alerted_today(ticker, section_name):
-    today_str = str(date.today())
-    if os.path.exists(ALERT_LOG):
-        with open(ALERT_LOG, "r") as f:
-            for row in csv.reader(f):
-                if len(row) == 3 and row[0] == today_str and row[1] == section_name and row[2] == ticker:
-                    return True
-    return False
-
-def add_to_alert_log(ticker, section_name):
-    today_str = str(date.today())
-    with open(ALERT_LOG, "a", newline="") as f:
-        csv.writer(f).writerow([today_str, section_name, ticker])
-
-def log_to_google_sheet(row_dict, section_name):
-    SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    SHEET_ID = "YOUR_GOOGLE_SHEET_ID"
-    SHEET_NAME = "Sheet1"  # Change if you rename your worksheet
-    if "gcp_service_account" in st.secrets:
-        creds_dict = st.secrets["gcp_service_account"]
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
-    else:
-        creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", SCOPE)
-    gc = gspread.authorize(creds)
-    worksheet = gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_row = [
-        now,
-        section_name,
-        row_dict.get("Ticker"),
-        row_dict.get("Price"),
-        row_dict.get("Target Price"),
-        row_dict.get("Cut Loss Price"),
-        row_dict.get("Position Size"),
-        row_dict.get("Max Loss at Stop"),
-        row_dict.get("Reasons"),
-    ]
-    worksheet.append_row(log_row, value_input_option="USER_ENTERED")
-
-if 'alerted_tickers' not in st.session_state:
-    st.session_state['alerted_tickers'] = set()
-alerted_tickers = st.session_state['alerted_tickers']
-
-def alert_for_section(section_name, filter_col):
+def show_section(title, filter_column, columns, df_results):
+    st.subheader(title)
     if not df_results.empty:
-        new_hits = df_results[df_results[filter_col] == True]
-        for _, row in new_hits.iterrows():
-            ticker = row["Ticker"]
-            if not was_alerted_today(ticker, section_name):
-                alert_msg = (
-                    f"📈 {section_name} ALERT!\n"
-                    f"Ticker: {ticker}\n"
-                    f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
-                    f"Position: {row['Position Size']} shares | Max Loss: ${row['Max Loss at Stop']}\n"
-                    f"Reasons: {row['Reasons']}"
-                )
-                send_telegram_alert(alert_msg)
-                add_to_alert_log(ticker, section_name)
-                log_to_google_sheet(row, section_name)
+        df = df_results[df_results[filter_column] == True]
+        if not df.empty:
+            st.dataframe(df[columns])
+        else:
+            st.info(f"No stocks meet {title.lower()} criteria.")
+    else:
+        st.info("No data for stock screening.")
 
-# ---- Go/No-Go Dashboard Logic ----
+# ------------- MAIN LOGIC (AFTER DEFINITIONS) -------------
 spy = get_data('SPY')
 qqq = get_data('QQQ')
 
@@ -376,8 +378,6 @@ else:
 
 st.caption("Data source: Yahoo Finance")
 
-# ---- Section: Stock Screens ----
-
 results = []
 for ticker in watchlist:
     result = scan_stock_all(
@@ -391,17 +391,6 @@ for ticker in watchlist:
         results.append(result)
 df_results = pd.DataFrame(results) if results else pd.DataFrame()
 
-def show_section(title, filter_column, columns):
-    st.subheader(title)
-    if not df_results.empty:
-        df = df_results[df_results[filter_column] == True]
-        if not df.empty:
-            st.dataframe(df[columns])
-        else:
-            st.info(f"No stocks meet {title.lower()} criteria.")
-    else:
-        st.info("No data for stock screening.")
-
 common_trade_cols = ["Target Price", "Cut Loss Price", "Position Size", "Max Loss at Stop"]
 
 show_section(
@@ -410,7 +399,8 @@ show_section(
     [
         "Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol",
         "RS vs SPY", "VWAP", "EMA 10", "EMA 20", "EMA 50", "MACD Bullish", "Reasons"
-    ] + common_trade_cols
+    ] + common_trade_cols,
+    df_results
 )
 
 show_section(
@@ -419,7 +409,8 @@ show_section(
     [
         "Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol",
         "RS vs SPY", "EMA 50", "Reasons"
-    ] + common_trade_cols
+    ] + common_trade_cols,
+    df_results
 )
 
 show_section(
@@ -428,7 +419,8 @@ show_section(
     [
         "Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol",
         "RS vs SPY", "VWAP", "EMA 10", "EMA 20", "Reasons"
-    ] + common_trade_cols
+    ] + common_trade_cols,
+    df_results
 )
 
 show_section(
@@ -437,7 +429,8 @@ show_section(
     [
         "Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol",
         "RS vs SPY", "EMA 200", "VWAP", "Reasons"
-    ] + common_trade_cols
+    ] + common_trade_cols,
+    df_results
 )
 
 show_section(
@@ -446,56 +439,66 @@ show_section(
     [
         "Ticker", "Price", "Open", "Close", "High", "Low", "Change %", "Volume", "Avg Volume", "Rel Vol",
         "RS vs SPY", "VWAP", "EMA 20", "Reasons"
-    ] + common_trade_cols
+    ] + common_trade_cols,
+    df_results
 )
 
-# --- ALERTS & LOGGING (must come AFTER function definitions) ---
-alert_for_section("GO Day", "GO")
-alert_for_section("No-Go Day", "NO-GO")
-alert_for_section("Institutional Accumulation", "Accumulation")
-alert_for_section("EMA200 Breakout", "EMA200 Breakout")
-alert_for_section("VWAP/EMA Pullback", "Pullback Bounce")
+# ----------- ALERTS ---------
+if 'alerted_tickers' not in st.session_state:
+    st.session_state['alerted_tickers'] = set()
+alerted_tickers = st.session_state['alerted_tickers']
 
+alerted_tickers = alert_for_section("GO Day", "GO", df_results, alerted_tickers)
+alerted_tickers = alert_for_section("No-Go Day", "NO-GO", df_results, alerted_tickers)
+alerted_tickers = alert_for_section("Institutional Accumulation", "Accumulation", df_results, alerted_tickers)
+alerted_tickers = alert_for_section("EMA200 Breakout", "EMA200 Breakout", df_results, alerted_tickers)
+alerted_tickers = alert_for_section("VWAP/EMA Pullback", "Pullback Bounce", df_results, alerted_tickers)
 st.session_state['alerted_tickers'] = alerted_tickers
 
-# --- BACKTEST MODULE ---
+# ----------- BACKTEST MODULE (Basic Example) ---------
 if run_backtest:
-    st.subheader(f"GO Day Backtest Results (last {lookback_days} days)")
-    # Loop through tickers, download historical 5m data, simulate buy on open if Go Day, TP/SL.
-    bt_results = []
-    for ticker in stqdm(watchlist, desc="Backtesting..."):
-        df = yf.download(ticker, period=f"{lookback_days+2}d", interval='5m', progress=False)
-        if df.empty: continue
-        df['Date'] = df.index.date
-        day_groups = df.groupby('Date')
-        for d, group in day_groups:
-            if len(group) < 20: continue
-            o = group['Open'].iloc[0]
-            h = group['High'].max()
-            l = group['Low'].min()
-            c = group['Close'].iloc[-1]
-            # Simulate: Buy open, TP/SL in day
-            tp = o * (1 + backtest_tp)
-            sl = o * (1 - backtest_sl)
-            hit_tp = (group['High'] >= tp).any()
-            hit_sl = (group['Low'] <= sl).any()
-            win = None
-            if hit_tp and hit_sl:
-                # Whichever happened first
-                tp_idx = group[group['High'] >= tp].index[0]
-                sl_idx = group[group['Low'] <= sl].index[0]
-                win = tp_idx < sl_idx
-            elif hit_tp:
-                win = True
-            elif hit_sl:
-                win = False
-            else:
-                win = c > o
-            bt_results.append({'Ticker': ticker, 'Date': d, 'Open': o, 'Close': c, 'TP_hit': hit_tp, 'SL_hit': hit_sl, 'Win': win})
-    if bt_results:
-        df_bt = pd.DataFrame(bt_results)
-        win_rate = df_bt['Win'].mean() * 100
-        st.markdown(f"**Backtest Win Rate:** {win_rate:.2f}%  (sample size: {len(df_bt)})")
-        st.dataframe(df_bt.tail(100))
+    st.header("🔁 GO Day Backtest Results (Experimental)")
+    from stqdm import stqdm
+
+    backtest_results = []
+    lookback_dates = [datetime.now() - timedelta(days=i) for i in range(1, lookback_days+1)]
+    for bt_date in stqdm(lookback_dates, desc="Backtesting..."):
+        # 1. Fetch SPY/QQQ data for bt_date
+        spy_hist = yf.download("SPY", start=bt_date.strftime("%Y-%m-%d"), end=(bt_date + timedelta(days=2)).strftime("%Y-%m-%d"), interval="5m", progress=False)
+        qqq_hist = yf.download("QQQ", start=bt_date.strftime("%Y-%m-%d"), end=(bt_date + timedelta(days=2)).strftime("%Y-%m-%d"), interval="5m", progress=False)
+        if len(spy_hist) < 2 or len(qqq_hist) < 2:
+            continue
+        spy_chg = (spy_hist['Close'][-1] - spy_hist['Close'][-2]) / spy_hist['Close'][-2] * 100
+        qqq_chg = (qqq_hist['Close'][-1] - qqq_hist['Close'][-2]) / qqq_hist['Close'][-2] * 100
+        # GO Day logic:
+        if spy_chg >= min_index_change and qqq_chg >= min_index_change:
+            # Just sample first 5 tickers for demo backtest:
+            for ticker in watchlist[:5]:
+                stock_hist = yf.download(ticker, start=bt_date.strftime("%Y-%m-%d"), end=(bt_date + timedelta(days=2)).strftime("%Y-%m-%d"), interval="5m", progress=False)
+                if stock_hist.empty or len(stock_hist) < 2:
+                    continue
+                open_p = stock_hist["Open"][0]
+                high_p = stock_hist["High"].max()
+                tp = open_p * (1 + backtest_tp)
+                sl = open_p * (1 - backtest_sl)
+                win = high_p >= tp
+                loss = stock_hist["Low"].min() <= sl
+                backtest_results.append({
+                    "Date": bt_date.strftime("%Y-%m-%d"),
+                    "Ticker": ticker,
+                    "Open": open_p,
+                    "High": high_p,
+                    "TP": tp,
+                    "SL": sl,
+                    "Win": win,
+                    "Loss": loss
+                })
+    if backtest_results:
+        df_bt = pd.DataFrame(backtest_results)
+        st.dataframe(df_bt)
+        winrate = df_bt['Win'].sum() / len(df_bt)
+        st.success(f"Winrate (TP hit): {winrate:.1%}")
     else:
-        st.info("No backtest results found. Try a smaller watchlist or different settings.")
+        st.warning("No backtest results to show.")
+
+# ---- END OF SCRIPT ----
