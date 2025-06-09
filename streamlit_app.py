@@ -223,18 +223,27 @@ def scan_stock_all(
 # --- Market Sentiment Analysis ---
 spy = get_intraday_data('SPY')
 qqq = get_intraday_data('QQQ')
-spy_change = qqq_change = 0
+
+spy_change = 0.0
+qqq_change = 0.0
 
 if spy is not None and not spy.empty and qqq is not None and not qqq.empty:
     spy_today = spy[spy.index.date == spy.index[-1].date()]
     qqq_today = qqq[qqq.index.date == qqq.index[-1].date()]
     if len(spy_today) > 10 and len(qqq_today) > 10:
         try:
-            spy_change = (spy_today["Close"].iloc[-1] - spy_today["Open"].iloc[0]) / spy_today["Open"].iloc[0] * 100
-            qqq_change = (qqq_today["Close"].iloc[-1] - qqq_today["Open"].iloc[0]) / qqq_today["Open"].iloc[0] * 100
+            spy_open = float(spy_today["Open"].iloc[0])
+            spy_close = float(spy_today["Close"].iloc[-1])
+            qqq_open = float(qqq_today["Open"].iloc[0])
+            qqq_close = float(qqq_today["Close"].iloc[-1])
+            spy_change = float((spy_close - spy_open) / spy_open * 100) if spy_open != 0 else 0.0
+            qqq_change = float((qqq_close - qqq_open) / qqq_open * 100) if qqq_open != 0 else 0.0
         except Exception:
-            spy_change = qqq_change = 0
-        go_day = spy_change > min_index_change and qqq_change > min_index_change
+            spy_change = qqq_change = 0.0
+        try:
+            go_day = (float(spy_change) > float(min_index_change)) and (float(qqq_change) > float(min_index_change))
+        except Exception:
+            go_day = False
         st.session_state["GO_DAY"] = go_day
         st.subheader("Market Sentiment Panel")
         st.markdown(f"**SPY:** {spy_change:.2f}% | **QQQ:** {qqq_change:.2f}%")
