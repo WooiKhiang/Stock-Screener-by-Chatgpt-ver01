@@ -1,8 +1,8 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from datetime import datetime, timedelta, date
 import numpy as np
+from datetime import datetime, timedelta, date
 import requests
 
 # --- SETTINGS ---
@@ -17,7 +17,7 @@ st.title("US Market Go/No-Go Dashboard")
 with st.sidebar.expander("Screener Criteria", expanded=True):
     min_price = st.number_input("Min Price ($)", value=5.0)
     max_price = st.number_input("Max Price ($)", value=500.0)
-    min_avg_vol = st.number_input("Min Avg Volume", value=100000)  # Default 100,000
+    min_avg_vol = st.number_input("Min Avg Volume", value=100000)
     min_index_change = st.number_input("Min Index Change (%)", value=0.05)
     ema200_lookback = st.number_input("EMA200 Breakout Lookback", value=6, min_value=1, max_value=48)
     pullback_lookback = st.number_input("VWAP/EMA Pullback Lookback", value=6, min_value=2, max_value=20)
@@ -106,29 +106,31 @@ def scan_stock_all(
         rs_score = 0
 
     notes = []
-    ai_score = 0
+    ai_score = 0.0
+    signal_count = 0
 
     # EMA200 Crossover
     try:
         ema200_series = today["Close"].ewm(span=200).mean()
-        ema200 = float(ema200_series.iloc[-1])
         crossed = False
-        for i in range(1, min(ema200_lookback, len(today)-1)):
+        for i in range(1, min(int(ema200_lookback), len(today)-1)):
             if today["Close"].iloc[-i-1] < ema200_series.iloc[-i-1] and today["Close"].iloc[-i] > ema200_series.iloc[-i]:
                 crossed = True
                 break
         if crossed:
-            ai_score += 0.6
+            ai_score += 20
+            signal_count += 1
             notes.append("EMA200 Cross ↑")
     except Exception:
-        ema200, crossed = 0, False
+        crossed = False
 
     # VWAP
     try:
         vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
         vwap_signal = today_close > float(vwap.iloc[-1])
         if vwap_signal:
-            ai_score += 0.5
+            ai_score += 20
+            signal_count += 1
             notes.append("VWAP Above")
     except Exception:
         vwap_signal = False
@@ -140,7 +142,8 @@ def scan_stock_all(
         macd = exp12 - exp26
         signal = macd.ewm(span=9).mean()
         if float(macd.iloc[-1]) > float(signal.iloc[-1]):
-            ai_score += 0.4
+            ai_score += 15
+            signal_count += 1
             notes.append("MACD Bullish")
     except Exception:
         pass
@@ -181,7 +184,8 @@ def scan_stock_all(
         avg5m_vol = today["Volume"].rolling(10).mean()
         recent_bars = today.tail(12)
         if (recent_bars["Volume"] > 2 * avg5m_vol).any():
-            ai_score += 0.3
+            ai_score += 10
+            signal_count += 1
             notes.append("Order Flow Spike")
     except Exception:
         pass
@@ -191,10 +195,11 @@ def scan_stock_all(
         high_10 = today["High"].rolling(10).max()
         low_10 = today["Low"].rolling(10).min()
         if today_close >= high_10.iloc[-1]:
-            ai_score += 0.5
+            ai_score += 20
+            signal_count += 1
             notes.append("Breakout: 10-bar High")
         elif today_close <= low_10.iloc[-1]:
-            ai_score -= 0.2
+            ai_score -= 5
             notes.append("Breakdown: 10-bar Low")
     except Exception:
         pass
@@ -212,7 +217,8 @@ def scan_stock_all(
 
     # Relative Strength
     if rs_score > 0:
-        ai_score += 0.4
+        ai_score += 15
+        signal_count += 1
         notes.append("Strong RS")
 
     # Trade Management
@@ -220,12 +226,20 @@ def scan_stock_all(
     cut_loss_price = price * (1 - cut_loss_pct)
     position_size = int(capital / price) if price > 0 else 0
 
+    # Risk:Reward ratio
+    risk = price - cut_loss_price
+    reward = target_price - price
+    risk_reward_ratio = f"{(reward / risk):.2f}" if risk > 0 else "-"
+
     # Classification
     is_go = rs_score > 1 and vwap_signal and crossed and volume > avg_vol
     is_nogo = rs_score < -1 or not vwap_signal or not crossed
     is_ema200 = crossed
     is_vwap = vwap_signal
     is_institutional = rs_score > 0 and volume > avg_vol
+
+    # Confidence level
+    confidence_level = min(100, 40 + 12 * signal_count)  # Each signal adds 12%, base 40%
 
     return {
         "Ticker": ticker,
@@ -237,7 +251,9 @@ def scan_stock_all(
         "Target Price": f"{target_price:.2f}",
         "Cut Loss Price": f"{cut_loss_price:.2f}",
         "Position Size": position_size,
-        "AI Score": ai_score,
+        "Risk:Reward": risk_reward_ratio,
+        "AI Score": f"{ai_score:.1f}",
+        "Confidence Level": f"{confidence_level}%",
         "AI Reasoning": ", ".join(notes) if notes else "-",
         "GO": is_go,
         "NO-GO": is_nogo,
@@ -289,10 +305,10 @@ df_results = pd.DataFrame(results) if results else pd.DataFrame()
 
 trade_cols = [
     "Ticker", "Price", "Change %", "RS Score", "Volume", "Avg Volume",
-    "Target Price", "Cut Loss Price", "Position Size", "AI Score", "AI Reasoning"
+    "Target Price", "Cut Loss Price", "Position Size", "Risk:Reward",
+    "AI Score", "Confidence Level", "AI Reasoning"
 ]
 
-# --- Section Tables ---
 def show_section(title, filter_col):
     st.subheader(title)
     if not df_results.empty:
@@ -331,6 +347,8 @@ for _, row in df_results.sort_values("AI Score", ascending=False).head(5).iterro
             f"📈 {section_name} ALERT!\n"
             f"Ticker: {ticker}\n"
             f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
+            f"AI Score: {row['AI Score']} | Confidence: {row['Confidence Level']}\n"
+            f"Risk:Reward: {row['Risk:Reward']}\n"
             f"Reason: {row['AI Reasoning']}"
         )
         send_telegram_alert(msg)
