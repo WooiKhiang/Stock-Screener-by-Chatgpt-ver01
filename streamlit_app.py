@@ -109,7 +109,7 @@ def scan_stock_all(
     # --- Indicators ---
     try:
         vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
-        vwap_signal = today_close > float(vwap.iloc[-1])
+        vwap_signal = bool(today_close > float(vwap.iloc[-1]))
     except Exception:
         vwap_signal = False
 
@@ -119,10 +119,10 @@ def scan_stock_all(
         ema50 = today["Close"].ewm(span=50).mean().iloc[-1]
         ema200_series = today["Close"].ewm(span=200).mean()
         ema200 = ema200_series.iloc[-1]
-        ema10up = today_close > ema10
-        ema20up = today_close > ema20
-        ema50up = today_close > ema50
-        ema200up = today_close > ema200
+        ema10up = bool(today_close > ema10)
+        ema20up = bool(today_close > ema20)
+        ema50up = bool(today_close > ema50)
+        ema200up = bool(today_close > ema200)
         # Check for recent EMA200 crossover
         crossed_ema200 = False
         for i in range(1, min(ema200_lookback, len(today)-1)):
@@ -134,7 +134,7 @@ def scan_stock_all(
 
     # Volume spike: is latest volume > 2x avg 10-bar volume
     try:
-        volume_spike = today["Volume"].iloc[-1] > 2 * today["Volume"].rolling(10).mean().iloc[-1]
+        volume_spike = bool(today["Volume"].iloc[-1] > 2 * today["Volume"].rolling(10).mean().iloc[-1])
     except Exception:
         volume_spike = False
 
@@ -144,7 +144,7 @@ def scan_stock_all(
         exp26 = today["Close"].ewm(span=26).mean()
         macd = exp12 - exp26
         signal = macd.ewm(span=9).mean()
-        macd_bullish = macd.iloc[-1] > signal.iloc[-1]
+        macd_bullish = bool(macd.iloc[-1] > signal.iloc[-1])
     except Exception:
         macd_bullish = False
 
@@ -155,7 +155,7 @@ def scan_stock_all(
         down = -diff.clip(upper=0)
         rs = up.rolling(14).mean() / down.rolling(14).mean()
         rsi = 100 - (100 / (1 + rs))
-        rsi_signal = rsi.iloc[-1] > 55
+        rsi_signal = bool(rsi.iloc[-1] > 55)
     except Exception:
         rsi_signal = False
 
