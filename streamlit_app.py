@@ -24,8 +24,8 @@ with st.sidebar.expander("Screener Criteria", expanded=True):
 
 with st.sidebar.expander("Profit & Risk Planner", expanded=True):
     capital = st.number_input("Capital per Trade ($)", value=1000.0, step=100.0)
-    take_profit_pct = st.number_input("Take Profit (%)", value=2.0, min_value=0.5, max_value=10.0, step=0.1) / 100
-    cut_loss_pct = st.number_input("Cut Loss (%)", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
+    atr_risk_multiple = st.number_input("ATR Multiplier for Stop Loss", value=1.2)
+    atr_reward_multiple = st.number_input("ATR Multiplier for Target", value=2.4)
 
 watchlist = [
     "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMGN","AMT","AMZN","AVGO",
@@ -77,7 +77,7 @@ def scan_stock_all(
     ticker, spy_change,
     min_price, max_price, min_avg_vol,
     ema200_lookback, pullback_lookback,
-    capital, take_profit_pct, cut_loss_pct
+    capital, atr_risk_multiple, atr_reward_multiple
 ):
     df = get_intraday_data(ticker)
     if df is None or len(df) < 22:
@@ -109,7 +109,7 @@ def scan_stock_all(
     ai_score = 0.0
     signal_count = 0
 
-    # EMA200 Crossover
+    # --- EMA200 Crossover: Only if price is above and crossed recently ---
     try:
         ema200_series = today["Close"].ewm(span=200).mean()
         crossed = False
@@ -117,17 +117,17 @@ def scan_stock_all(
             if today["Close"].iloc[-i-1] < ema200_series.iloc[-i-1] and today["Close"].iloc[-i] > ema200_series.iloc[-i]:
                 crossed = True
                 break
-        if crossed:
+        if crossed and today_close > ema200_series.iloc[-1]:
             ai_score += 20
             signal_count += 1
             notes.append("EMA200 Cross ↑")
     except Exception:
         crossed = False
 
-    # VWAP
+    # --- VWAP: only if >0.2% above VWAP ---
     try:
         vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
-        vwap_signal = today_close > float(vwap.iloc[-1])
+        vwap_signal = today_close > float(vwap.iloc[-1]) * 1.002
         if vwap_signal:
             ai_score += 20
             signal_count += 1
@@ -135,20 +135,47 @@ def scan_stock_all(
     except Exception:
         vwap_signal = False
 
-    # MACD
+    # --- MACD: momentum check ---
     try:
         exp12 = today["Close"].ewm(span=12).mean()
         exp26 = today["Close"].ewm(span=26).mean()
         macd = exp12 - exp26
         signal = macd.ewm(span=9).mean()
-        if float(macd.iloc[-1]) > float(signal.iloc[-1]):
+        if float(macd.iloc[-1]) > float(signal.iloc[-1]) and macd.iloc[-1] > 0:
             ai_score += 15
             signal_count += 1
             notes.append("MACD Bullish")
     except Exception:
         pass
 
-    # RSI
+    # --- Order Flow Spike: recent volume 3x avg ---
+    try:
+        avg5m_vol = today["Volume"].rolling(10).mean()
+        recent_bars = today.tail(12)
+        if (recent_bars["Volume"] > 3 * avg5m_vol).any():
+            ai_score += 10
+            signal_count += 1
+            notes.append("Order Flow Spike")
+    except Exception:
+        pass
+
+    # --- Breakout: price > 0.5% above 10-bar high ---
+    try:
+        high_10 = today["High"].rolling(10).max()
+        if today_close >= high_10.iloc[-1] * 1.005:
+            ai_score += 20
+            signal_count += 1
+            notes.append("Breakout: 10-bar High")
+    except Exception:
+        pass
+
+    # --- Relative Strength: >0.5% ---
+    if rs_score > 0.5:
+        ai_score += 15
+        signal_count += 1
+        notes.append("Strong RS")
+
+    # --- RSI (overbought/oversold) ---
     try:
         delta = today["Close"].diff()
         up = delta.clip(lower=0)
@@ -164,7 +191,7 @@ def scan_stock_all(
     except Exception:
         pass
 
-    # ATR
+    # --- ATR calculation for dynamic stops/targets ---
     try:
         high = today["High"]
         low = today["Low"]
@@ -175,71 +202,36 @@ def scan_stock_all(
             (low - close.shift(1)).abs()
         ], axis=1).max(axis=1)
         atr = tr.rolling(14).mean().iloc[-1]
-        notes.append(f"ATR: {atr:.2f}")
     except Exception:
-        atr = 0
+        atr = None
 
-    # High Liquidity (Order Flow)
-    try:
-        avg5m_vol = today["Volume"].rolling(10).mean()
-        recent_bars = today.tail(12)
-        if (recent_bars["Volume"] > 2 * avg5m_vol).any():
-            ai_score += 10
-            signal_count += 1
-            notes.append("Order Flow Spike")
-    except Exception:
-        pass
+    # --- Dynamic risk/reward: ATR-based stops/targets ---
+    if atr and atr > 0:
+        stop_loss = price - atr * atr_risk_multiple
+        take_profit = price + atr * atr_reward_multiple
+        risk = price - stop_loss
+        reward = take_profit - price
+        if risk > 0:
+            risk_reward_ratio = round(reward / risk, 2)
+        else:
+            risk_reward_ratio = "-"
+    else:
+        stop_loss = price * 0.99
+        take_profit = price * 1.02
+        risk_reward_ratio = "-"
 
-    # 10-bar High/Low Breakout
-    try:
-        high_10 = today["High"].rolling(10).max()
-        low_10 = today["Low"].rolling(10).min()
-        if today_close >= high_10.iloc[-1]:
-            ai_score += 20
-            signal_count += 1
-            notes.append("Breakout: 10-bar High")
-        elif today_close <= low_10.iloc[-1]:
-            ai_score -= 5
-            notes.append("Breakdown: 10-bar Low")
-    except Exception:
-        pass
-
-    # Range Contraction/Expansion
-    try:
-        range_10 = today["High"].rolling(10).max() - today["Low"].rolling(10).min()
-        range_20 = today["High"].rolling(20).max() - today["Low"].rolling(20).min()
-        if range_10.iloc[-1] < 0.7 * range_20.iloc[-1]:
-            notes.append("Range Contraction")
-        elif range_10.iloc[-1] > 1.5 * range_20.iloc[-1]:
-            notes.append("Range Expansion")
-    except Exception:
-        pass
-
-    # Relative Strength
-    if rs_score > 0:
-        ai_score += 15
-        signal_count += 1
-        notes.append("Strong RS")
-
-    # Trade Management
-    target_price = price * (1 + take_profit_pct)
-    cut_loss_price = price * (1 - cut_loss_pct)
     position_size = int(capital / price) if price > 0 else 0
 
-    # Risk:Reward ratio
-    risk = price - cut_loss_price
-    reward = target_price - price
-    risk_reward_ratio = f"{(reward / risk):.2f}" if risk > 0 else "-"
+    # --- Final Score/Confidence ---
+    ai_score = min(100, ai_score)
+    confidence_level = min(100, 25 + 15 * signal_count)
 
-    # Classification
-    is_go = rs_score > 1 and vwap_signal and crossed and volume > avg_vol
-    is_nogo = rs_score < -1 or not vwap_signal or not crossed
+    # --- Section classifications ---
+    is_go = (rs_score > 1) and vwap_signal and crossed and volume > avg_vol
+    is_nogo = (rs_score < -1) or (not vwap_signal) or (not crossed)
     is_ema200 = crossed
     is_vwap = vwap_signal
     is_institutional = rs_score > 0 and volume > avg_vol
-
-    # Confidence level
-    confidence_level = min(100, 40 + 12 * signal_count)  # Each signal adds 12%, base 40%
 
     return {
         "Ticker": ticker,
@@ -248,12 +240,13 @@ def scan_stock_all(
         "RS Score": f"{rs_score:.2f}",
         "Volume": f"{volume:,.0f}",
         "Avg Volume": f"{avg_vol:,.0f}",
-        "Target Price": f"{target_price:.2f}",
-        "Cut Loss Price": f"{cut_loss_price:.2f}",
+        "ATR": f"{atr:.2f}" if atr else "-",
+        "Target Price": f"{take_profit:.2f}",
+        "Cut Loss Price": f"{stop_loss:.2f}",
         "Position Size": position_size,
         "Risk:Reward": risk_reward_ratio,
-        "AI Score": f"{ai_score:.1f}",
-        "Confidence Level": f"{confidence_level}%",
+        "AI Score": ai_score,
+        "Confidence Level (%)": confidence_level,
         "AI Reasoning": ", ".join(notes) if notes else "-",
         "GO": is_go,
         "NO-GO": is_nogo,
@@ -297,18 +290,19 @@ for ticker in watchlist:
         ticker, spy_change,
         min_price, max_price, min_avg_vol,
         ema200_lookback, pullback_lookback,
-        capital, take_profit_pct, cut_loss_pct
+        capital, atr_risk_multiple, atr_reward_multiple
     )
     if result:
         results.append(result)
 df_results = pd.DataFrame(results) if results else pd.DataFrame()
 
 trade_cols = [
-    "Ticker", "Price", "Change %", "RS Score", "Volume", "Avg Volume",
+    "Ticker", "Price", "Change %", "RS Score", "Volume", "Avg Volume", "ATR",
     "Target Price", "Cut Loss Price", "Position Size", "Risk:Reward",
-    "AI Score", "Confidence Level", "AI Reasoning"
+    "AI Score", "Confidence Level (%)", "AI Reasoning"
 ]
 
+# --- Section Tables ---
 def show_section(title, filter_col):
     st.subheader(title)
     if not df_results.empty:
@@ -347,7 +341,6 @@ for _, row in df_results.sort_values("AI Score", ascending=False).head(5).iterro
             f"📈 {section_name} ALERT!\n"
             f"Ticker: {ticker}\n"
             f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
-            f"AI Score: {row['AI Score']} | Confidence: {row['Confidence Level']}\n"
             f"Risk:Reward: {row['Risk:Reward']}\n"
             f"Reason: {row['AI Reasoning']}"
         )
