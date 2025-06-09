@@ -82,7 +82,6 @@ def get_daily_data(ticker, days=15):
     return df
 
 def calc_pivot_points(df_day):
-    # Accepts 1-day daily dataframe row (prev day)
     try:
         high = df_day["High"]
         low = df_day["Low"]
@@ -186,25 +185,36 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         "AI Reasoning": notes
     }
 
-# --- Market Sentiment Analysis ---
+# --- Market Sentiment Analysis (FIXED) ---
 spy = get_intraday_data('SPY')
 qqq = get_intraday_data('QQQ')
 go_day = False
+
+spy_change = 0
+qqq_change = 0
 
 if spy is not None and not spy.empty and qqq is not None and not qqq.empty:
     spy_today = spy[spy.index.date == spy.index[-1].date()]
     qqq_today = qqq[qqq.index.date == qqq.index[-1].date()]
     if len(spy_today) > 10 and len(qqq_today) > 10:
         try:
-            spy_change = (spy_today["Close"].iloc[-1] - spy_today["Open"].iloc[0]) / spy_today["Open"].iloc[0] * 100
-            qqq_change = (qqq_today["Close"].iloc[-1] - qqq_today["Open"].iloc[0]) / qqq_today["Open"].iloc[0] * 100
-        except Exception:
-            spy_change = qqq_change = 0
-        # Market trend: basic
-        go_day = spy_change > min_index_change and qqq_change > min_index_change
-        # Display
+            spy_open = float(spy_today["Open"].iloc[0])
+            spy_close = float(spy_today["Close"].iloc[-1])
+            spy_change = (spy_close - spy_open) / spy_open * 100
+        except Exception as e:
+            st.warning(f"Error calculating SPY change: {e}")
+            spy_change = 0
+        try:
+            qqq_open = float(qqq_today["Open"].iloc[0])
+            qqq_close = float(qqq_today["Close"].iloc[-1])
+            qqq_change = (qqq_close - qqq_open) / qqq_open * 100
+        except Exception as e:
+            st.warning(f"Error calculating QQQ change: {e}")
+            qqq_change = 0
+
         st.subheader("Market Sentiment Panel")
         st.markdown(f"**SPY:** {spy_change:.2f}% | **QQQ:** {qqq_change:.2f}%")
+        go_day = (spy_change > float(min_index_change)) and (qqq_change > float(min_index_change))
         st.markdown("**Trend:** " + ("🟢 GO Day – Favorable" if go_day else "🔴 NO-GO Day – Defensive"))
     else:
         st.warning("Could not load enough recent market data. Try again later.")
