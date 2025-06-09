@@ -74,35 +74,17 @@ def get_intraday_data(ticker):
         return None
     return df
 
-def get_daily_data(ticker, days=15):
-    try:
-        df = yf.download(ticker, period=f"{days}d", interval="1d", progress=False)
-    except Exception:
-        return None
-    return df
-
-def calc_pivot_points(df_day):
-    try:
-        high = df_day["High"]
-        low = df_day["Low"]
-        close = df_day["Close"]
-        pivot = (high + low + close) / 3
-        r1 = 2 * pivot - low
-        s1 = 2 * pivot - high
-        r2 = pivot + (high - low)
-        s2 = pivot - (high - low)
-        return f"{s1:.2f}", f"{s2:.2f}", f"{pivot:.2f}", f"{r1:.2f}", f"{r2:.2f}"
-    except Exception:
-        return "-", "-", "-", "-", "-"
-
-def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200_lookback, pullback_lookback,
-                   capital, take_profit_pct, cut_loss_pct):
+def scan_stock_all(
+    ticker, spy_change,
+    min_price, max_price, min_avg_vol, ema200_lookback, pullback_lookback,
+    capital, take_profit_pct, cut_loss_pct
+):
     df = get_intraday_data(ticker)
-    if df is None or len(df) < 22:
+    if df is None or len(df) < 50:
         return None
 
     today = df[df.index.date == df.index[-1].date()]
-    if today.empty or len(today) < 10:
+    if today.empty or len(today) < 20:
         return None
 
     try:
@@ -124,48 +106,106 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         today_change = 0
         rs_score = 0
 
-    # --- EMA/VWAP checks (for signal/notes only) ---
-    try:
-        ema200_series = today["Close"].ewm(span=200).mean()
-        ema200 = float(ema200_series.iloc[-1])
-        crossed = False
-        for i in range(1, min(ema200_lookback, len(today)-1)):
-            if today["Close"].iloc[-i-1] < ema200_series.iloc[-i-1] and today["Close"].iloc[-i] > ema200_series.iloc[-i]:
-                crossed = True
-                break
-    except Exception:
-        ema200, crossed = 0, False
-
+    # --- Indicators ---
     try:
         vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
         vwap_signal = today_close > float(vwap.iloc[-1])
     except Exception:
         vwap_signal = False
 
+    try:
+        ema10 = today["Close"].ewm(span=10).mean().iloc[-1]
+        ema20 = today["Close"].ewm(span=20).mean().iloc[-1]
+        ema50 = today["Close"].ewm(span=50).mean().iloc[-1]
+        ema200_series = today["Close"].ewm(span=200).mean()
+        ema200 = ema200_series.iloc[-1]
+        ema10up = today_close > ema10
+        ema20up = today_close > ema20
+        ema50up = today_close > ema50
+        ema200up = today_close > ema200
+        # Check for recent EMA200 crossover
+        crossed_ema200 = False
+        for i in range(1, min(ema200_lookback, len(today)-1)):
+            if today["Close"].iloc[-i-1] < ema200_series.iloc[-i-1] and today["Close"].iloc[-i] > ema200_series.iloc[-i]:
+                crossed_ema200 = True
+                break
+    except Exception:
+        ema10up = ema20up = ema50up = ema200up = crossed_ema200 = False
+
+    # Volume spike: is latest volume > 2x avg 10-bar volume
+    try:
+        volume_spike = today["Volume"].iloc[-1] > 2 * today["Volume"].rolling(10).mean().iloc[-1]
+    except Exception:
+        volume_spike = False
+
+    # MACD Bullish
+    try:
+        exp12 = today["Close"].ewm(span=12).mean()
+        exp26 = today["Close"].ewm(span=26).mean()
+        macd = exp12 - exp26
+        signal = macd.ewm(span=9).mean()
+        macd_bullish = macd.iloc[-1] > signal.iloc[-1]
+    except Exception:
+        macd_bullish = False
+
+    # RSI
+    try:
+        diff = today["Close"].diff()
+        up = diff.clip(lower=0)
+        down = -diff.clip(upper=0)
+        rs = up.rolling(14).mean() / down.rolling(14).mean()
+        rsi = 100 - (100 / (1 + rs))
+        rsi_signal = rsi.iloc[-1] > 55
+    except Exception:
+        rsi_signal = False
+
     # --- Trade Management ---
     target_price = price * (1 + take_profit_pct)
     cut_loss_price = price * (1 - cut_loss_pct)
     position_size = int(capital / price) if price > 0 else 0
 
-    # --- Pivot/Sup/Res for Top5: need 2 days daily data
-    df_day = get_daily_data(ticker, days=3)
-    if df_day is not None and len(df_day) >= 2:
-        prev_day = df_day.iloc[-2]
-        s1, s2, pivot, r1, r2 = calc_pivot_points(prev_day)
-        resistance = r1
-        support = s1
-    else:
-        support, resistance, pivot = "-", "-", "-"
-
-    # --- AI score: simple ranking by RS score + volume for demo
-    ai_score = 0.6 * rs_score + 0.4 * (volume / avg_vol if avg_vol else 0)
-
-    # --- Compose Reason ---
-    notes = []
-    if rs_score > 0: notes.append("Strong RS")
-    if crossed: notes.append("EMA200 Crossover")
-    if vwap_signal: notes.append("VWAP Above")
-    notes = ", ".join(notes) if notes else "-"
+    # --- AI Score (0-100): composite scoring, can adjust weights
+    ai_score = 0
+    reason = []
+    weights = {
+        "go_day": 16,
+        "rs": 20,
+        "vwap": 12,
+        "volume_spike": 10,
+        "ema_align": 14,
+        "ema200_cross": 8,
+        "macd": 8,
+        "rsi": 6,
+        "liquidity": 6
+    }
+    # Market day, RS, VWAP, Volume, EMA align, EMA200 cross, MACD, RSI, liquidity
+    if st.session_state.get("GO_DAY", False):
+        ai_score += weights["go_day"]
+        reason.append("Market GO Day")
+    if rs_score > 1:
+        ai_score += weights["rs"]
+        reason.append("Strong RS")
+    if vwap_signal:
+        ai_score += weights["vwap"]
+        reason.append("VWAP breakout")
+    if volume_spike:
+        ai_score += weights["volume_spike"]
+        reason.append("Volume spike")
+    if ema10up and ema20up and ema50up and ema200up:
+        ai_score += weights["ema_align"]
+        reason.append("All EMA align up")
+    if crossed_ema200:
+        ai_score += weights["ema200_cross"]
+        reason.append("Recent EMA200 cross")
+    if macd_bullish:
+        ai_score += weights["macd"]
+        reason.append("MACD bullish")
+    if rsi_signal:
+        ai_score += weights["rsi"]
+        reason.append("RSI > 55")
+    if volume > 2 * min_avg_vol:
+        ai_score += weights["liquidity"]
+        reason.append("High liquidity")
 
     return {
         "Ticker": ticker,
@@ -173,55 +213,38 @@ def scan_stock_all(ticker, spy_change, min_price, max_price, min_avg_vol, ema200
         "Change %": f"{today_change:.2f}",
         "RS Score": f"{rs_score:.2f}",
         "Volume": f"{volume:,.0f}",
-        "AI Score": ai_score,
-        "Support (S1)": support,
-        "Resistance (R1)": resistance,
-        "Pivot": pivot,
-        "GO": rs_score > 1,
-        "NO-GO": rs_score <= 1,
         "Target Price": f"{target_price:.2f}",
         "Cut Loss Price": f"{cut_loss_price:.2f}",
         "Position Size": position_size,
-        "AI Reasoning": notes
+        "AI Score": ai_score,
+        "AI Reasoning": ", ".join(reason) if reason else "-"
     }
 
-# --- Market Sentiment Analysis (FIXED) ---
+# --- Market Sentiment Analysis ---
 spy = get_intraday_data('SPY')
 qqq = get_intraday_data('QQQ')
-go_day = False
-
-spy_change = 0
-qqq_change = 0
+spy_change = qqq_change = 0
 
 if spy is not None and not spy.empty and qqq is not None and not qqq.empty:
     spy_today = spy[spy.index.date == spy.index[-1].date()]
     qqq_today = qqq[qqq.index.date == qqq.index[-1].date()]
     if len(spy_today) > 10 and len(qqq_today) > 10:
         try:
-            spy_open = float(spy_today["Open"].iloc[0])
-            spy_close = float(spy_today["Close"].iloc[-1])
-            spy_change = (spy_close - spy_open) / spy_open * 100
-        except Exception as e:
-            st.warning(f"Error calculating SPY change: {e}")
-            spy_change = 0
-        try:
-            qqq_open = float(qqq_today["Open"].iloc[0])
-            qqq_close = float(qqq_today["Close"].iloc[-1])
-            qqq_change = (qqq_close - qqq_open) / qqq_open * 100
-        except Exception as e:
-            st.warning(f"Error calculating QQQ change: {e}")
-            qqq_change = 0
-
+            spy_change = (spy_today["Close"].iloc[-1] - spy_today["Open"].iloc[0]) / spy_today["Open"].iloc[0] * 100
+            qqq_change = (qqq_today["Close"].iloc[-1] - qqq_today["Open"].iloc[0]) / qqq_today["Open"].iloc[0] * 100
+        except Exception:
+            spy_change = qqq_change = 0
+        go_day = spy_change > min_index_change and qqq_change > min_index_change
+        st.session_state["GO_DAY"] = go_day
         st.subheader("Market Sentiment Panel")
         st.markdown(f"**SPY:** {spy_change:.2f}% | **QQQ:** {qqq_change:.2f}%")
-        go_day = (spy_change > float(min_index_change)) and (qqq_change > float(min_index_change))
         st.markdown("**Trend:** " + ("🟢 GO Day – Favorable" if go_day else "🔴 NO-GO Day – Defensive"))
     else:
         st.warning("Could not load enough recent market data. Try again later.")
-        spy_change = qqq_change = 0
+        st.session_state["GO_DAY"] = False
 else:
     st.warning("Could not load recent market data. Try again later.")
-    spy_change = qqq_change = 0
+    st.session_state["GO_DAY"] = False
 
 # --- Screener ---
 results = []
@@ -236,19 +259,14 @@ for ticker in watchlist:
         results.append(result)
 df_results = pd.DataFrame(results) if results else pd.DataFrame()
 
-# --- Show results, AI Picks, Alerts ---
 trade_cols = [
     "Ticker", "Price", "Change %", "RS Score", "Volume",
-    "Support (S1)", "Resistance (R1)", "Pivot",
     "Target Price", "Cut Loss Price", "Position Size", "AI Score", "AI Reasoning"
 ]
 
 if not df_results.empty:
-    # Show all that pass the screener (sorted)
     st.subheader("All Screener Results")
     st.dataframe(df_results[trade_cols].sort_values("AI Score", ascending=False).reset_index(drop=True), use_container_width=True)
-    
-    # AI Top 5 Picks
     df_ai_top = df_results.sort_values("AI Score", ascending=False).head(5).copy()
     st.subheader("⭐ Top 5 AI Picks of the Day")
     st.dataframe(df_ai_top[trade_cols].reset_index(drop=True), use_container_width=True)
@@ -268,8 +286,7 @@ for _, row in df_results.sort_values("AI Score", ascending=False).head(5).iterro
             f"📈 {section_name} ALERT!\n"
             f"Ticker: {ticker}\n"
             f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
-            f"Support: {row['Support (S1)']} | Resistance: {row['Resistance (R1)']}\n"
-            f"Reason: {row['AI Reasoning']}"
+            f"AI Score: {row['AI Score']} | Reason: {row['AI Reasoning']}"
         )
         send_telegram_alert(msg)
         add_to_alert_log(ticker, section_name)
