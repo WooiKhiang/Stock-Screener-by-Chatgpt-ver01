@@ -15,7 +15,7 @@ GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "Sheet1"
 ALERT_LOG = "alerts_log.csv"
 
-# --- Streamlit PAGE SETTINGS ---
+# --- PAGE SETTINGS ---
 st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
 
@@ -35,8 +35,9 @@ with st.sidebar.expander("Profit & Risk Planner", expanded=True):
     take_profit_pct = st.number_input("Take Profit (%)", value=2.0, min_value=0.5, max_value=10.0, step=0.1) / 100
     cut_loss_pct = st.number_input("Cut Loss (%)", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
 
-with st.sidebar.expander("Backtest", expanded=False):
-    run_backtest = st.checkbox("Run GO Day Backtest Now")
+with st.sidebar.expander("Backtest (Top 5/Manual)", expanded=False):
+    tickers_to_backtest = st.text_input("Enter up to 5 tickers (comma separated)", value="")
+    run_backtest = st.button("Run Backtest Now")
     lookback_days = st.number_input("Backtest: Days", value=10, min_value=2, max_value=30, step=1)
     backtest_tp = st.number_input("Backtest: Take Profit %", value=2.0, min_value=0.5, max_value=10.0, step=0.1) / 100
     backtest_sl = st.number_input("Backtest: Stop Loss %", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
@@ -94,12 +95,23 @@ def log_to_google_sheet(row_dict, section_name):
             row_dict.get("Target Price"),
             row_dict.get("Cut Loss Price"),
             row_dict.get("Position Size"),
-            row_dict.get("Max Loss at Stop"),
             row_dict.get("Reasons"),
         ]
         worksheet.append_row(log_row, value_input_option="USER_ENTERED")
     except Exception as e:
         st.warning(f"Failed to log to Google Sheet: {e}")
+
+# --- SUPPORT & RESISTANCE for Top 5
+def calc_support_resistance(prices, lookback=48):
+    try:
+        if len(prices) < lookback:
+            return "-", "-"
+        sub = prices[-lookback:]
+        support = sub.min()
+        resistance = sub.max()
+        return f"{support:.2f}", f"{resistance:.2f}"
+    except Exception:
+        return "-", "-"
 
 # --- DATA FETCH ---
 def get_data(ticker):
@@ -170,7 +182,6 @@ def scan_stock_all(ticker, min_price, max_price, min_avg_vol, ema200_lookback, p
 
     # VWAP/EMA20 Pullback
     pullback = False
-    vwap = None
     if len(today) > pullback_lookback:
         vwap_series = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
         for i in range(2, pullback_lookback + 1):
@@ -197,9 +208,7 @@ def scan_stock_all(ticker, min_price, max_price, min_avg_vol, ema200_lookback, p
     # Trade management
     target_price = price * (1 + take_profit_pct)
     cut_loss_price = price * (1 - cut_loss_pct)
-    risk_per_share = price - cut_loss_price
     position_size = int(capital / price) if price > 0 else 0
-    max_loss = position_size * risk_per_share
 
     # --- Categorical signals
     go_criteria = (price > ema10) and (price > ema20) and (price > ema50) and (rs_score > 0) and (rel_vol > 1)
@@ -234,11 +243,11 @@ def scan_stock_all(ticker, min_price, max_price, min_avg_vol, ema200_lookback, p
         "Target Price": f"{target_price:.2f}",
         "Cut Loss Price": f"{cut_loss_price:.2f}",
         "Position Size": position_size,
-        "Max Loss at Stop": f"{max_loss:.2f}",
         "AI Score": ai_score,
         "Confidence Level": f"{confidence}%",
         "AI Reasoning": ai_reasoning,
         "Reasons": f"RS: {rs_score:.2f}, Rel Vol: {rel_vol:.2f}",
+        "Today Close Series": today["Close"].copy()  # for support/resistance
     }
 
 # --- MARKET SENTIMENT ---
@@ -271,7 +280,7 @@ for ticker in watchlist:
 df_results = pd.DataFrame(results) if results else pd.DataFrame()
 
 # --- PRESENTATION (sections) ---
-trade_cols = ["Target Price", "Cut Loss Price", "Position Size", "Max Loss at Stop"]
+trade_cols = ["Target Price", "Cut Loss Price", "Position Size"]
 main_cols = ["Ticker", "Price", "Change %", "Avg Vol", "Rel Vol", "VWAP Pullback", "EMA200 Bounce", "Volume Spike"]
 ai_cols = ["AI Score", "Confidence Level", "AI Reasoning"]
 
@@ -288,12 +297,19 @@ show_section("Institutional Accumulation", "Accumulation")
 show_section("VWAP/EMA20 Pullback Screener", "VWAP Pullback")
 show_section("EMA200 Bounce Screener", "EMA200 Bounce")
 
-# --- TOP 5 AI PICKS ---
+# --- TOP 5 AI PICKS, with Support/Resistance ---
 if not df_results.empty:
     df_ai = df_results.copy()
     df_ai = df_ai.sort_values(by="AI Score", ascending=False).head(5)
+    support_list, resistance_list = [], []
+    for idx, row in df_ai.iterrows():
+        sup, res = calc_support_resistance(row["Today Close Series"])
+        support_list.append(sup)
+        resistance_list.append(res)
+    df_ai["Support"] = support_list
+    df_ai["Resistance"] = resistance_list
     st.subheader("🤖 Top 5 AI Picks of the Day")
-    st.dataframe(df_ai[["Ticker", "Price", "AI Score", "Confidence Level", "AI Reasoning"] + trade_cols])
+    st.dataframe(df_ai[["Ticker", "Price", "Support", "Resistance", "AI Score", "Confidence Level", "AI Reasoning"] + trade_cols])
 
 # --- ALERTS (only for new signals) ---
 if 'alerted_tickers' not in st.session_state:
@@ -315,7 +331,7 @@ for _, row in df_results.iterrows():
                     f"📈 {section_name} ALERT!\n"
                     f"Ticker: {ticker}\n"
                     f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
-                    f"Position: {row['Position Size']} shares | Max Loss: ${row['Max Loss at Stop']}\n"
+                    f"Position: {row['Position Size']} shares\n"
                     f"Reasons: {row['Reasons']}"
                 )
                 send_telegram_alert(msg)
@@ -324,11 +340,12 @@ for _, row in df_results.iterrows():
                 alerted_tickers.add((ticker, section_name))
 st.session_state['alerted_tickers'] = alerted_tickers
 
-# --- BACKTEST ---
-if run_backtest:
-    st.subheader(f"GO Day Backtest Results (last {lookback_days} days)")
+# --- BACKTEST for Tickers in Text Box ---
+if run_backtest and tickers_to_backtest.strip():
+    st.subheader(f"Backtest Results (last {lookback_days} days)")
     bt_results = []
-    for ticker in watchlist[:20]:  # Limit for speed
+    input_tickers = [t.strip().upper() for t in tickers_to_backtest.split(",")][:5]
+    for ticker in input_tickers:
         try:
             df = yf.download(ticker, period=f"{lookback_days+2}d", interval='5m', progress=False)
             if df.empty: continue
@@ -346,7 +363,6 @@ if run_backtest:
                 hit_sl = (group['Low'] <= sl).any()
                 win = None
                 if hit_tp and hit_sl:
-                    # Whichever happened first
                     tp_idx = group[group['High'] >= tp].index[0]
                     sl_idx = group[group['Low'] <= sl].index[0]
                     win = tp_idx < sl_idx
