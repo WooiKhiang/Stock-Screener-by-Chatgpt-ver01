@@ -17,7 +17,7 @@ st.title("US Market Go/No-Go Dashboard")
 with st.sidebar.expander("Screener Criteria", expanded=True):
     min_price = st.number_input("Min Price ($)", value=5.0)
     max_price = st.number_input("Max Price ($)", value=500.0)
-    min_avg_vol = st.number_input("Min Avg Volume", value=1_000_000)
+    min_avg_vol = st.number_input("Min Avg Volume", value=100000)  # Default 100,000
     min_index_change = st.number_input("Min Index Change (%)", value=0.05)
     ema200_lookback = st.number_input("EMA200 Breakout Lookback", value=6, min_value=1, max_value=48)
     pullback_lookback = st.number_input("VWAP/EMA Pullback Lookback", value=6, min_value=2, max_value=20)
@@ -73,13 +73,6 @@ def get_intraday_data(ticker):
         return None
     return df
 
-def get_daily_data(ticker, days=15):
-    try:
-        df = yf.download(ticker, period=f"{days}d", interval="1d", progress=False)
-    except Exception:
-        return None
-    return df
-
 def scan_stock_all(
     ticker, spy_change,
     min_price, max_price, min_avg_vol,
@@ -112,11 +105,10 @@ def scan_stock_all(
         today_change = 0
         rs_score = 0
 
-    # --- EMA/VWAP, MACD, RSI, ATR, etc. ---
     notes = []
     ai_score = 0
 
-    # --- EMA Cross (200) ---
+    # EMA200 Crossover
     try:
         ema200_series = today["Close"].ewm(span=200).mean()
         ema200 = float(ema200_series.iloc[-1])
@@ -131,7 +123,7 @@ def scan_stock_all(
     except Exception:
         ema200, crossed = 0, False
 
-    # --- VWAP ---
+    # VWAP
     try:
         vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
         vwap_signal = today_close > float(vwap.iloc[-1])
@@ -141,7 +133,7 @@ def scan_stock_all(
     except Exception:
         vwap_signal = False
 
-    # --- MACD ---
+    # MACD
     try:
         exp12 = today["Close"].ewm(span=12).mean()
         exp26 = today["Close"].ewm(span=26).mean()
@@ -153,7 +145,7 @@ def scan_stock_all(
     except Exception:
         pass
 
-    # --- RSI ---
+    # RSI
     try:
         delta = today["Close"].diff()
         up = delta.clip(lower=0)
@@ -169,7 +161,7 @@ def scan_stock_all(
     except Exception:
         pass
 
-    # --- ATR (Dynamic Stop) ---
+    # ATR
     try:
         high = today["High"]
         low = today["Low"]
@@ -184,7 +176,7 @@ def scan_stock_all(
     except Exception:
         atr = 0
 
-    # --- High Liquidity (Order Flow) ---
+    # High Liquidity (Order Flow)
     try:
         avg5m_vol = today["Volume"].rolling(10).mean()
         recent_bars = today.tail(12)
@@ -194,7 +186,7 @@ def scan_stock_all(
     except Exception:
         pass
 
-    # --- 10-bar High/Low Breakout ---
+    # 10-bar High/Low Breakout
     try:
         high_10 = today["High"].rolling(10).max()
         low_10 = today["Low"].rolling(10).min()
@@ -207,7 +199,7 @@ def scan_stock_all(
     except Exception:
         pass
 
-    # --- Range Contraction/Expansion ---
+    # Range Contraction/Expansion
     try:
         range_10 = today["High"].rolling(10).max() - today["Low"].rolling(10).min()
         range_20 = today["High"].rolling(20).max() - today["Low"].rolling(20).min()
@@ -218,15 +210,22 @@ def scan_stock_all(
     except Exception:
         pass
 
-    # --- Relative Strength ---
+    # Relative Strength
     if rs_score > 0:
         ai_score += 0.4
         notes.append("Strong RS")
 
-    # --- Trade Management ---
+    # Trade Management
     target_price = price * (1 + take_profit_pct)
     cut_loss_price = price * (1 - cut_loss_pct)
     position_size = int(capital / price) if price > 0 else 0
+
+    # Classification
+    is_go = rs_score > 1 and vwap_signal and crossed and volume > avg_vol
+    is_nogo = rs_score < -1 or not vwap_signal or not crossed
+    is_ema200 = crossed
+    is_vwap = vwap_signal
+    is_institutional = rs_score > 0 and volume > avg_vol
 
     return {
         "Ticker": ticker,
@@ -239,7 +238,12 @@ def scan_stock_all(
         "Cut Loss Price": f"{cut_loss_price:.2f}",
         "Position Size": position_size,
         "AI Score": ai_score,
-        "AI Reasoning": ", ".join(notes) if notes else "-"
+        "AI Reasoning": ", ".join(notes) if notes else "-",
+        "GO": is_go,
+        "NO-GO": is_nogo,
+        "EMA200": is_ema200,
+        "VWAP": is_vwap,
+        "Institutional": is_institutional
     }
 
 # --- Market Sentiment Analysis ---
@@ -252,21 +256,23 @@ if spy is not None and not spy.empty and qqq is not None and not qqq.empty:
     qqq_today = qqq[qqq.index.date == qqq.index[-1].date()]
     if len(spy_today) > 10 and len(qqq_today) > 10:
         try:
-            spy_change = (spy_today["Close"].iloc[-1] - spy_today["Open"].iloc[0]) / spy_today["Open"].iloc[0] * 100
-            qqq_change = (qqq_today["Close"].iloc[-1] - qqq_today["Open"].iloc[0]) / qqq_today["Open"].iloc[0] * 100
+            spy_change = float((spy_today["Close"].iloc[-1] - spy_today["Open"].iloc[0]) / spy_today["Open"].iloc[0] * 100)
+            qqq_change = float((qqq_today["Close"].iloc[-1] - qqq_today["Open"].iloc[0]) / qqq_today["Open"].iloc[0] * 100)
         except Exception:
-            spy_change = qqq_change = 0
-        # Market trend: basic
-        go_day = float(spy_change) > float(min_index_change) and float(qqq_change) > float(min_index_change)
-        st.subheader("Market Sentiment Panel")
-        st.markdown(f"**SPY:** {spy_change:.2f}% | **QQQ:** {qqq_change:.2f}%")
-        st.markdown("**Trend:** " + ("🟢 GO Day – Favorable" if go_day else "🔴 NO-GO Day – Defensive"))
+            spy_change = qqq_change = 0.0
+        try:
+            st.subheader("Market Sentiment Panel")
+            st.markdown(f"**SPY:** {spy_change:.2f}% | **QQQ:** {qqq_change:.2f}%")
+            go_day = spy_change > float(min_index_change) and qqq_change > float(min_index_change)
+            st.markdown("**Trend:** " + ("🟢 GO Day – Favorable" if go_day else "🔴 NO-GO Day – Defensive"))
+        except Exception:
+            st.markdown("**SPY/QQQ Data Error**")
     else:
         st.warning("Could not load enough recent market data. Try again later.")
-        spy_change = qqq_change = 0
+        spy_change = qqq_change = 0.0
 else:
     st.warning("Could not load recent market data. Try again later.")
-    spy_change = qqq_change = 0
+    spy_change = qqq_change = 0.0
 
 # --- Screener ---
 results = []
@@ -281,25 +287,38 @@ for ticker in watchlist:
         results.append(result)
 df_results = pd.DataFrame(results) if results else pd.DataFrame()
 
-# --- Show results, AI Picks, Alerts ---
 trade_cols = [
     "Ticker", "Price", "Change %", "RS Score", "Volume", "Avg Volume",
     "Target Price", "Cut Loss Price", "Position Size", "AI Score", "AI Reasoning"
 ]
 
+# --- Section Tables ---
+def show_section(title, filter_col):
+    st.subheader(title)
+    if not df_results.empty:
+        df = df_results[df_results[filter_col] == True]
+        if not df.empty:
+            st.dataframe(df[trade_cols].sort_values("AI Score", ascending=False).reset_index(drop=True), use_container_width=True)
+        else:
+            st.info(f"No stocks meet {title.lower()} criteria.")
+    else:
+        st.info("No data for stock screening.")
+
+show_section("Go Day Stock Recommendations (Momentum/Breakout)", "GO")
+show_section("No-Go Day Stock Recommendations (Defensive)", "NO-GO")
+show_section("EMA200 Crossover Screener", "EMA200")
+show_section("VWAP Above Screener", "VWAP")
+show_section("Potential Institutional Accumulation (RS > 0 & High Volume)", "Institutional")
+
+# --- AI Top 5 Picks ---
 if not df_results.empty:
-    # Show all that pass the screener (sorted)
-    st.subheader("All Screener Results")
-    st.dataframe(df_results[trade_cols].sort_values("AI Score", ascending=False).reset_index(drop=True), use_container_width=True)
-    
-    # AI Top 5 Picks
     df_ai_top = df_results.sort_values("AI Score", ascending=False).head(5).copy()
     st.subheader("⭐ Top 5 AI Picks of the Day")
     st.dataframe(df_ai_top[trade_cols].reset_index(drop=True), use_container_width=True)
 else:
     st.warning("⚠️ No stocks meet your screener criteria. Try relaxing the filter settings.")
 
-# --- Alerts (for Top 5 only, to avoid spam) ---
+# --- Alerts (for Top 5 only) ---
 if 'alerted_tickers' not in st.session_state:
     st.session_state['alerted_tickers'] = set()
 alerted_tickers = st.session_state['alerted_tickers']
