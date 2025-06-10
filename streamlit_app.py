@@ -14,6 +14,19 @@ ALERT_LOG = "alerts_log.csv"
 st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
 
+# --- Refresh Button & Timestamp (Safe) ---
+if "do_refresh" not in st.session_state:
+    st.session_state["do_refresh"] = False
+
+if st.button("🔄 Refresh Data Now"):
+    st.session_state["do_refresh"] = True
+
+if st.session_state["do_refresh"]:
+    st.session_state["do_refresh"] = False
+    st.experimental_rerun()
+
+st.caption(f"Last data refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
 # --- Market Time & Demo Mode ---
 now_ny = datetime.now(pytz.timezone('America/New_York'))
 market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -29,11 +42,6 @@ else:
     st.success("🇺🇸 The US market is **OPEN**. Intraday screener will show live data.")
 
 demo_mode = st.sidebar.checkbox("Demo Mode (Use daily bars if market closed)", value=True)
-
-# --- Refresh Button & Timestamp ---
-if st.button("🔄 Refresh Data Now"):
-    st.experimental_rerun()
-st.caption(f"Last data refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # --- Sidebar: Screener Criteria ---
 with st.sidebar.expander("Screener Criteria", expanded=True):
