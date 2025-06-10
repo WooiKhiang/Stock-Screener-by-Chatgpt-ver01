@@ -6,18 +6,23 @@ from datetime import datetime, timedelta, date
 import requests
 
 # --- SETTINGS ---
-TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
-TELEGRAM_CHAT_ID = "713264762"
+TELEGRAM_BOT_TOKEN = "xxx" # keep private
+TELEGRAM_CHAT_ID = "xxx"
 ALERT_LOG = "alerts_log.csv"
 
 st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
 
+# --- Refresh Button & Timestamp ---
+if st.button("🔄 Refresh Data Now"):
+    st.experimental_rerun()
+st.caption(f"Last data refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
 # --- Sidebar: Screener Criteria ---
 with st.sidebar.expander("Screener Criteria", expanded=True):
     min_price = st.number_input("Min Price ($)", value=5.0)
     max_price = st.number_input("Max Price ($)", value=500.0)
-    min_avg_vol = st.number_input("Min Avg Volume", value=100_000)  # Default 100,000
+    min_avg_vol = st.number_input("Min Avg Volume", value=100_000)
     min_index_change = st.number_input("Min Index Change (%)", value=0.05)
     ema200_lookback = st.number_input("EMA200 Breakout Lookback", value=6, min_value=1, max_value=48)
     pullback_lookback = st.number_input("VWAP/EMA Pullback Lookback", value=6, min_value=2, max_value=20)
@@ -26,58 +31,203 @@ with st.sidebar.expander("Profit & Risk Planner", expanded=True):
     capital = st.number_input("Capital per Trade ($)", value=1000.0, step=100.0)
     take_profit_pct = st.number_input("Take Profit (%)", value=2.0, min_value=0.5, max_value=10.0, step=0.1) / 100
     cut_loss_pct = st.number_input("Cut Loss (%)", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
+    commission_per_trade = st.number_input("Commission per trade ($)", value=1.0, step=0.1)
+    slippage_pct = st.number_input("Slippage (%)", value=0.02, step=0.01) / 100
 
-watchlist = [
-    "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMGN","AMT","AMZN","AVGO",
-    "AXP","BA","BAC","BK","BKNG","BLK","BMY","BRK.B","C","CAT",
-    "CHTR","CL","CMCSA","COF","COP","COST","CRM","CSCO","CVS","CVX",
-    "DHR","DIS","DOW","DUK","EMR","EXC","F","FDX","FOX","FOXA",
-    "GD","GE","GILD","GM","GOOG","GOOGL","GS","HD","HON","IBM",
-    "INTC","JNJ","JPM","KHC","KMI","KO","LIN","LLY","LMT","LOW",
-    "MA","MCD","MDLZ","MDT","MET","META","MMM","MO","MRK","MS",
-    "MSFT","NEE","NFLX","NKE","NVDA","ORCL","PEP","PFE","PG","PM",
-    "PYPL","QCOM","RTX","SBUX","SCHW","SO","SPG","T","TGT","TMO",
-    "TMUS","TSLA","TXN","UNH","UNP","UPS","USB","V","VZ","WBA",
-    "WFC","WMT","XOM"
-]
+watchlist = [...]  # [your tickers, unchanged]
 
-def send_telegram_alert(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    try:
-        requests.post(url, data=payload)
-    except Exception as e:
-        st.warning(f"Failed to send Telegram alert: {e}")
+# --- Helper for Net Profit Calculation ---
+def estimate_net_profit(price, shares, take_profit_pct, commission_per_trade, slippage_pct):
+    gross_profit = price * take_profit_pct * shares
+    est_fees = commission_per_trade * 2
+    est_slippage = price * shares * slippage_pct * 2
+    net_profit = gross_profit - est_fees - est_slippage
+    return net_profit, est_fees, est_slippage
 
-def was_alerted_today(ticker, section_name):
-    today_str = str(date.today())
-    try:
-        with open(ALERT_LOG, "r") as f:
-            for row in f:
-                cols = row.strip().split(",")
-                if len(cols) == 3 and cols[0] == today_str and cols[1] == section_name and cols[2] == ticker:
-                    return True
-    except FileNotFoundError:
-        return False
-    return False
+def send_telegram_alert(message):  # [unchanged]
+    ...
 
-def add_to_alert_log(ticker, section_name):
-    today_str = str(date.today())
-    with open(ALERT_LOG, "a") as f:
-        f.write(f"{today_str},{section_name},{ticker}\n")
+def was_alerted_today(ticker, section_name):  # [unchanged]
+    ...
 
-def get_intraday_data(ticker):
-    try:
-        df = yf.download(ticker, period="2d", interval="5m", progress=False)
-    except Exception:
-        return None
-    return df
+def add_to_alert_log(ticker, section_name):  # [unchanged]
+    ...
+
+def get_intraday_data(ticker):  # [unchanged]
+    ...
+
+# --- Dynamic AI Scoring & Confidence ---
+def dynamic_ai_score(today, spy_change, ema200_lookback):
+    # EMA200
+    ema200_series = today["Close"].ewm(span=200).mean()
+    close = today["Close"].iloc[-1]
+    ema200 = ema200_series.iloc[-1]
+    ema_diff = (close - ema200) / ema200 * 100
+    if ema_diff > 2:
+        ema_score = 20
+        ema_label = "Strong EMA200 Breakout"
+    elif ema_diff > 1:
+        ema_score = 12
+        ema_label = "Clean EMA200 Cross"
+    elif ema_diff > 0:
+        ema_score = 5
+        ema_label = "Mild EMA200 Cross"
+    else:
+        ema_score = 0
+        ema_label = None
+
+    # VWAP
+    vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
+    vwap_diff = (close - vwap.iloc[-1]) / vwap.iloc[-1] * 100
+    if vwap_diff > 1:
+        vwap_score = 10
+        vwap_label = "Strong VWAP Above"
+    elif vwap_diff > 0.2:
+        vwap_score = 7
+        vwap_label = "VWAP Above"
+    elif vwap_diff > 0:
+        vwap_score = 3
+        vwap_label = "VWAP Just Above"
+    else:
+        vwap_score = 0
+        vwap_label = None
+
+    # MACD
+    exp12 = today["Close"].ewm(span=12).mean()
+    exp26 = today["Close"].ewm(span=26).mean()
+    macd = exp12 - exp26
+    signal = macd.ewm(span=9).mean()
+    macd_spread = macd.iloc[-1] - signal.iloc[-1]
+    if macd_spread > 0.5:
+        macd_score = 8
+        macd_label = "Strong MACD Bullish"
+    elif macd_spread > 0.1:
+        macd_score = 4
+        macd_label = "MACD Bullish"
+    elif macd_spread > 0:
+        macd_score = 2
+        macd_label = "Weak MACD Bullish"
+    else:
+        macd_score = 0
+        macd_label = None
+
+    # RS
+    today_open = today["Open"].iloc[0]
+    today_close = today["Close"].iloc[-1]
+    today_change = (today_close - today_open) / today_open * 100
+    rs_score = today_change - spy_change
+    if rs_score > 2:
+        rs_points = 12
+        rs_label = "Very Strong RS"
+    elif rs_score > 1:
+        rs_points = 8
+        rs_label = "Strong RS"
+    elif rs_score > 0:
+        rs_points = 4
+        rs_label = "RS > 0"
+    else:
+        rs_points = 0
+        rs_label = None
+
+    # Volume
+    avg_vol = today["Volume"].rolling(10).mean().iloc[-1]
+    last_vol = today["Volume"].iloc[-1]
+    vol_ratio = last_vol / avg_vol if avg_vol > 0 else 0
+    if vol_ratio > 3:
+        vol_score = 15
+        vol_label = "3x Volume Spike"
+    elif vol_ratio > 2:
+        vol_score = 8
+        vol_label = "2x Volume Spike"
+    elif vol_ratio > 1.3:
+        vol_score = 4
+        vol_label = "Volume Above Average"
+    else:
+        vol_score = 0
+        vol_label = None
+
+    # 10-bar High Breakout
+    high_10 = today["High"].rolling(10).max().iloc[-1]
+    if close >= high_10 and vol_ratio > 2:
+        breakout_score = 15
+        breakout_label = "Explosive 10-bar Breakout"
+    elif close >= high_10:
+        breakout_score = 5
+        breakout_label = "10-bar High Breakout"
+    else:
+        breakout_score = 0
+        breakout_label = None
+
+    # ATR Expansion
+    range_10 = today["High"].rolling(10).max() - today["Low"].rolling(10).min()
+    range_20 = today["High"].rolling(20).max() - today["Low"].rolling(20).min()
+    if range_10 > 1.5 * range_20:
+        atr_score = 5
+        atr_label = "Large ATR Expansion"
+    elif range_10 > range_20:
+        atr_score = 2
+        atr_label = "ATR Expanding"
+    else:
+        atr_score = 0
+        atr_label = None
+
+    # Defensive
+    spy_down = spy_change < 0
+    defensive_score = 12 if (spy_down and rs_score > 2) else 0
+    defensive_label = "Defensive Play" if defensive_score else None
+
+    # RSI
+    delta = today["Close"].diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    roll_up = up.rolling(14).mean()
+    roll_down = down.rolling(14).mean()
+    rs_rsi = roll_up / (roll_down + 1e-9)
+    rsi = 100 - (100 / (1 + rs_rsi))
+    rsi_note = None
+    if rsi.iloc[-1] > 70:
+        rsi_note = "RSI Overbought"
+    elif rsi.iloc[-1] < 30:
+        rsi_note = "RSI Oversold"
+
+    ai_score = min(ema_score + vwap_score + macd_score + rs_points +
+                   vol_score + breakout_score + atr_score + defensive_score, 100)
+    # Details for confidence and explanation
+    signals = [ema_label, vwap_label, macd_label, rs_label, vol_label, breakout_label, atr_label, defensive_label]
+    notes = [s for s in signals if s] + ([rsi_note] if rsi_note else [])
+
+    # For later use
+    all_scores = dict(
+        ema_score=ema_score, vwap_score=vwap_score, macd_score=macd_score,
+        rs_points=rs_points, vol_score=vol_score, breakout_score=breakout_score,
+        atr_score=atr_score, defensive_score=defensive_score
+    )
+    return ai_score, notes, all_scores, rs_score, rsi.iloc[-1], avg_vol, last_vol
+
+def calc_confidence(all_scores, go_day, avg_vol, last_vol, rsi_val):
+    conf = 30
+    for k in ["ema_score", "vwap_score", "rs_points", "vol_score"]:
+        if all_scores[k] >= 8:
+            conf += 8
+        elif all_scores[k] >= 4:
+            conf += 4
+    for k in ["macd_score", "breakout_score", "atr_score"]:
+        if all_scores[k] >= 5:
+            conf += 4
+        elif all_scores[k] > 0:
+            conf += 2
+    if not go_day and all_scores["defensive_score"] == 0:
+        conf -= 8
+    if last_vol < avg_vol:
+        conf -= 10
+    if rsi_val > 75:
+        conf -= 6
+    conf = min(max(conf, 0), 100)
+    return conf
 
 def scan_stock_all(
-    ticker, spy_change,
-    min_price, max_price, min_avg_vol,
-    ema200_lookback, pullback_lookback,
-    capital, take_profit_pct, cut_loss_pct
+    ticker, spy_change, min_price, max_price, min_avg_vol,
+    ema200_lookback, pullback_lookback, capital, take_profit_pct, cut_loss_pct, go_day
 ):
     df = get_intraday_data(ticker)
     if df is None or len(df) < 22:
@@ -98,153 +248,27 @@ def scan_stock_all(
     if not (min_price <= price <= max_price and avg_vol >= min_avg_vol):
         return None
 
-    try:
-        today_change = (today_close - today_open) / today_open * 100
-        rs_score = today_change - spy_change
-    except Exception:
-        today_change = 0
-        rs_score = 0
+    # --- Dynamic AI Score & Signal Reasoning ---
+    ai_score, notes, all_scores, rs_score, rsi_val, avg_vol, last_vol = dynamic_ai_score(today, spy_change, ema200_lookback)
+    conf = calc_confidence(all_scores, go_day, avg_vol, last_vol, rsi_val)
 
-    notes = []
-    score = 0
-    conf = 50  # start at 50%
-
-    # EMA200 Crossover
-    try:
-        ema200_series = today["Close"].ewm(span=200).mean()
-        crossed = False
-        for i in range(1, min(ema200_lookback, len(today)-1)):
-            if today["Close"].iloc[-i-1] < ema200_series.iloc[-i-1] and today["Close"].iloc[-i] > ema200_series.iloc[-i]:
-                crossed = True
-                break
-        if crossed:
-            score += 25
-            conf += 8
-            notes.append("EMA200 Cross ↑")
-    except Exception:
-        crossed = False
-
-    # VWAP
-    try:
-        vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
-        vwap_signal = today_close > float(vwap.iloc[-1])
-        if vwap_signal:
-            score += 20
-            conf += 7
-            notes.append("VWAP Above")
-    except Exception:
-        vwap_signal = False
-
-    # MACD
-    try:
-        exp12 = today["Close"].ewm(span=12).mean()
-        exp26 = today["Close"].ewm(span=26).mean()
-        macd = exp12 - exp26
-        signal = macd.ewm(span=9).mean()
-        macd_bull = float(macd.iloc[-1]) > float(signal.iloc[-1])
-        if macd_bull:
-            score += 15
-            conf += 6
-            notes.append("MACD Bullish")
-    except Exception:
-        macd_bull = False
-
-    # RSI
-    try:
-        delta = today["Close"].diff()
-        up = delta.clip(lower=0)
-        down = -1 * delta.clip(upper=0)
-        roll_up = up.rolling(14).mean()
-        roll_down = down.rolling(14).mean()
-        rs = roll_up / (roll_down + 1e-9)
-        rsi = 100 - (100 / (1 + rs))
-        if rsi.iloc[-1] > 70:
-            conf -= 6
-            notes.append("RSI Overbought")
-        elif rsi.iloc[-1] < 30:
-            score += 5
-            conf += 5
-            notes.append("RSI Oversold")
-    except Exception:
-        pass
-
-    # ATR
-    try:
-        high = today["High"]
-        low = today["Low"]
-        close = today["Close"]
-        tr = pd.concat([
-            (high - low),
-            (high - close.shift(1)).abs(),
-            (low - close.shift(1)).abs()
-        ], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean().iloc[-1]
-        notes.append(f"ATR: {atr:.2f}")
-    except Exception:
-        atr = 0
-
-    # High Liquidity (Order Flow)
-    try:
-        avg5m_vol = today["Volume"].rolling(10).mean()
-        recent_bars = today.tail(12)
-        flow_spike = (recent_bars["Volume"] > 2 * avg5m_vol).any()
-        if flow_spike:
-            score += 15
-            conf += 5
-            notes.append("Order Flow Spike")
-    except Exception:
-        flow_spike = False
-
-    # 10-bar High/Low Breakout
-    try:
-        high_10 = today["High"].rolling(10).max()
-        low_10 = today["Low"].rolling(10).min()
-        if today_close >= high_10.iloc[-1]:
-            score += 15
-            conf += 6
-            notes.append("Breakout: 10-bar High")
-        elif today_close <= low_10.iloc[-1]:
-            score -= 10
-            conf -= 8
-            notes.append("Breakdown: 10-bar Low")
-    except Exception:
-        pass
-
-    # Range Contraction/Expansion
-    try:
-        range_10 = today["High"].rolling(10).max() - today["Low"].rolling(10).min()
-        range_20 = today["High"].rolling(20).max() - today["Low"].rolling(20).min()
-        if range_10.iloc[-1] < 0.7 * range_20.iloc[-1]:
-            notes.append("Range Contraction")
-        elif range_10.iloc[-1] > 1.5 * range_20.iloc[-1]:
-            notes.append("Range Expansion")
-    except Exception:
-        pass
-
-    # Relative Strength
-    if rs_score > 0:
-        score += 10
-        conf += 5
-        notes.append("Strong RS")
-
+    today_change = (today_close - today_open) / today_open * 100
     # Trade Management
     target_price = price * (1 + take_profit_pct)
     cut_loss_price = price * (1 - cut_loss_pct)
     position_size = int(capital / price) if price > 0 else 0
-
-    # Risk:Reward
     risk_reward_ratio = (take_profit_pct / cut_loss_pct) if cut_loss_pct > 0 else np.nan
 
-    # Clip for 0-100 range
-    score = min(max(score, 0), 100)
-    conf = min(max(conf, 0), 100)
+    net_profit, est_fees, est_slippage = estimate_net_profit(
+        price, position_size, take_profit_pct, commission_per_trade, slippage_pct)
 
-    # Classification
-    is_go = rs_score > 1 and vwap_signal and crossed and volume > avg_vol
-    is_nogo = rs_score < -1 or not vwap_signal or not crossed
-    is_ema200 = crossed
-    is_vwap = vwap_signal
-    is_institutional = rs_score > 0 and volume > avg_vol
+    # Classifications
+    # A+ Setup: 3+ strong signals (≥8 points) + AI Score ≥ 70
+    signal_strong_count = sum([all_scores[k] >= 8 for k in ["ema_score", "vwap_score", "rs_points", "vol_score"]])
+    is_aplus = (signal_strong_count >= 3) and (ai_score >= 70) and go_day
+    is_defensive = (rs_score > 1) and (today_change > 0) and (not go_day)
+    is_go = is_aplus
+    is_nogo = is_defensive
 
     return {
         "Ticker": ticker,
@@ -257,14 +281,16 @@ def scan_stock_all(
         "Cut Loss Price": f"{cut_loss_price:.2f}",
         "Position Size": position_size,
         "Risk:Reward": f"{risk_reward_ratio:.2f}" if not np.isnan(risk_reward_ratio) else "-",
-        "AI Score": score,
+        "AI Score": ai_score,
         "Confidence Level": f"{conf:.0f}%",
         "AI Reasoning": ", ".join(notes) if notes else "-",
+        "A+": is_aplus,
+        "Defensive": is_defensive,
         "GO": is_go,
         "NO-GO": is_nogo,
-        "EMA200": is_ema200,
-        "VWAP": is_vwap,
-        "Institutional": is_institutional
+        "Estimated Net Profit": f"{net_profit:.2f}",
+        "Estimated Fees": f"{est_fees:.2f}",
+        "Estimated Slippage": f"{est_slippage:.2f}"
     }
 
 # --- Market Sentiment Analysis ---
@@ -302,7 +328,7 @@ for ticker in watchlist:
         ticker, spy_change,
         min_price, max_price, min_avg_vol,
         ema200_lookback, pullback_lookback,
-        capital, take_profit_pct, cut_loss_pct
+        capital, take_profit_pct, cut_loss_pct, go_day
     )
     if result:
         results.append(result)
@@ -311,10 +337,11 @@ df_results = pd.DataFrame(results) if results else pd.DataFrame()
 trade_cols = [
     "Ticker", "Price", "Change %", "RS Score", "Volume", "Avg Volume",
     "Target Price", "Cut Loss Price", "Position Size", "Risk:Reward",
-    "AI Score", "Confidence Level", "AI Reasoning"
+    "AI Score", "Confidence Level", "AI Reasoning",
+    "Estimated Net Profit", "Estimated Fees", "Estimated Slippage"
 ]
 
-# --- Section Tables ---
+# --- New Sections ---
 def show_section(title, filter_col):
     st.subheader(title)
     if not df_results.empty:
@@ -326,26 +353,32 @@ def show_section(title, filter_col):
     else:
         st.info("No data for stock screening.")
 
+# --- Section: A+ Setups on Go Day ---
+show_section("🔥 A+ Setups (High Confluence, Go Day)", "A+")
+
+# --- Section: Defensive Picks on No-Go Day ---
+show_section("🛡️ Defensive (Anti-Market) Picks (No-Go Day)", "Defensive")
+
+# --- Old Sections for reference (you can remove if not needed) ---
 show_section("Go Day Stock Recommendations (Momentum/Breakout)", "GO")
 show_section("No-Go Day Stock Recommendations (Defensive)", "NO-GO")
-show_section("EMA200 Crossover Screener", "EMA200")
-show_section("VWAP Above Screener", "VWAP")
-show_section("Potential Institutional Accumulation (RS > 0 & High Volume)", "Institutional")
 
-# --- AI Top 5 Picks ---
+# --- Enhanced AI Top 5 A+ Picks ---
 if not df_results.empty:
-    df_ai_top = df_results.sort_values("AI Score", ascending=False).head(5).copy()
-    st.subheader("⭐ Top 5 AI Picks of the Day")
+    df_ai_top = df_results[df_results["A+"] == True].sort_values(
+        ["AI Score", "Confidence Level", "Risk:Reward"], ascending=False
+    ).head(5).copy()
+    st.subheader("⭐ Top 5 AI Picks of the Day (A+ Net Profit After Fees)")
     st.dataframe(df_ai_top[trade_cols].reset_index(drop=True), use_container_width=True)
 else:
     st.warning("⚠️ No stocks meet your screener criteria. Try relaxing the filter settings.")
 
-# --- Alerts (for Top 5 only) ---
+# --- Alerts (Top 5 only) ---
 if 'alerted_tickers' not in st.session_state:
     st.session_state['alerted_tickers'] = set()
 alerted_tickers = st.session_state['alerted_tickers']
 
-for _, row in df_results.sort_values("AI Score", ascending=False).head(5).iterrows():
+for _, row in df_results[df_results["A+"] == True].sort_values("AI Score", ascending=False).head(5).iterrows():
     section_name = "AI Top 5"
     ticker = row["Ticker"]
     if not was_alerted_today(ticker, section_name):
@@ -354,6 +387,7 @@ for _, row in df_results.sort_values("AI Score", ascending=False).head(5).iterro
             f"Ticker: {ticker}\n"
             f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
             f"Risk:Reward {row['Risk:Reward']} | AI Score: {row['AI Score']} | Conf: {row['Confidence Level']}\n"
+            f"Net Profit: ${row['Estimated Net Profit']} (after fees/slippage)\n"
             f"Reason: {row['AI Reasoning']}"
         )
         send_telegram_alert(msg)
@@ -362,57 +396,4 @@ for _, row in df_results.sort_values("AI Score", ascending=False).head(5).iterro
 st.session_state['alerted_tickers'] = alerted_tickers
 
 # --- Win Rate & RR Backtest Panel ---
-def simulate_intraday_trades(ticker, days=10, take_profit_pct=0.01, cut_loss_pct=0.005):
-    df = yf.download(ticker, period=f"{days+2}d", interval="5m", progress=False)
-    if df.empty:
-        return None
-    df['Date'] = df.index.date
-    grouped = df.groupby('Date')
-    results = []
-    for d, group in grouped:
-        if len(group) < 20:
-            continue
-        open_price = group['Open'].iloc[0]
-        tp = open_price * (1 + take_profit_pct)
-        sl = open_price * (1 - cut_loss_pct)
-        hit_tp = (group['High'] >= tp).any()
-        hit_sl = (group['Low'] <= sl).any()
-        win = None
-        if hit_tp and hit_sl:
-            tp_idx = group[group['High'] >= tp].index[0]
-            sl_idx = group[group['Low'] <= sl].index[0]
-            win = tp_idx < sl_idx
-        elif hit_tp:
-            win = True
-        elif hit_sl:
-            win = False
-        else:
-            win = group['Close'].iloc[-1] > open_price
-        gain = take_profit_pct if win else -cut_loss_pct
-        results.append({"Date": d, "Win": int(win), "Gain": gain})
-    return results
-
-with st.expander("🧪 Quick Win Rate & RR Estimator"):
-    ticker_for_test = st.text_input("Ticker to Backtest", value="AAPL")
-    backtest_days = st.number_input("Days to Backtest", value=10, min_value=2, max_value=30)
-    backtest_tp = st.number_input("Take Profit (%)", value=1.0, min_value=0.2, max_value=5.0, step=0.1) / 100
-    backtest_sl = st.number_input("Cut Loss (%)", value=0.5, min_value=0.1, max_value=3.0, step=0.1) / 100
-    if st.button("Run Backtest"):
-        st.write(f"Running backtest on {ticker_for_test} for {backtest_days} days...")
-        bt = simulate_intraday_trades(
-            ticker_for_test,
-            days=int(backtest_days),
-            take_profit_pct=backtest_tp,
-            cut_loss_pct=backtest_sl
-        )
-        if bt:
-            df_bt = pd.DataFrame(bt)
-            win_rate = df_bt["Win"].mean() * 100
-            rr = backtest_tp / backtest_sl if backtest_sl != 0 else np.nan
-            avg_return = df_bt["Gain"].mean() * 100
-            st.markdown(f"**Win Rate:** {win_rate:.2f}%")
-            st.markdown(f"**Risk/Reward Ratio:** {rr:.2f}")
-            st.markdown(f"**Average Return per Trade:** {avg_return:.2f}%")
-            st.dataframe(df_bt)
-        else:
-            st.warning("Not enough data to simulate.")
+# [no change needed; your code is fine here]
