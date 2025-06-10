@@ -2,11 +2,11 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
 import requests
 
 # --- SETTINGS ---
-TELEGRAM_BOT_TOKEN = "xxx" # keep private
+TELEGRAM_BOT_TOKEN = "xxx"
 TELEGRAM_CHAT_ID = "xxx"
 ALERT_LOG = "alerts_log.csv"
 
@@ -34,9 +34,23 @@ with st.sidebar.expander("Profit & Risk Planner", expanded=True):
     commission_per_trade = st.number_input("Commission per trade ($)", value=1.0, step=0.1)
     slippage_pct = st.number_input("Slippage (%)", value=0.02, step=0.01) / 100
 
-watchlist = [...]  # [your tickers, unchanged]
+watchlist = [
+    "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMGN","AMT","AMZN","AVGO",
+    "AXP","BA","BAC","BK","BKNG","BLK","BMY","BRK.B","C","CAT",
+    "CHTR","CL","CMCSA","COF","COP","COST","CRM","CSCO","CVS","CVX",
+    "DHR","DIS","DOW","DUK","EMR","EXC","F","FDX","FOX","FOXA",
+    "GD","GE","GILD","GM","GOOG","GOOGL","GS","HD","HON","IBM",
+    "INTC","JNJ","JPM","KHC","KMI","KO","LIN","LLY","LMT","LOW",
+    "MA","MCD","MDLZ","MDT","MET","META","MMM","MO","MRK","MS",
+    "MSFT","NEE","NFLX","NKE","NVDA","ORCL","PEP","PFE","PG","PM",
+    "PYPL","QCOM","RTX","SBUX","SCHW","SO","SPG","T","TGT","TMO",
+    "TMUS","TSLA","TXN","UNH","UNP","UPS","USB","V","VZ","WBA",
+    "WFC","WMT","XOM"
+]
 
-# --- Helper for Net Profit Calculation ---
+def has_column(df, col):
+    return (not df.empty) and (col in df.columns)
+
 def estimate_net_profit(price, shares, take_profit_pct, commission_per_trade, slippage_pct):
     gross_profit = price * take_profit_pct * shares
     est_fees = commission_per_trade * 2
@@ -44,21 +58,39 @@ def estimate_net_profit(price, shares, take_profit_pct, commission_per_trade, sl
     net_profit = gross_profit - est_fees - est_slippage
     return net_profit, est_fees, est_slippage
 
-def send_telegram_alert(message):  # [unchanged]
-    ...
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        requests.post(url, data=payload)
+    except Exception as e:
+        st.warning(f"Failed to send Telegram alert: {e}")
 
-def was_alerted_today(ticker, section_name):  # [unchanged]
-    ...
+def was_alerted_today(ticker, section_name):
+    today_str = str(date.today())
+    try:
+        with open(ALERT_LOG, "r") as f:
+            for row in f:
+                cols = row.strip().split(",")
+                if len(cols) == 3 and cols[0] == today_str and cols[1] == section_name and cols[2] == ticker:
+                    return True
+    except FileNotFoundError:
+        return False
+    return False
 
-def add_to_alert_log(ticker, section_name):  # [unchanged]
-    ...
+def add_to_alert_log(ticker, section_name):
+    today_str = str(date.today())
+    with open(ALERT_LOG, "a") as f:
+        f.write(f"{today_str},{section_name},{ticker}\n")
 
-def get_intraday_data(ticker):  # [unchanged]
-    ...
+def get_intraday_data(ticker):
+    try:
+        df = yf.download(ticker, period="2d", interval="5m", progress=False)
+    except Exception:
+        return None
+    return df
 
-# --- Dynamic AI Scoring & Confidence ---
 def dynamic_ai_score(today, spy_change, ema200_lookback):
-    # EMA200
     ema200_series = today["Close"].ewm(span=200).mean()
     close = today["Close"].iloc[-1]
     ema200 = ema200_series.iloc[-1]
@@ -76,7 +108,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         ema_score = 0
         ema_label = None
 
-    # VWAP
     vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
     vwap_diff = (close - vwap.iloc[-1]) / vwap.iloc[-1] * 100
     if vwap_diff > 1:
@@ -92,7 +123,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         vwap_score = 0
         vwap_label = None
 
-    # MACD
     exp12 = today["Close"].ewm(span=12).mean()
     exp26 = today["Close"].ewm(span=26).mean()
     macd = exp12 - exp26
@@ -111,7 +141,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         macd_score = 0
         macd_label = None
 
-    # RS
     today_open = today["Open"].iloc[0]
     today_close = today["Close"].iloc[-1]
     today_change = (today_close - today_open) / today_open * 100
@@ -129,7 +158,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         rs_points = 0
         rs_label = None
 
-    # Volume
     avg_vol = today["Volume"].rolling(10).mean().iloc[-1]
     last_vol = today["Volume"].iloc[-1]
     vol_ratio = last_vol / avg_vol if avg_vol > 0 else 0
@@ -146,7 +174,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         vol_score = 0
         vol_label = None
 
-    # 10-bar High Breakout
     high_10 = today["High"].rolling(10).max().iloc[-1]
     if close >= high_10 and vol_ratio > 2:
         breakout_score = 15
@@ -158,7 +185,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         breakout_score = 0
         breakout_label = None
 
-    # ATR Expansion
     range_10 = today["High"].rolling(10).max() - today["Low"].rolling(10).min()
     range_20 = today["High"].rolling(20).max() - today["Low"].rolling(20).min()
     if range_10 > 1.5 * range_20:
@@ -171,12 +197,10 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         atr_score = 0
         atr_label = None
 
-    # Defensive
     spy_down = spy_change < 0
     defensive_score = 12 if (spy_down and rs_score > 2) else 0
     defensive_label = "Defensive Play" if defensive_score else None
 
-    # RSI
     delta = today["Close"].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
@@ -192,11 +216,9 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
 
     ai_score = min(ema_score + vwap_score + macd_score + rs_points +
                    vol_score + breakout_score + atr_score + defensive_score, 100)
-    # Details for confidence and explanation
     signals = [ema_label, vwap_label, macd_label, rs_label, vol_label, breakout_label, atr_label, defensive_label]
     notes = [s for s in signals if s] + ([rsi_note] if rsi_note else [])
 
-    # For later use
     all_scores = dict(
         ema_score=ema_score, vwap_score=vwap_score, macd_score=macd_score,
         rs_points=rs_points, vol_score=vol_score, breakout_score=breakout_score,
@@ -248,12 +270,10 @@ def scan_stock_all(
     if not (min_price <= price <= max_price and avg_vol >= min_avg_vol):
         return None
 
-    # --- Dynamic AI Score & Signal Reasoning ---
     ai_score, notes, all_scores, rs_score, rsi_val, avg_vol, last_vol = dynamic_ai_score(today, spy_change, ema200_lookback)
     conf = calc_confidence(all_scores, go_day, avg_vol, last_vol, rsi_val)
 
     today_change = (today_close - today_open) / today_open * 100
-    # Trade Management
     target_price = price * (1 + take_profit_pct)
     cut_loss_price = price * (1 - cut_loss_pct)
     position_size = int(capital / price) if price > 0 else 0
@@ -262,8 +282,6 @@ def scan_stock_all(
     net_profit, est_fees, est_slippage = estimate_net_profit(
         price, position_size, take_profit_pct, commission_per_trade, slippage_pct)
 
-    # Classifications
-    # A+ Setup: 3+ strong signals (≥8 points) + AI Score ≥ 70
     signal_strong_count = sum([all_scores[k] >= 8 for k in ["ema_score", "vwap_score", "rs_points", "vol_score"]])
     is_aplus = (signal_strong_count >= 3) and (ai_score >= 70) and go_day
     is_defensive = (rs_score > 1) and (today_change > 0) and (not go_day)
@@ -293,7 +311,6 @@ def scan_stock_all(
         "Estimated Slippage": f"{est_slippage:.2f}"
     }
 
-# --- Market Sentiment Analysis ---
 spy = get_intraday_data('SPY')
 qqq = get_intraday_data('QQQ')
 go_day = False
@@ -321,7 +338,6 @@ else:
     st.warning("Could not load recent market data. Try again later.")
     spy_change = qqq_change = 0.0
 
-# --- Screener ---
 results = []
 for ticker in watchlist:
     result = scan_stock_all(
@@ -341,10 +357,9 @@ trade_cols = [
     "Estimated Net Profit", "Estimated Fees", "Estimated Slippage"
 ]
 
-# --- New Sections ---
 def show_section(title, filter_col):
     st.subheader(title)
-    if not df_results.empty:
+    if has_column(df_results, filter_col):
         df = df_results[df_results[filter_col] == True]
         if not df.empty:
             st.dataframe(df[trade_cols].sort_values("AI Score", ascending=False).reset_index(drop=True), use_container_width=True)
@@ -353,47 +368,40 @@ def show_section(title, filter_col):
     else:
         st.info("No data for stock screening.")
 
-# --- Section: A+ Setups on Go Day ---
 show_section("🔥 A+ Setups (High Confluence, Go Day)", "A+")
-
-# --- Section: Defensive Picks on No-Go Day ---
 show_section("🛡️ Defensive (Anti-Market) Picks (No-Go Day)", "Defensive")
-
-# --- Old Sections for reference (you can remove if not needed) ---
 show_section("Go Day Stock Recommendations (Momentum/Breakout)", "GO")
 show_section("No-Go Day Stock Recommendations (Defensive)", "NO-GO")
 
-# --- Enhanced AI Top 5 A+ Picks ---
-if not df_results.empty:
+if has_column(df_results, "A+"):
     df_ai_top = df_results[df_results["A+"] == True].sort_values(
         ["AI Score", "Confidence Level", "Risk:Reward"], ascending=False
-    ).head(5).copy()
+    ).head(5)
     st.subheader("⭐ Top 5 AI Picks of the Day (A+ Net Profit After Fees)")
     st.dataframe(df_ai_top[trade_cols].reset_index(drop=True), use_container_width=True)
 else:
     st.warning("⚠️ No stocks meet your screener criteria. Try relaxing the filter settings.")
 
-# --- Alerts (Top 5 only) ---
 if 'alerted_tickers' not in st.session_state:
     st.session_state['alerted_tickers'] = set()
 alerted_tickers = st.session_state['alerted_tickers']
 
-for _, row in df_results[df_results["A+"] == True].sort_values("AI Score", ascending=False).head(5).iterrows():
-    section_name = "AI Top 5"
-    ticker = row["Ticker"]
-    if not was_alerted_today(ticker, section_name):
-        msg = (
-            f"📈 {section_name} ALERT!\n"
-            f"Ticker: {ticker}\n"
-            f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
-            f"Risk:Reward {row['Risk:Reward']} | AI Score: {row['AI Score']} | Conf: {row['Confidence Level']}\n"
-            f"Net Profit: ${row['Estimated Net Profit']} (after fees/slippage)\n"
-            f"Reason: {row['AI Reasoning']}"
-        )
-        send_telegram_alert(msg)
-        add_to_alert_log(ticker, section_name)
-        alerted_tickers.add((ticker, section_name))
+if has_column(df_results, "A+"):
+    for _, row in df_results[df_results["A+"] == True].sort_values("AI Score", ascending=False).head(5).iterrows():
+        section_name = "AI Top 5"
+        ticker = row["Ticker"]
+        if not was_alerted_today(ticker, section_name):
+            msg = (
+                f"📈 {section_name} ALERT!\n"
+                f"Ticker: {ticker}\n"
+                f"Price: ${row['Price']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
+                f"Risk:Reward {row['Risk:Reward']} | AI Score: {row['AI Score']} | Conf: {row['Confidence Level']}\n"
+                f"Net Profit: ${row['Estimated Net Profit']} (after fees/slippage)\n"
+                f"Reason: {row['AI Reasoning']}"
+            )
+            send_telegram_alert(msg)
+            add_to_alert_log(ticker, section_name)
+            alerted_tickers.add((ticker, section_name))
 st.session_state['alerted_tickers'] = alerted_tickers
 
-# --- Win Rate & RR Backtest Panel ---
-# [no change needed; your code is fine here]
+# Your backtest tool (unchanged)
