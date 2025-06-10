@@ -111,10 +111,52 @@ def get_intraday_data(ticker):
         return None
 
 def dynamic_ai_score(today, spy_change, ema200_lookback):
+    close = float(today["Close"].iloc[-1])
     ema200_series = today["Close"].ewm(span=200).mean()
-    close = today["Close"].iloc[-1]
-    ema200 = ema200_series.iloc[-1]
+    ema200 = float(ema200_series.iloc[-1])
     ema_diff = (close - ema200) / ema200 * 100
+
+    # VWAP
+    vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
+    vwap_val = float(vwap.iloc[-1])
+    vwap_diff = (close - vwap_val) / vwap_val * 100
+
+    # MACD
+    exp12 = today["Close"].ewm(span=12).mean()
+    exp26 = today["Close"].ewm(span=26).mean()
+    macd = exp12 - exp26
+    signal = macd.ewm(span=9).mean()
+    macd_spread = float(macd.iloc[-1]) - float(signal.iloc[-1])
+
+    # 10-bar high
+    high_10 = float(today["High"].rolling(10).max().iloc[-1])
+
+    # ATR/range
+    range_10 = float(today["High"].rolling(10).max().iloc[-1] - today["Low"].rolling(10).min().iloc[-1])
+    range_20 = float(today["High"].rolling(20).max().iloc[-1] - today["Low"].rolling(20).min().iloc[-1])
+
+    # RSI
+    delta = today["Close"].diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    roll_up = up.rolling(14).mean()
+    roll_down = down.rolling(14).mean()
+    rs_rsi = roll_up / (roll_down + 1e-9)
+    rsi = 100 - (100 / (1 + rs_rsi))
+    rsi_val = float(rsi.iloc[-1])
+
+    # RS
+    today_open = float(today["Open"].iloc[0])
+    today_close = float(today["Close"].iloc[-1])
+    today_change = (today_close - today_open) / today_open * 100
+    rs_score = today_change - spy_change
+
+    # Avg/last vol
+    avg_vol = float(today["Volume"].rolling(10).mean().iloc[-1])
+    last_vol = float(today["Volume"].iloc[-1])
+    vol_ratio = last_vol / avg_vol if avg_vol > 0 else 0
+
+    # Signals logic (all float safe)
     if ema_diff > 2:
         ema_score = 20
         ema_label = "Strong EMA200 Breakout"
@@ -128,8 +170,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         ema_score = 0
         ema_label = None
 
-    vwap = (today["Volume"] * (today["High"] + today["Low"] + today["Close"]) / 3).cumsum() / today["Volume"].cumsum()
-    vwap_diff = (close - vwap.iloc[-1]) / vwap.iloc[-1] * 100
     if vwap_diff > 1:
         vwap_score = 10
         vwap_label = "Strong VWAP Above"
@@ -143,11 +183,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         vwap_score = 0
         vwap_label = None
 
-    exp12 = today["Close"].ewm(span=12).mean()
-    exp26 = today["Close"].ewm(span=26).mean()
-    macd = exp12 - exp26
-    signal = macd.ewm(span=9).mean()
-    macd_spread = macd.iloc[-1] - signal.iloc[-1]
     if macd_spread > 0.5:
         macd_score = 8
         macd_label = "Strong MACD Bullish"
@@ -161,10 +196,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         macd_score = 0
         macd_label = None
 
-    today_open = today["Open"].iloc[0]
-    today_close = today["Close"].iloc[-1]
-    today_change = (today_close - today_open) / today_open * 100
-    rs_score = today_change - spy_change
     if rs_score > 2:
         rs_points = 12
         rs_label = "Very Strong RS"
@@ -178,9 +209,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         rs_points = 0
         rs_label = None
 
-    avg_vol = today["Volume"].rolling(10).mean().iloc[-1]
-    last_vol = today["Volume"].iloc[-1]
-    vol_ratio = last_vol / avg_vol if avg_vol > 0 else 0
     if vol_ratio > 3:
         vol_score = 15
         vol_label = "3x Volume Spike"
@@ -194,7 +222,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         vol_score = 0
         vol_label = None
 
-    high_10 = today["High"].rolling(10).max().iloc[-1]
     if close >= high_10 and vol_ratio > 2:
         breakout_score = 15
         breakout_label = "Explosive 10-bar Breakout"
@@ -205,8 +232,6 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         breakout_score = 0
         breakout_label = None
 
-    range_10 = today["High"].rolling(10).max() - today["Low"].rolling(10).min()
-    range_20 = today["High"].rolling(20).max() - today["Low"].rolling(20).min()
     if range_10 > 1.5 * range_20:
         atr_score = 5
         atr_label = "Large ATR Expansion"
@@ -221,17 +246,10 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
     defensive_score = 12 if (spy_down and rs_score > 2) else 0
     defensive_label = "Defensive Play" if defensive_score else None
 
-    delta = today["Close"].diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    roll_up = up.rolling(14).mean()
-    roll_down = down.rolling(14).mean()
-    rs_rsi = roll_up / (roll_down + 1e-9)
-    rsi = 100 - (100 / (1 + rs_rsi))
     rsi_note = None
-    if rsi.iloc[-1] > 70:
+    if rsi_val > 70:
         rsi_note = "RSI Overbought"
-    elif rsi.iloc[-1] < 30:
+    elif rsi_val < 30:
         rsi_note = "RSI Oversold"
 
     ai_score = min(ema_score + vwap_score + macd_score + rs_points +
@@ -244,7 +262,7 @@ def dynamic_ai_score(today, spy_change, ema200_lookback):
         rs_points=rs_points, vol_score=vol_score, breakout_score=breakout_score,
         atr_score=atr_score, defensive_score=defensive_score
     )
-    return ai_score, notes, all_scores, rs_score, rsi.iloc[-1], avg_vol, last_vol
+    return ai_score, notes, all_scores, rs_score, rsi_val, avg_vol, last_vol
 
 def calc_confidence(all_scores, go_day, avg_vol, last_vol, rsi_val):
     conf = 30
