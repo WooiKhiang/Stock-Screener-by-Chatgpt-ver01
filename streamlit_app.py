@@ -7,22 +7,15 @@ import pytz
 import requests
 
 # --- SETTINGS ---
-TELEGRAM_BOT_TOKEN = "xxx"   # <-- fill with your token
-TELEGRAM_CHAT_ID = "xxx"     # <-- fill with your chat ID
+TELEGRAM_BOT_TOKEN = "xxx"   # <-- fill with your token or comment out alert sections
+TELEGRAM_CHAT_ID = "xxx"
 ALERT_LOG = "alerts_log.csv"
 
 st.set_page_config(page_title="US Market Day Trading Screener", layout="wide")
 st.title("US Market Go/No-Go Dashboard")
 
-# --- Refresh Button & Timestamp (Safe) ---
-if "do_refresh" not in st.session_state:
-    st.session_state["do_refresh"] = False
-
+# --- Refresh Button & Timestamp (Safe & Minimal) ---
 if st.button("🔄 Refresh Data Now"):
-    st.session_state["do_refresh"] = True
-
-if st.session_state["do_refresh"]:
-    st.session_state["do_refresh"] = False
     st.experimental_rerun()
 
 st.caption(f"Last data refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
