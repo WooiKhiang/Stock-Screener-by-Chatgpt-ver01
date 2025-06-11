@@ -39,19 +39,23 @@ def calc_indicators(df):
     return df
 
 def mean_reversion_signal(df):
-    cond = (
-        (df['Close'].iloc[-1] > df['SMA40'].iloc[-1]) and
-        (df['RSI3'].iloc[-1] < 15)
-    )
+    c = df['Close'].iloc[-1]
+    sma = df['SMA40'].iloc[-1]
+    rsi = df['RSI3'].iloc[-1]
+    if pd.isna(c) or pd.isna(sma) or pd.isna(rsi):
+        return False, None
+    cond = (c > sma) and (rsi < 15)
     return cond, "Mean Reversion: Price > SMA40 & RSI(3)<15" if cond else (False, None)
 
 def ema40_breakout_signal(df):
-    close = df['Close'].iloc[-1]
-    ema40 = df['EMA40'].iloc[-1]
-    prev_close = df['Close'].iloc[-2]
-    prev_ema40 = df['EMA40'].iloc[-2]
+    c = df['Close'].iloc[-1]
+    ema = df['EMA40'].iloc[-1]
+    pc = df['Close'].iloc[-2]
+    pema = df['EMA40'].iloc[-2]
+    if pd.isna(c) or pd.isna(ema) or pd.isna(pc) or pd.isna(pema):
+        return False, None
     dipped = (df['Close'].iloc[-10:-1] < df['EMA40'].iloc[-10:-1]).any()
-    cond = (close > ema40) and ((prev_close < prev_ema40) or dipped)
+    cond = (c > ema) and ((pc < pema) or dipped)
     return cond, "EMA40 Breakout: Price reclaimed EMA40 (with shakeout)" if cond else (False, None)
 
 def macd_ema_signal(df):
@@ -61,6 +65,8 @@ def macd_ema_signal(df):
     macd_signal_prev = df['MACD_signal'].iloc[-2]
     ema8 = df['EMA8'].iloc[-1]
     ema21 = df['EMA21'].iloc[-1]
+    if any(pd.isna(x) for x in [macd, macd_signal, macd_prev, macd_signal_prev, ema8, ema21]):
+        return False, None
     cross = (macd_prev < macd_signal_prev) and (macd > macd_signal) and (macd < 0)
     cond = cross and (ema8 > ema21)
     return cond, "MACD+EMA: MACD cross up <0 & EMA8>EMA21" if cond else (False, None)
@@ -164,7 +170,6 @@ for ticker in sp500:
         debug_status = f"{ticker}: Exception - {e}"
         debug_rows.append({'Ticker': ticker, 'Status': debug_status})
 
-# Show debug indicator/status table
 df_debug = pd.DataFrame(debug_rows)
 if not df_debug.empty:
     st.subheader("DEBUG: Ticker Status & Indicator Values")
