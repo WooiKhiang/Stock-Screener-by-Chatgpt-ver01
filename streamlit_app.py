@@ -8,7 +8,7 @@ from datetime import datetime
 sp500 = [
     'AAPL','MSFT','GOOGL','AMZN','NVDA','META','BRK-B','JPM','UNH','XOM',
     'LLY','JNJ','V','PG','MA','AVGO','HD','MRK','COST','ADBE'
-    # ...expand for production, but keep short for speed/testing
+    # ...expand as needed
 ]
 
 # --- Sidebar: Filters ---
@@ -178,7 +178,6 @@ for ticker in sp500:
         df = yf.download(ticker, period="2d", interval="5m", progress=False)
         if df.empty:
             continue
-        # Use the last two non-NaN closes
         closes = df['Close'].dropna()
         if len(closes) < 2:
             continue
@@ -187,7 +186,7 @@ for ticker in sp500:
         last_idx = closes.index[-1]
         last_row = df.loc[last_idx]
         last_vol = last_row['Volume'] if not np.isnan(last_row['Volume']) else 0
-        if prev_close == 0:  # Avoid division by zero
+        if prev_close == 0:
             continue
         pct_change = 100 * (last_close - prev_close) / prev_close
         perf_results.append({
@@ -202,7 +201,6 @@ for ticker in sp500:
 
 df_perf = pd.DataFrame(perf_results)
 if not df_perf.empty:
-    # Clean up Change (%) for safety
     df_perf = df_perf.dropna(subset=["Change (%)"])
     df_perf["Change (%)"] = pd.to_numeric(df_perf["Change (%)"], errors="coerce")
     df_perf = df_perf.dropna(subset=["Change (%)"])
@@ -216,4 +214,3 @@ else:
     st.info("No recent 5-min data for performance check.")
 
 st.caption("Strategies: 1) Mean Reversion, 2) EMA40 Breakout, 3) MACD+EMA. Exits: Mean Reversion = TP +1%/SL -0.5%. EMA40/Combo = trailing stop or indicator exit.")
-
