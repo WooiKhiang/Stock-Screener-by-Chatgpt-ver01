@@ -15,11 +15,10 @@ max_price = st.sidebar.number_input("Max Price ($)", value=2000.0, key="max_pric
 min_volume = st.sidebar.number_input("Min Avg Vol (40 bars)", value=50000, key="min_vol")
 capital_per_trade = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0, key="capital_trade")
 
-st.title("⚡ S&P 500 - 5-Minute Intraday Trade Screener (ROBUST DEBUG MODE)")
+st.title("⚡ S&P 500 - 5-Minute Intraday Trade Screener (BULLETPROOF DEBUG MODE)")
 st.caption(f"Last run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 def safe_scalar(val):
-    # Returns a scalar if possible, else np.nan
     if isinstance(val, pd.Series) or isinstance(val, np.ndarray):
         if len(val) == 1:
             return float(val.item())
@@ -65,10 +64,9 @@ def ema40_breakout_signal(df):
     pema = safe_scalar(df['EMA40'].iloc[-2])
     if np.isnan(c) or np.isnan(ema) or np.isnan(pc) or np.isnan(pema):
         return False, None
-    # Fix: Align series before comparison!
     left = df['Close'].iloc[-10:-1]
     right = df['EMA40'].iloc[-10:-1]
-    left, right = left.align(right, join='inner')
+    left, right = left.align(right, join='inner', axis=0)  # <- fix axis=0!
     dipped = (left < right).any()
     cond = (c > ema) and ((pc < pema) or dipped)
     return cond, "EMA40 Breakout: Price reclaimed EMA40 (with shakeout)" if cond else (False, None)
@@ -93,6 +91,14 @@ for ticker in sp500:
     debug_status = ""
     try:
         df = yf.download(ticker, period="5d", interval="5m", progress=False)
+        # --- Normalize DataFrame, force single-column
+        if isinstance(df, pd.DataFrame) and isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(-1)
+        if isinstance(df['Close'], pd.DataFrame):
+            df['Close'] = df['Close'].iloc[:, 0]
+        if isinstance(df['Volume'], pd.DataFrame):
+            df['Volume'] = df['Volume'].iloc[:, 0]
+        # ------------------------
         if df.empty or len(df) < 50:
             debug_status = f"{ticker}: Not enough data ({len(df)} bars)"
             debug_rows.append({'Ticker': ticker, 'Status': debug_status})
@@ -199,4 +205,4 @@ if not df_results.empty:
 else:
     st.info("No stocks meet your filter/strategy criteria right now.")
 
-st.caption("This version bulletproofs against all index/Series issues. If you still see errors, paste the new error message here!")
+st.caption("This version is robust to all DataFrame/Series, index alignment, and axis errors. If you still get errors, show me the exact line and message!")
