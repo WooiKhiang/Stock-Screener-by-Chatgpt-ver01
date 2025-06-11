@@ -4,24 +4,21 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# --- S&P 500 Shortlist (expand as needed for full S&P 500) ---
 sp500 = [
     'AAPL','MSFT','GOOGL','AMZN','NVDA','META','BRK-B','JPM','UNH','XOM',
     'LLY','JNJ','V','PG','MA','AVGO','HD','MRK','COST','ADBE'
-    # ...expand to full list for production if desired
+    # ...expand for production, but keep short for debugging
 ]
 
-# --- Sidebar: Filters ---
 st.sidebar.header("Filter Settings")
 min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
 min_volume = st.sidebar.number_input("Min Avg Vol (40 bars)", value=50000)
 capital_per_trade = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0)
 
-st.title("⚡ S&P 500 - 5-Minute Intraday Trade Screener")
-st.caption(f"Last run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (5-min chart, 5-day lookback)")
+st.title("⚡ S&P 500 - 5-Minute Intraday Trade Screener (DEBUG MODE)")
+st.caption(f"Last run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# --- Helper Functions: Indicators ---
 def calc_indicators(df):
     df['SMA40'] = df['Close'].rolling(window=40).mean()
     df['EMA40'] = df['Close'].ewm(span=40, min_periods=40).mean()
@@ -41,7 +38,6 @@ def calc_indicators(df):
     df['AvgVol40'] = df['Volume'].rolling(window=40).mean()
     return df
 
-# --- Strategy Functions ---
 def mean_reversion_signal(df):
     cond = (
         (df['Close'].iloc[-1] > df['SMA40'].iloc[-1]) and
@@ -69,29 +65,65 @@ def macd_ema_signal(df):
     cond = cross and (ema8 > ema21)
     return cond, "MACD+EMA: MACD cross up <0 & EMA8>EMA21" if cond else (False, None)
 
-# --- Main Scan Loop ---
+debug_rows = []
 results = []
+
 for ticker in sp500:
+    debug_status = ""
     try:
         df = yf.download(ticker, period="5d", interval="5m", progress=False)
         if df.empty or len(df) < 50:
+            debug_status = f"{ticker}: Not enough data ({len(df)} bars)"
+            debug_rows.append({'Ticker': ticker, 'Status': debug_status})
             continue
         df = calc_indicators(df)
         last = df.iloc[-1]
         close_price = float(last['Close'])
         avgvol40 = float(last['AvgVol40'])
+
+        if last.isna().any():
+            debug_status = f"{ticker}: NaNs in indicators"
+            debug_rows.append({
+                'Ticker': ticker,
+                'Status': debug_status,
+                'Close': last['Close'],
+                'SMA40': last['SMA40'],
+                'RSI3': last['RSI3'],
+                'EMA40': last['EMA40'],
+                'MACD': last['MACD'],
+                'Volume': last['Volume'],
+                'AvgVol40': last['AvgVol40'],
+            })
+            continue
         if np.isnan(close_price) or not (min_price <= close_price <= max_price):
+            debug_status = f"{ticker}: Price {close_price} outside filter"
+            debug_rows.append({'Ticker': ticker, 'Status': debug_status, 'Close': close_price})
             continue
         if np.isnan(avgvol40) or avgvol40 < min_volume:
+            debug_status = f"{ticker}: AvgVol40 {avgvol40} below filter"
+            debug_rows.append({'Ticker': ticker, 'Status': debug_status, 'AvgVol40': avgvol40})
             continue
-
-        strat, reason = None, ""
-        rank = 0
 
         mr, mr_reason = mean_reversion_signal(df)
         ema, ema_reason = ema40_breakout_signal(df)
         macdema, macdema_reason = macd_ema_signal(df)
 
+        debug_rows.append({
+            'Ticker': ticker,
+            'Status': 'OK',
+            'Close': close_price,
+            'SMA40': last['SMA40'],
+            'RSI3': last['RSI3'],
+            'EMA40': last['EMA40'],
+            'MACD': last['MACD'],
+            'Volume': last['Volume'],
+            'AvgVol40': avgvol40,
+            'MR?': mr,
+            'EMA?': ema,
+            'MACD?': macdema
+        })
+
+        strat, reason, rank = None, None, 0
         if mr:
             strat, reason, rank = "Mean Reversion", mr_reason, 1
         elif ema:
@@ -102,8 +134,8 @@ for ticker in sp500:
         if strat:
             entry = close_price
             if strat == "Mean Reversion":
-                tp = entry * 1.01  # 1% target
-                sl = entry * 0.995 # 0.5% stop
+                tp = entry * 1.01
+                sl = entry * 0.995
             elif strat == "EMA40 Breakout":
                 tp = None
                 sl = entry * 0.99
@@ -128,8 +160,15 @@ for ticker in sp500:
                 "EMA40": round(last['EMA40'], 2),
                 "SMA40": round(last['SMA40'], 2)
             })
-    except Exception:
-        continue
+    except Exception as e:
+        debug_status = f"{ticker}: Exception - {e}"
+        debug_rows.append({'Ticker': ticker, 'Status': debug_status})
+
+# Show debug indicator/status table
+df_debug = pd.DataFrame(debug_rows)
+if not df_debug.empty:
+    st.subheader("DEBUG: Ticker Status & Indicator Values")
+    st.dataframe(df_debug)
 
 df_results = pd.DataFrame(results)
 
@@ -141,68 +180,4 @@ if not df_results.empty:
 else:
     st.info("No stocks meet your filter/strategy criteria right now.")
 
-# --- Summary Section ---
-if not df_results.empty:
-    st.subheader("🔔 Summary & Highlight")
-    picks = df_results.groupby("Strategy").first().sort_values("Rank")
-    for idx, row in picks.iterrows():
-        st.markdown(f"**[{row['Strategy']}] {row['Ticker']}** | Entry: ${row['Entry Price']} | Shares: {row['Shares']} | Reason: {row['Reason']}")
-else:
-    st.info("No strategy triggered this 5-min bar. Try next run.")
-
-# --- Top 5 by Capital Invested ---
-if not df_results.empty:
-    st.subheader("💰 Top 5 by Capital Invested")
-    top_cap = df_results.sort_values("Capital Used", ascending=False).head(5)
-    st.table(top_cap[["Ticker", "Capital Used", "Strategy", "Entry Price", "Shares", "Volume"]].reset_index(drop=True))
-
-# --- Top 5 by Volume ---
-if not df_results.empty:
-    st.subheader("🔥 Top 5 by Volume (Latest Bar)")
-    top_vol = df_results.sort_values("Volume", ascending=False).head(5)
-    st.table(top_vol[["Ticker", "Volume", "Strategy", "Entry Price", "Shares", "Capital Used"]].reset_index(drop=True))
-
-# --- Top 5 Performers by % Change in Last 5-Min Bar (robust version) ---
-perf_results = []
-for ticker in sp500:
-    try:
-        df = yf.download(ticker, period="2d", interval="5m", progress=False)
-        if df.empty:
-            continue
-        closes = df['Close'].dropna()
-        if len(closes) < 2:
-            continue
-        last_close = closes.iloc[-1]
-        prev_close = closes.iloc[-2]
-        last_idx = closes.index[-1]
-        last_row = df.loc[last_idx]
-        last_vol = last_row['Volume'] if not np.isnan(last_row['Volume']) else 0
-        if prev_close == 0:
-            continue
-        pct_change = 100 * (last_close - prev_close) / prev_close
-        perf_results.append({
-            "Ticker": ticker,
-            "Last Close": round(last_close, 2),
-            "Prev Close": round(prev_close, 2),
-            "Change (%)": pct_change,
-            "Volume": int(last_vol)
-        })
-    except Exception:
-        continue
-
-df_perf = pd.DataFrame(perf_results)
-if not df_perf.empty:
-    df_perf = df_perf.dropna(subset=["Change (%)"])
-    df_perf["Change (%)"] = pd.to_numeric(df_perf["Change (%)"], errors="coerce")
-    df_perf = df_perf.dropna(subset=["Change (%)"])
-    if not df_perf.empty:
-        st.subheader("🚀 Top 5 Performers (Last 5-Min Session)")
-        top_perf = df_perf.sort_values("Change (%)", ascending=False).head(5)
-        st.table(top_perf.reset_index(drop=True))
-    else:
-        st.info("No valid performance data for this session.")
-else:
-    st.info("No recent 5-min data for performance check.")
-
-st.caption("Strategies: 1) Mean Reversion, 2) EMA40 Breakout, 3) MACD+EMA. Exits: Mean Reversion = TP +1%/SL -0.5%. EMA40/Combo = trailing stop or indicator exit.")
-
+st.caption("Use the above table to see why each ticker was/was not picked by strategies. Adjust thresholds or look for NaNs if needed.")
