@@ -4,11 +4,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# --- S&P 500 Shortlist (edit: can expand to full S&P 500 for live use) ---
+# --- S&P 500 Shortlist (edit or expand to full S&P 500 as needed) ---
 sp500 = [
     'AAPL','MSFT','GOOGL','AMZN','NVDA','META','BRK-B','JPM','UNH','XOM',
     'LLY','JNJ','V','PG','MA','AVGO','HD','MRK','COST','ADBE'
-    # ...add more or replace with full S&P 500 for production, but keep small for initial testing
+    # ...expand to full S&P 500 list if running locally and not limited by Streamlit Cloud
 ]
 
 # --- Sidebar: Filters ---
@@ -59,7 +59,7 @@ def ema40_breakout_signal(df):
     ema40 = df['EMA40'].iloc[-1]
     prev_close = df['Close'].iloc[-2]
     prev_ema40 = df['EMA40'].iloc[-2]
-    dipped = (df['Close'].iloc[-10:-1] < df['EMA40'].iloc[-10:-1]).any()  # slightly longer dip window
+    dipped = (df['Close'].iloc[-10:-1] < df['EMA40'].iloc[-10:-1]).any()
     cond = (close > ema40) and ((prev_close < prev_ema40) or dipped)
     if cond:
         return True, "EMA40 Breakout: Price reclaimed EMA40 (with shakeout)"
@@ -111,10 +111,10 @@ for ticker in sp500:
         if strat:
             entry = close_price
             if strat == "Mean Reversion":
-                tp = entry * 1.01  # For 5min chart, use tighter 1% profit
+                tp = entry * 1.01  # 1% target
                 sl = entry * 0.995 # 0.5% stop
             elif strat == "EMA40 Breakout":
-                tp = None  # Trailing or dynamic exit
+                tp = None
                 sl = entry * 0.99
             elif strat == "MACD+EMA":
                 tp = None
@@ -159,5 +159,17 @@ if not df_results.empty:
 else:
     st.info("No strategy triggered this 5-min bar. Try next run.")
 
-st.caption("Strategies ranked: 1) Mean Reversion, 2) EMA40 Breakout, 3) MACD+EMA. Exits: Mean Reversion = TP +1%/SL -0.5%. EMA40/Combo = trailing stop or indicator exit.")
+# --- Top 5 by Capital Invested ---
+if not df_results.empty:
+    st.subheader("💰 Top 5 by Capital Invested")
+    top_cap = df_results.sort_values("Capital Used", ascending=False).head(5)
+    st.table(top_cap[["Ticker", "Capital Used", "Strategy", "Entry Price", "Shares", "Volume"]].reset_index(drop=True))
+
+# --- Top 5 by Volume ---
+if not df_results.empty:
+    st.subheader("🔥 Top 5 by Volume (Latest Bar)")
+    top_vol = df_results.sort_values("Volume", ascending=False).head(5)
+    st.table(top_vol[["Ticker", "Volume", "Strategy", "Entry Price", "Shares", "Capital Used"]].reset_index(drop=True))
+
+st.caption("Strategies: 1) Mean Reversion, 2) EMA40 Breakout, 3) MACD+EMA. Exits: Mean Reversion = TP +1%/SL -0.5%. EMA40/Combo = trailing stop or indicator exit.")
 
