@@ -4,18 +4,18 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# --- S&P 500 Shortlist (edit or expand to full S&P 500 as needed) ---
+# --- S&P 500 Shortlist (edit or expand for full S&P 500 as needed) ---
 sp500 = [
     'AAPL','MSFT','GOOGL','AMZN','NVDA','META','BRK-B','JPM','UNH','XOM',
     'LLY','JNJ','V','PG','MA','AVGO','HD','MRK','COST','ADBE'
-    # ...expand to full S&P 500 list if running locally and not limited by Streamlit Cloud
+    # ...expand for production, but keep short for speed on Streamlit Cloud
 ]
 
 # --- Sidebar: Filters ---
 st.sidebar.header("Filter Settings")
 min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
-min_volume = st.sidebar.number_input("Min Avg Vol (40 bars)", value=50_000)
+min_volume = st.sidebar.number_input("Min Avg Vol (40 bars)", value=50000)
 capital_per_trade = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0)
 
 st.title("⚡ S&P 500 - 5-Minute Intraday Trade Screener")
@@ -171,8 +171,6 @@ if not df_results.empty:
     top_vol = df_results.sort_values("Volume", ascending=False).head(5)
     st.table(top_vol[["Ticker", "Volume", "Strategy", "Entry Price", "Shares", "Capital Used"]].reset_index(drop=True))
 
-st.caption("Strategies: 1) Mean Reversion, 2) EMA40 Breakout, 3) MACD+EMA. Exits: Mean Reversion = TP +1%/SL -0.5%. EMA40/Combo = trailing stop or indicator exit.")
-
 # --- Top 5 Performers by % Change in Last 5-Min Bar ---
 perf_results = []
 for ticker in sp500:
@@ -187,7 +185,7 @@ for ticker in sp500:
             "Ticker": ticker,
             "Last Close": round(last['Close'], 2),
             "Prev Close": round(prev['Close'], 2),
-            "Change (%)": round(pct_change, 2),
+            "Change (%)": pct_change,
             "Volume": int(last['Volume'])
         })
     except Exception as e:
@@ -195,9 +193,18 @@ for ticker in sp500:
 
 df_perf = pd.DataFrame(perf_results)
 if not df_perf.empty:
-    st.subheader("🚀 Top 5 Performers (Last 5-Min Session)")
-    top_perf = df_perf.sort_values("Change (%)", ascending=False).head(5)
-    st.table(top_perf.reset_index(drop=True))
+    # Clean up Change (%) for safety
+    df_perf = df_perf.dropna(subset=["Change (%)"])
+    df_perf["Change (%)"] = pd.to_numeric(df_perf["Change (%)"], errors="coerce")
+    df_perf = df_perf.dropna(subset=["Change (%)"])
+    if not df_perf.empty:
+        st.subheader("🚀 Top 5 Performers (Last 5-Min Session)")
+        top_perf = df_perf.sort_values("Change (%)", ascending=False).head(5)
+        st.table(top_perf.reset_index(drop=True))
+    else:
+        st.info("No valid performance data for this session.")
 else:
     st.info("No recent 5-min data for performance check.")
+
+st.caption("Strategies: 1) Mean Reversion, 2) EMA40 Breakout, 3) MACD+EMA. Exits: Mean Reversion = TP +1%/SL -0.5%. EMA40/Combo = trailing stop or indicator exit.")
 
