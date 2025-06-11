@@ -28,10 +28,25 @@ capital_per_trade = st.sidebar.number_input("Capital per Trade ($)", value=1000.
 st.title("🔍 S&P 100 Intraday Screener & AI Top 3 Stock Picks")
 st.caption(f"Last run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
+def force_series(df, col):
+    """Force DataFrame column to Series (handles MultiIndex and multi-columns)"""
+    if col not in df.columns:
+        # Try to find a column containing the word
+        matches = [c for c in df.columns if col in str(c)]
+        if matches:
+            df[col] = df[matches[0]]
+        else:
+            raise Exception(f"'{col}' column missing")
+    if isinstance(df[col], pd.DataFrame):
+        df[col] = df[col].iloc[:,0]
+    return df
+
 def safe_scalar(val):
     if isinstance(val, pd.Series) or isinstance(val, np.ndarray):
         if len(val) == 1:
             return float(val.item())
+        elif len(val) > 0:
+            return float(val[-1])
         else:
             return np.nan
     try:
@@ -59,51 +74,43 @@ def calc_indicators(df):
     return df
 
 def mean_reversion_signal(df):
-    c = safe_scalar(df['Close'].iloc[-1])
-    sma = safe_scalar(df['SMA40'].iloc[-1])
-    rsi = safe_scalar(df['RSI3'].iloc[-1])
+    c = float(safe_scalar(df['Close'].iloc[-1]))
+    sma = float(safe_scalar(df['SMA40'].iloc[-1]))
+    rsi = float(safe_scalar(df['RSI3'].iloc[-1]))
     if np.isnan(c) or np.isnan(sma) or np.isnan(rsi):
         return False, None, 0
-    score = 0
     cond = (c > sma) and (rsi < 15)
-    if cond:
-        score = 75 + max(0, 15 - rsi)  # bonus for more oversold
+    score = 75 + max(0, 15 - rsi) if cond else 0
     return bool(cond), "Mean Reversion: Price > SMA40 & RSI(3)<15", score
 
 def ema40_breakout_signal(df):
-    c = safe_scalar(df['Close'].iloc[-1])
-    ema = safe_scalar(df['EMA40'].iloc[-1])
-    pc = safe_scalar(df['Close'].iloc[-2])
-    pema = safe_scalar(df['EMA40'].iloc[-2])
+    c = float(safe_scalar(df['Close'].iloc[-1]))
+    ema = float(safe_scalar(df['EMA40'].iloc[-1]))
+    pc = float(safe_scalar(df['Close'].iloc[-2]))
+    pema = float(safe_scalar(df['EMA40'].iloc[-2]))
     if np.isnan(c) or np.isnan(ema) or np.isnan(pc) or np.isnan(pema):
         return False, None, 0
     left_vals = df['Close'].iloc[-10:-1].values
     right_vals = df['EMA40'].iloc[-10:-1].values
+    dipped = False
     if len(left_vals) == len(right_vals) and len(left_vals) > 0:
-        dipped = (left_vals < right_vals).any()
-    else:
-        dipped = False
+        dipped = np.any(left_vals < right_vals)
     cond = (c > ema) and ((pc < pema) or dipped)
-    score = 0
-    if cond:
-        magnitude = max(0, c - ema)
-        score = 70 + min(20, magnitude)  # Cap the bonus for safety
+    score = 70 + min(20, c - ema) if cond else 0
     return bool(cond), "EMA40 Breakout: Price reclaimed EMA40 (with shakeout)", score
 
 def macd_ema_signal(df):
-    macd = safe_scalar(df['MACD'].iloc[-1])
-    macd_signal = safe_scalar(df['MACD_signal'].iloc[-1])
-    macd_prev = safe_scalar(df['MACD'].iloc[-2])
-    macd_signal_prev = safe_scalar(df['MACD_signal'].iloc[-2])
-    ema8 = safe_scalar(df['EMA8'].iloc[-1])
-    ema21 = safe_scalar(df['EMA21'].iloc[-1])
+    macd = float(safe_scalar(df['MACD'].iloc[-1]))
+    macd_signal = float(safe_scalar(df['MACD_signal'].iloc[-1]))
+    macd_prev = float(safe_scalar(df['MACD'].iloc[-2]))
+    macd_signal_prev = float(safe_scalar(df['MACD_signal'].iloc[-2]))
+    ema8 = float(safe_scalar(df['EMA8'].iloc[-1]))
+    ema21 = float(safe_scalar(df['EMA21'].iloc[-1]))
     if any(np.isnan(x) for x in [macd, macd_signal, macd_prev, macd_signal_prev, ema8, ema21]):
         return False, None, 0
     cross = (macd_prev < macd_signal_prev) and (macd > macd_signal) and (macd < 0)
     cond = cross and (ema8 > ema21)
-    score = 0
-    if cond:
-        score = 65 + int(abs(macd)*5)
+    score = 65 + int(abs(macd)*5) if cond else 0
     return bool(cond), "MACD+EMA: MACD cross up <0 & EMA8>EMA21", score
 
 debug_rows = []
@@ -113,43 +120,25 @@ for ticker in sp100:
     debug_status = ""
     try:
         df = yf.download(ticker, period="5d", interval="5m", progress=False)
-        if df.empty or len(df) < 50 or 'Close' not in df.columns or 'Volume' not in df.columns:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = ['_'.join(col).strip() for col in df.columns.values]
-            if 'Close' not in df.columns:
-                close_col = [c for c in df.columns if 'Close' in c]
-                if close_col:
-                    df['Close'] = df[close_col[0]]
-            if 'Volume' not in df.columns:
-                volume_col = [c for c in df.columns if 'Volume' in c]
-                if volume_col:
-                    df['Volume'] = df[volume_col[0]]
-            if df.empty or len(df) < 50 or 'Close' not in df.columns or 'Volume' not in df.columns:
-                debug_status = f"{ticker}: Not enough data or missing Close/Volume column"
-                debug_rows.append({'Ticker': ticker, 'Status': debug_status})
-                continue
-        if isinstance(df['Close'], pd.DataFrame):
-            df['Close'] = df['Close'].iloc[:, 0]
-        if isinstance(df['Volume'], pd.DataFrame):
-            df['Volume'] = df['Volume'].iloc[:, 0]
+        # Normalize columns
+        if df.empty or len(df) < 50:
+            debug_status = f"{ticker}: Not enough data"
+            debug_rows.append({'Ticker': ticker, 'Status': debug_status})
+            continue
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[-1] if isinstance(c, tuple) else c for c in df.columns]
+        # Force Close/Volume to Series (not DataFrame)
+        df = force_series(df, 'Close')
+        df = force_series(df, 'Volume')
+
         df = calc_indicators(df)
         last = df.iloc[-1]
-        close_price = safe_scalar(last['Close'])
-        avgvol40 = safe_scalar(last['AvgVol40'])
+        close_price = float(safe_scalar(last['Close']))
+        avgvol40 = float(safe_scalar(last['AvgVol40']))
 
         if any(np.isnan([close_price, avgvol40])):
             debug_status = f"{ticker}: NaNs in indicators or data"
-            debug_rows.append({
-                'Ticker': ticker,
-                'Status': debug_status,
-                'Close': close_price,
-                'SMA40': safe_scalar(last['SMA40']),
-                'RSI3': safe_scalar(last['RSI3']),
-                'EMA40': safe_scalar(last['EMA40']),
-                'MACD': safe_scalar(last['MACD']),
-                'Volume': safe_scalar(last['Volume']),
-                'AvgVol40': avgvol40,
-            })
+            debug_rows.append({'Ticker': ticker, 'Status': debug_status})
             continue
         if not (min_price <= close_price <= max_price):
             debug_status = f"{ticker}: Price {close_price} outside filter"
@@ -175,10 +164,10 @@ for ticker in sp100:
             'Ticker': ticker,
             'Status': 'OK',
             'Close': close_price,
-            'SMA40': safe_scalar(last['SMA40']),
-            'RSI3': safe_scalar(last['RSI3']),
-            'EMA40': safe_scalar(last['EMA40']),
-            'MACD': safe_scalar(last['MACD']),
+            'SMA40': float(safe_scalar(last['SMA40'])),
+            'RSI3': float(safe_scalar(last['RSI3'])),
+            'EMA40': float(safe_scalar(last['EMA40'])),
+            'MACD': float(safe_scalar(last['MACD'])),
             'Volume': int(safe_scalar(df['Volume'][df['Volume'] > 0].iloc[-1])) if (df['Volume'] > 0).any() else 0,
             'AvgVol40': int(avgvol40),
             'MR?': any(x[0] == "Mean Reversion" for x in picks),
@@ -204,9 +193,9 @@ for ticker in sp100:
                 "Reason": reason,
                 "Volume": int(safe_scalar(df['Volume'][df['Volume'] > 0].iloc[-1])) if (df['Volume'] > 0).any() else 0,
                 "Avg Vol (40)": int(avgvol40),
-                "RSI(3)": round(safe_scalar(last['RSI3']), 2),
-                "EMA40": round(safe_scalar(last['EMA40']), 2),
-                "SMA40": round(safe_scalar(last['SMA40']), 2)
+                "RSI(3)": round(float(safe_scalar(last['RSI3'])), 2),
+                "EMA40": round(float(safe_scalar(last['EMA40'])), 2),
+                "SMA40": round(float(safe_scalar(last['SMA40'])), 2)
             })
     except Exception as e:
         debug_status = f"{ticker}: Exception - {e}"
@@ -222,7 +211,6 @@ df_results = pd.DataFrame(results)
 st.header("AI-Powered Top 3 Intraday Stock Picks (S&P 100)")
 
 if not df_results.empty:
-    # Rank by AI Score (confidence/potential)
     df_results = df_results.sort_values(["AI Score", "Strategy", "RSI(3)"], ascending=[False, True, True])
     st.dataframe(df_results.reset_index(drop=True), use_container_width=True)
 
