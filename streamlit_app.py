@@ -1,3 +1,109 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# --- S&P 100 ticker list (for demo - you can expand as needed) ---
+sp100 = [
+    'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO',
+    'AXP','BA','BAC','BK','BKNG','BLK','BMY','BRK-B','C','CAT',
+    'CHTR','CL','CMCSA','COF','COP','COST','CRM','CSCO','CVS','CVX',
+    'DHR','DIS','DOW','DUK','EMR','EXC','F','FDX','FOX','FOXA',
+    'GD','GE','GILD','GM','GOOG','GOOGL','GS','HD','HON','IBM',
+    'INTC','JNJ','JPM','KHC','KMI','KO','LIN','LLY','LMT','LOW',
+    'MA','MCD','MDLZ','MDT','MET','META','MMM','MO','MRK','MS',
+    'MSFT','NEE','NFLX','NKE','NVDA','ORCL','PEP','PFE','PG','PM',
+    'PYPL','QCOM','RTX','SBUX','SCHW','SO','SPG','T','TGT','TMO',
+    'TMUS','TSLA','TXN','UNH','UNP','UPS','USB','V','VZ','WBA',
+    'WFC','WMT','XOM'
+]
+
+# --- Streamlit Sidebar ---
+st.sidebar.header("Filter Settings")
+min_price = st.sidebar.number_input("Min Price ($)", value=10.0, key="min_price")
+max_price = st.sidebar.number_input("Max Price ($)", value=2000.0, key="max_price")
+min_volume = st.sidebar.number_input("Min Avg Vol (40 bars)", value=100000, key="min_vol")
+capital_per_trade = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0, key="capital_trade")
+
+st.title("🔍 S&P 100 Intraday Screener & AI Top 3 Stock Picks")
+st.caption(f"Last run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+def safe_scalar(val):
+    if isinstance(val, pd.Series) or isinstance(val, np.ndarray):
+        if len(val) == 1:
+            return float(val.item())
+        elif len(val) > 0:
+            return float(val[-1])
+        else:
+            return np.nan
+    try:
+        return float(val)
+    except Exception:
+        return np.nan
+
+def calc_indicators(df):
+    df['SMA40'] = df['Close'].rolling(window=40).mean()
+    df['EMA40'] = df['Close'].ewm(span=40, min_periods=40).mean()
+    df['EMA8'] = df['Close'].ewm(span=8, min_periods=8).mean()
+    df['EMA21'] = df['Close'].ewm(span=21, min_periods=21).mean()
+    delta = df['Close'].diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    roll_up = up.rolling(window=3).mean()
+    roll_down = down.rolling(window=3).mean()
+    rs = roll_up / (roll_down + 1e-9)
+    df['RSI3'] = 100 - (100 / (1 + rs))
+    ema12 = df['Close'].ewm(span=12, min_periods=12).mean()
+    ema26 = df['Close'].ewm(span=26, min_periods=26).mean()
+    df['MACD'] = ema12 - ema26
+    df['MACD_signal'] = df['MACD'].ewm(span=9, min_periods=9).mean()
+    df['AvgVol40'] = df['Volume'].replace(0, np.nan).rolling(window=40, min_periods=1).mean().fillna(0)
+    return df
+
+def mean_reversion_signal(df):
+    c = float(safe_scalar(df['Close'].iloc[-1]))
+    sma = float(safe_scalar(df['SMA40'].iloc[-1]))
+    rsi = float(safe_scalar(df['RSI3'].iloc[-1]))
+    if np.isnan(c) or np.isnan(sma) or np.isnan(rsi):
+        return False, None, 0
+    cond = (c > sma) and (rsi < 15)
+    score = 75 + max(0, 15 - rsi) if cond else 0
+    return bool(cond), "Mean Reversion: Price > SMA40 & RSI(3)<15", score
+
+def ema40_breakout_signal(df):
+    c = float(safe_scalar(df['Close'].iloc[-1]))
+    ema = float(safe_scalar(df['EMA40'].iloc[-1]))
+    pc = float(safe_scalar(df['Close'].iloc[-2]))
+    pema = float(safe_scalar(df['EMA40'].iloc[-2]))
+    if np.isnan(c) or np.isnan(ema) or np.isnan(pc) or np.isnan(pema):
+        return False, None, 0
+    left_vals = df['Close'].iloc[-10:-1].values
+    right_vals = df['EMA40'].iloc[-10:-1].values
+    dipped = False
+    if len(left_vals) == len(right_vals) and len(left_vals) > 0:
+        dipped = np.any(left_vals < right_vals)
+    cond = (c > ema) and ((pc < pema) or dipped)
+    score = 70 + min(20, c - ema) if cond else 0
+    return bool(cond), "EMA40 Breakout: Price reclaimed EMA40 (with shakeout)", score
+
+def macd_ema_signal(df):
+    macd = float(safe_scalar(df['MACD'].iloc[-1]))
+    macd_signal = float(safe_scalar(df['MACD_signal'].iloc[-1]))
+    macd_prev = float(safe_scalar(df['MACD'].iloc[-2]))
+    macd_signal_prev = float(safe_scalar(df['MACD_signal'].iloc[-2]))
+    ema8 = float(safe_scalar(df['EMA8'].iloc[-1]))
+    ema21 = float(safe_scalar(df['EMA21'].iloc[-1]))
+    if any(np.isnan(x) for x in [macd, macd_signal, macd_prev, macd_signal_prev, ema8, ema21]):
+        return False, None, 0
+    cross = (macd_prev < macd_signal_prev) and (macd > macd_signal) and (macd < 0)
+    cond = cross and (ema8 > ema21)
+    score = 65 + int(abs(macd)*5) if cond else 0
+    return bool(cond), "MACD+EMA: MACD cross up <0 & EMA8>EMA21", score
+
+debug_rows = []
+results = []
+
 for ticker in sp100:
     debug_status = ""
     try:
@@ -7,13 +113,13 @@ for ticker in sp100:
             debug_rows.append({'Ticker': ticker, 'Status': debug_status})
             continue
 
-        # --- FLATTEN all multi-index columns (always) ---
+        # FLATTEN MultiIndex and standardize all column names
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = ["_".join([str(x) for x in c]).lower() for c in df.columns]
         else:
             df.columns = [str(c).lower() for c in df.columns]
 
-        # --- Universal "close" finder ---
+        # --- Defensive universal "close" finder ---
         close_col = None
         candidates = ['close', 'adjclose', 'adj close']
         for cand in candidates:
@@ -37,7 +143,7 @@ for ticker in sp100:
         else:
             df['Close'] = df[close_col]
 
-        # --- Universal "volume" finder ---
+        # --- Defensive universal "volume" finder ---
         vol_col = None
         candidates = ['volume', 'regularmarketvolume']
         for cand in candidates:
@@ -129,3 +235,41 @@ for ticker in sp100:
     except Exception as e:
         debug_status = f"{ticker}: Exception - {e}"
         debug_rows.append({'Ticker': ticker, 'Status': debug_status})
+
+# --- Output debug ---
+df_debug = pd.DataFrame(debug_rows)
+if not df_debug.empty:
+    st.subheader("DEBUG: Ticker Status & Indicator Values")
+    st.dataframe(df_debug)
+
+# --- Output results and top 3 picks ---
+df_results = pd.DataFrame(results)
+st.header("AI-Powered Top 3 Intraday Stock Picks (S&P 100)")
+
+if not df_results.empty:
+    df_results = df_results.sort_values(["AI Score", "Strategy", "RSI(3)"], ascending=[False, True, True])
+    st.dataframe(df_results.reset_index(drop=True), use_container_width=True)
+
+    top3 = df_results.head(3)
+    st.subheader("📈 Today's AI Stock Recommendations")
+    for idx, row in top3.iterrows():
+        rank_num = idx + 1
+        rank_emoji = "🥇" if rank_num == 1 else ("🥈" if rank_num == 2 else "🥉")
+        st.markdown(f"""
+        {rank_emoji} **Rank #{rank_num}: {row['Ticker']}**  
+        **Signal:** {row['Strategy']}  
+        **AI Confidence Score:** {row['AI Score']}  
+        **Reason:** {row['Reason']}  
+        **Entry Price:** ${row['Entry Price']} | **Capital Used:** ${row['Capital Used']}  
+        **RSI(3):** {row['RSI(3)']} | **EMA40:** {row['EMA40']} | **SMA40:** {row['SMA40']}  
+        """)
+        if rank_num == 1:
+            st.info("Rank #1: Highest confidence and strongest signal based on all indicators and strategy score. Most potential for intraday growth today.")
+        elif rank_num == 2:
+            st.info("Rank #2: Good signal, but a bit less compelling than #1. Still has solid edge today.")
+        elif rank_num == 3:
+            st.info("Rank #3: Valid setup, but less optimal than #1 or #2 based on strategy and indicator strength.")
+else:
+    st.info("No stocks meet your filter/strategy criteria right now.")
+
+st.caption("Each recommendation above is ranked by a composite confidence score. View the debug table for diagnostic info on all tickers.")
