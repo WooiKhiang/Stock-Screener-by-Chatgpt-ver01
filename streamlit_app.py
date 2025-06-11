@@ -4,11 +4,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# --- S&P 500 Shortlist (edit or expand for full S&P 500 as needed) ---
+# --- S&P 500 Shortlist (expand as needed for full S&P 500) ---
 sp500 = [
     'AAPL','MSFT','GOOGL','AMZN','NVDA','META','BRK-B','JPM','UNH','XOM',
     'LLY','JNJ','V','PG','MA','AVGO','HD','MRK','COST','ADBE'
-    # ...expand for production, but keep short for speed on Streamlit Cloud
+    # ...expand for production, but keep short for speed/testing
 ]
 
 # --- Sidebar: Filters ---
@@ -171,22 +171,31 @@ if not df_results.empty:
     top_vol = df_results.sort_values("Volume", ascending=False).head(5)
     st.table(top_vol[["Ticker", "Volume", "Strategy", "Entry Price", "Shares", "Capital Used"]].reset_index(drop=True))
 
-# --- Top 5 Performers by % Change in Last 5-Min Bar ---
+# --- Top 5 Performers by % Change in Last 5-Min Bar (robust version) ---
 perf_results = []
 for ticker in sp500:
     try:
         df = yf.download(ticker, period="2d", interval="5m", progress=False)
-        if df.empty or len(df) < 2:
+        if df.empty:
             continue
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        pct_change = 100 * (last['Close'] - prev['Close']) / prev['Close']
+        # Use the last two non-NaN closes
+        closes = df['Close'].dropna()
+        if len(closes) < 2:
+            continue
+        last_close = closes.iloc[-1]
+        prev_close = closes.iloc[-2]
+        last_idx = closes.index[-1]
+        last_row = df.loc[last_idx]
+        last_vol = last_row['Volume'] if not np.isnan(last_row['Volume']) else 0
+        if prev_close == 0:  # Avoid division by zero
+            continue
+        pct_change = 100 * (last_close - prev_close) / prev_close
         perf_results.append({
             "Ticker": ticker,
-            "Last Close": round(last['Close'], 2),
-            "Prev Close": round(prev['Close'], 2),
+            "Last Close": round(last_close, 2),
+            "Prev Close": round(prev_close, 2),
             "Change (%)": pct_change,
-            "Volume": int(last['Volume'])
+            "Volume": int(last_vol)
         })
     except Exception as e:
         continue
