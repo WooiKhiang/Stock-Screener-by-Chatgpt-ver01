@@ -173,3 +173,31 @@ if not df_results.empty:
 
 st.caption("Strategies: 1) Mean Reversion, 2) EMA40 Breakout, 3) MACD+EMA. Exits: Mean Reversion = TP +1%/SL -0.5%. EMA40/Combo = trailing stop or indicator exit.")
 
+# --- Top 5 Performers by % Change in Last 5-Min Bar ---
+perf_results = []
+for ticker in sp500:
+    try:
+        df = yf.download(ticker, period="2d", interval="5m", progress=False)
+        if df.empty or len(df) < 2:
+            continue
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        pct_change = 100 * (last['Close'] - prev['Close']) / prev['Close']
+        perf_results.append({
+            "Ticker": ticker,
+            "Last Close": round(last['Close'], 2),
+            "Prev Close": round(prev['Close'], 2),
+            "Change (%)": round(pct_change, 2),
+            "Volume": int(last['Volume'])
+        })
+    except Exception as e:
+        continue
+
+df_perf = pd.DataFrame(perf_results)
+if not df_perf.empty:
+    st.subheader("🚀 Top 5 Performers (Last 5-Min Session)")
+    top_perf = df_perf.sort_values("Change (%)", ascending=False).head(5)
+    st.table(top_perf.reset_index(drop=True))
+else:
+    st.info("No recent 5-min data for performance check.")
+
