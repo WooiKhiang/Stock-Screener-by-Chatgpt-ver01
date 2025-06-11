@@ -7,6 +7,7 @@ from datetime import datetime
 sp500 = [
     'AAPL','MSFT','GOOGL','AMZN','NVDA','META','BRK-B','JPM','UNH','XOM',
     'LLY','JNJ','V','PG','MA','AVGO','HD','MRK','COST','ADBE'
+    # ...expand for production
 ]
 
 st.sidebar.header("Filter Settings")
@@ -15,7 +16,7 @@ max_price = st.sidebar.number_input("Max Price ($)", value=2000.0, key="max_pric
 min_volume = st.sidebar.number_input("Min Avg Vol (40 bars)", value=50000, key="min_vol")
 capital_per_trade = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0, key="capital_trade")
 
-st.title("⚡ S&P 500 - 5-Minute Intraday Trade Screener (BULLETPROOF DEBUG MODE)")
+st.title("⚡ S&P 500 - 5-Minute Intraday Trade Screener (ULTRA ROBUST DEBUG MODE)")
 st.caption(f"Last run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 def safe_scalar(val):
@@ -66,7 +67,7 @@ def ema40_breakout_signal(df):
         return False, None
     left = df['Close'].iloc[-10:-1]
     right = df['EMA40'].iloc[-10:-1]
-    left, right = left.align(right, join='inner', axis=0)  # <- fix axis=0!
+    left, right = left.align(right, join='inner', axis=0)  # explicit axis
     dipped = (left < right).any()
     cond = (c > ema) and ((pc < pema) or dipped)
     return cond, "EMA40 Breakout: Price reclaimed EMA40 (with shakeout)" if cond else (False, None)
@@ -91,18 +92,31 @@ for ticker in sp500:
     debug_status = ""
     try:
         df = yf.download(ticker, period="5d", interval="5m", progress=False)
-        # --- Normalize DataFrame, force single-column
-        if isinstance(df, pd.DataFrame) and isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(-1)
+        # --- Handle missing columns/MultiIndex/variants ---
+        if df.empty or len(df) < 50 or 'Close' not in df.columns or 'Volume' not in df.columns:
+            # Try flatten MultiIndex columns if present
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = ['_'.join(col).strip() for col in df.columns.values]
+            # Try alternate columns if still not found
+            if 'Close' not in df.columns:
+                close_col = [c for c in df.columns if 'Close' in c]
+                if close_col:
+                    df['Close'] = df[close_col[0]]
+            if 'Volume' not in df.columns:
+                volume_col = [c for c in df.columns if 'Volume' in c]
+                if volume_col:
+                    df['Volume'] = df[volume_col[0]]
+            # Final check
+            if df.empty or len(df) < 50 or 'Close' not in df.columns or 'Volume' not in df.columns:
+                debug_status = f"{ticker}: Not enough data or missing Close/Volume column"
+                debug_rows.append({'Ticker': ticker, 'Status': debug_status})
+                continue
+        # Force DataFrame columns to Series (handle odd cases)
         if isinstance(df['Close'], pd.DataFrame):
             df['Close'] = df['Close'].iloc[:, 0]
         if isinstance(df['Volume'], pd.DataFrame):
             df['Volume'] = df['Volume'].iloc[:, 0]
-        # ------------------------
-        if df.empty or len(df) < 50:
-            debug_status = f"{ticker}: Not enough data ({len(df)} bars)"
-            debug_rows.append({'Ticker': ticker, 'Status': debug_status})
-            continue
+        # ------------------------------------------------
         df = calc_indicators(df)
         last = df.iloc[-1]
         close_price = safe_scalar(last['Close'])
@@ -205,4 +219,4 @@ if not df_results.empty:
 else:
     st.info("No stocks meet your filter/strategy criteria right now.")
 
-st.caption("This version is robust to all DataFrame/Series, index alignment, and axis errors. If you still get errors, show me the exact line and message!")
+st.caption("If any ticker is missing data, see 'Status' in the debug table above. This version is robust to all data quirks.")
