@@ -9,41 +9,57 @@ for ticker in sp100:
 
         # --- FLATTEN all multi-index columns (always) ---
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [str(c[-1]).lower() if isinstance(c, tuple) else str(c).lower() for c in df.columns]
+            df.columns = ["_".join([str(x) for x in c]).lower() for c in df.columns]
+        else:
+            df.columns = [str(c).lower() for c in df.columns]
 
-        # --- SEARCH for any column named "close" (case-insensitive), or fallback to "adj close" ---
+        # --- Universal "close" finder ---
         close_col = None
-        for col in df.columns:
-            if "close" == col.lower():
-                close_col = col
-                break
+        candidates = ['close', 'adjclose', 'adj close']
+        for cand in candidates:
+            for col in df.columns:
+                if cand == col.strip().replace(' ', '').lower():
+                    close_col = col
+                    break
+            if close_col: break
+        # Try partial match as fallback
         if not close_col:
             for col in df.columns:
-                if "close" in col.lower():
+                if 'close' in col.replace(' ', '').lower():
                     close_col = col
                     break
         if not close_col:
-            debug_status = f"{ticker}: 'Close' column missing"
+            debug_status = f"{ticker}: 'Close' column missing ({df.columns})"
             debug_rows.append({'Ticker': ticker, 'Status': debug_status})
             continue
-        df['Close'] = df[close_col]  # Overwrite/force to standard column
+        if isinstance(df[close_col], pd.DataFrame):
+            df['Close'] = df[close_col].iloc[:,0]
+        else:
+            df['Close'] = df[close_col]
 
-        # --- Volume ---
+        # --- Universal "volume" finder ---
         vol_col = None
-        for col in df.columns:
-            if "volume" == col.lower():
-                vol_col = col
-                break
+        candidates = ['volume', 'regularmarketvolume']
+        for cand in candidates:
+            for col in df.columns:
+                if cand == col.strip().replace(' ', '').lower():
+                    vol_col = col
+                    break
+            if vol_col: break
+        # Try partial match as fallback
         if not vol_col:
             for col in df.columns:
-                if "vol" in col.lower():
+                if 'vol' in col.replace(' ', '').lower():
                     vol_col = col
                     break
         if not vol_col:
-            debug_status = f"{ticker}: 'Volume' column missing"
+            debug_status = f"{ticker}: 'Volume' column missing ({df.columns})"
             debug_rows.append({'Ticker': ticker, 'Status': debug_status})
             continue
-        df['Volume'] = df[vol_col]
+        if isinstance(df[vol_col], pd.DataFrame):
+            df['Volume'] = df[vol_col].iloc[:,0]
+        else:
+            df['Volume'] = df[vol_col]
 
         df = calc_indicators(df)
         last = df.iloc[-1]
@@ -91,7 +107,6 @@ for ticker in sp100:
 
         # --- If at least one strategy triggers, add for ranking ---
         if picks:
-            # Pick the highest scoring strategy for this ticker
             picks.sort(key=lambda x: -x[2])
             strat_name, reason, score = picks[0]
             entry = close_price
