@@ -7,7 +7,7 @@ from datetime import datetime
 # --- S&P 100 Tickers ---
 sp100 = [
     'AAPL','ABBV','ABT','ACN','AIG','AMGN','AMT','AMZN','AVGO','AXP',
-    'BA','BAC','BK','BKNG','BLK','BMY','BRK.B','C','CAT','CHTR','CL',
+    'BA','BAC','BK','BKNG','BLK','BMY','BRK-B','C','CAT','CHTR','CL',
     'CMCSA','COF','COP','COST','CRM','CSCO','CVS','CVX','DHR','DIS',
     'DOW','DUK','EMR','EXC','F','FDX','FOX','FOXA','GD','GE','GILD',
     'GM','GOOG','GOOGL','GS','HD','HON','IBM','INTC','JNJ','JPM',
@@ -90,62 +90,67 @@ def macd_ema_signal(df):
 
 # --- Main Scan Loop ---
 results = []
-
 for ticker in sp100:
-    df = yf.download(ticker, period="1y", interval="1d", progress=False)
-    if df.empty or len(df) < 210:
+    try:
+        df = yf.download(ticker, period="1y", interval="1d", progress=False)
+        if df.empty or len(df) < 210:
+            continue
+        df = calc_indicators(df)
+        last = df.iloc[-1]
+        close_price = float(last['Close'])
+        avgvol20 = float(last['AvgVol20'])
+        # Check for NaN/invalid values
+        if np.isnan(close_price) or not (min_price <= close_price <= max_price):
+            continue
+        if np.isnan(avgvol20) or avgvol20 < min_volume:
+            continue
+
+        strat, reason = None, ""
+        rank = 0
+
+        mr, mr_reason = mean_reversion_signal(df)
+        ema, ema_reason = ema200_breakout_signal(df)
+        macdema, macdema_reason = macd_ema_signal(df)
+
+        if mr:
+            strat, reason, rank = "Mean Reversion", mr_reason, 1
+        elif ema:
+            strat, reason, rank = "EMA200 Breakout", ema_reason, 2
+        elif macdema:
+            strat, reason, rank = "MACD+EMA", macdema_reason, 3
+
+        if strat:
+            entry = close_price
+            if strat == "Mean Reversion":
+                tp = entry * 1.02
+                sl = entry * 0.99
+            elif strat == "EMA200 Breakout":
+                tp = None  # Trailing stop logic can be handled on execution
+                sl = entry * 0.98
+            elif strat == "MACD+EMA":
+                tp = None  # Trailing stop logic can be handled on execution
+                sl = entry * 0.99
+            shares = int(capital_per_trade // entry)
+            invested = shares * entry
+            results.append({
+                "Ticker": ticker,
+                "Strategy": strat,
+                "Rank": rank,
+                "Entry Price": round(entry, 2),
+                "Capital Used": round(invested, 2),
+                "Shares": shares,
+                "TP (if fixed)": round(tp, 2) if tp else "-",
+                "SL": round(sl, 2),
+                "Reason": reason,
+                "Volume": int(last['Volume']),
+                "Avg Vol (20d)": int(avgvol20),
+                "RSI(2)": round(last['RSI2'], 2),
+                "EMA200": round(last['EMA200'], 2),
+                "SMA200": round(last['SMA200'], 2)
+            })
+    except Exception as e:
+        # Safely skip ticker on error
         continue
-    df = calc_indicators(df)
-    last = df.iloc[-1]
-    # Apply price/volume filter
-    if not (min_price <= last['Close'] <= max_price):
-        continue
-    if last['AvgVol20'] < min_volume:
-        continue
-
-    strat, reason = None, ""
-    rank = 0
-
-    mr, mr_reason = mean_reversion_signal(df)
-    ema, ema_reason = ema200_breakout_signal(df)
-    macdema, macdema_reason = macd_ema_signal(df)
-
-    if mr:
-        strat, reason, rank = "Mean Reversion", mr_reason, 1
-    elif ema:
-        strat, reason, rank = "EMA200 Breakout", ema_reason, 2
-    elif macdema:
-        strat, reason, rank = "MACD+EMA", macdema_reason, 3
-
-    if strat:
-        entry = last['Close']
-        if strat == "Mean Reversion":
-            tp = entry * 1.02
-            sl = entry * 0.99
-        elif strat == "EMA200 Breakout":
-            tp = None  # We'll use a trailing stop instead
-            sl = entry * 0.98
-        elif strat == "MACD+EMA":
-            tp = None  # We'll use a trailing stop instead
-            sl = entry * 0.99
-        shares = int(capital_per_trade // entry)
-        invested = shares * entry
-        results.append({
-            "Ticker": ticker,
-            "Strategy": strat,
-            "Rank": rank,
-            "Entry Price": round(entry, 2),
-            "Capital Used": round(invested, 2),
-            "Shares": shares,
-            "TP (if fixed)": round(tp, 2) if tp else "-",
-            "SL": round(sl, 2),
-            "Reason": reason,
-            "Volume": int(last['Volume']),
-            "Avg Vol (20d)": int(last['AvgVol20']),
-            "RSI(2)": round(last['RSI2'], 2),
-            "EMA200": round(last['EMA200'], 2),
-            "SMA200": round(last['SMA200'], 2)
-        })
 
 df_results = pd.DataFrame(results)
 
