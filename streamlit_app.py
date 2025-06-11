@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# --- S&P 100 Tickers (abbreviated, add more if needed) ---
 sp100 = [
     'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO',
     'AXP','BA','BAC','BK','BKNG','BLK','BMY','BRK-B','C','CAT',
@@ -59,7 +58,6 @@ def calc_indicators(df):
     df['AvgVol40'] = df['Volume'].replace(0, np.nan).rolling(window=40, min_periods=1).mean().fillna(0)
     return df
 
-# --- Strategies ---
 def mean_reversion_signal(df):
     c = safe_scalar(df['Close'].iloc[-1])
     sma = safe_scalar(df['SMA40'].iloc[-1])
@@ -70,7 +68,7 @@ def mean_reversion_signal(df):
     cond = (c > sma) and (rsi < 15)
     if cond:
         score = 75 + max(0, 15 - rsi)  # bonus for more oversold
-    return cond, "Mean Reversion: Price > SMA40 & RSI(3)<15", score
+    return bool(cond), "Mean Reversion: Price > SMA40 & RSI(3)<15", score
 
 def ema40_breakout_signal(df):
     c = safe_scalar(df['Close'].iloc[-1])
@@ -88,10 +86,9 @@ def ema40_breakout_signal(df):
     cond = (c > ema) and ((pc < pema) or dipped)
     score = 0
     if cond:
-        # The bigger the break and shakeout, the better
         magnitude = max(0, c - ema)
         score = 70 + min(20, magnitude)  # Cap the bonus for safety
-    return cond, "EMA40 Breakout: Price reclaimed EMA40 (with shakeout)", score
+    return bool(cond), "EMA40 Breakout: Price reclaimed EMA40 (with shakeout)", score
 
 def macd_ema_signal(df):
     macd = safe_scalar(df['MACD'].iloc[-1])
@@ -106,11 +103,9 @@ def macd_ema_signal(df):
     cond = cross and (ema8 > ema21)
     score = 0
     if cond:
-        # The closer to zero (MACD rising up), the better
         score = 65 + int(abs(macd)*5)
-    return cond, "MACD+EMA: MACD cross up <0 & EMA8>EMA21", score
+    return bool(cond), "MACD+EMA: MACD cross up <0 & EMA8>EMA21", score
 
-# --- Main Loop ---
 debug_rows = []
 results = []
 
