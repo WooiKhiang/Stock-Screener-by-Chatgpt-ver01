@@ -42,6 +42,15 @@ def safe_scalar(val):
     except Exception:
         return np.nan
 
+def format_number(num, decimals=2):
+    try:
+        if np.isnan(num): return "-"
+        if isinstance(num, int) or decimals == 0:
+            return f"{int(num):,}"
+        return f"{num:,.{decimals}f}"
+    except Exception:
+        return str(num)
+
 def calc_indicators(df):
     df['SMA40'] = df['Close'].rolling(window=40).mean()
     df['EMA40'] = df['Close'].ewm(span=40, min_periods=40).mean()
@@ -111,10 +120,10 @@ def send_telegram_alert(message):
     except Exception as e:
         st.warning(f"Telegram alert failed: {e}")
 
-def append_to_gsheet(data_rows):
+def append_to_gsheet(data_rows, creds_path):
     try:
         scope = ["https://spreadsheets.google.com/feeds",'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name('gcreds.json', scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
         client = gspread.authorize(creds)
         sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
         for row in data_rows:
@@ -123,7 +132,6 @@ def append_to_gsheet(data_rows):
         st.warning(f"Failed to append to Google Sheet: {e}")
 
 def get_market_sentiment():
-    # Quick & simple market mood using SPY and QQQ
     spy = yf.download('SPY', period='1d', interval='5m', progress=False)
     qqq = yf.download('QQQ', period='1d', interval='5m', progress=False)
     try:
@@ -145,7 +153,6 @@ def get_market_sentiment():
         return f"Market sentiment unavailable ({e})"
 
 def get_market_status():
-    # NYSE hours: 9:30am - 4:00pm US/Eastern
     now_utc = datetime.utcnow()
     eastern = pytz.timezone("US/Eastern")
     now_et = now_utc.replace(tzinfo=pytz.utc).astimezone(eastern)
@@ -165,12 +172,12 @@ min_price = st.sidebar.number_input("Min Price ($)", value=10.0, key="min_price"
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0, key="max_price")
 min_volume = st.sidebar.number_input("Min Avg Vol (40 bars)", value=100000, key="min_vol")
 capital_per_trade = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0, key="capital_trade")
+gcreds_path = st.sidebar.text_input("Google Credentials Path", value="gcreds.json", help="Path to your gcreds.json service account file for Google Sheets")
 
 # --- Dashboard Header ---
 st.title("🔍 S&P 100 Intraday Screener & AI Top 3 Stock Picks")
 st.caption(f"Last run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# --- Show strategy summary ---
 with st.expander("About the 3 AI Strategies", expanded=True):
     st.markdown("""
 **Mean Reversion:**  
@@ -187,7 +194,6 @@ status = get_market_status()
 st.subheader(f"Market Sentiment: {sentiment}")
 st.caption(f"Market Status: {status}")
 
-# --- Data Loop ---
 results = []
 top10_active = []
 
@@ -196,12 +202,10 @@ for ticker in sp100:
         df = yf.download(ticker, period="5d", interval="5m", progress=False)
         if df.empty or len(df) < 50:
             continue
-        # Defensive flatten/column match
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = ["_".join([str(x) for x in c]).lower() for c in df.columns]
         else:
             df.columns = [str(c).lower() for c in df.columns]
-        # Find Close
         close_col = None
         candidates = ['close', 'adjclose', 'adj close']
         for cand in candidates:
@@ -221,7 +225,6 @@ for ticker in sp100:
             df['Close'] = df[close_col].iloc[:,0]
         else:
             df['Close'] = df[close_col]
-        # Find Volume
         vol_col = None
         candidates = ['volume', 'regularmarketvolume']
         for cand in candidates:
@@ -247,16 +250,16 @@ for ticker in sp100:
         close_price = float(safe_scalar(last['Close']))
         avgvol40 = float(safe_scalar(last['AvgVol40']))
         volume_now = int(safe_scalar(df['Volume'][df['Volume'] > 0].iloc[-1])) if (df['Volume'] > 0).any() else 0
+        traded_value = close_price * volume_now
 
-        # Build top10_active (regardless of strategy)
         top10_active.append({
             "Ticker": ticker,
             "Last Price": close_price,
             "Last Volume": volume_now,
+            "Traded Value": traded_value,
             "Avg Vol (40)": int(avgvol40)
         })
 
-        # Filter for strategy screener
         if any(np.isnan([close_price, avgvol40])):
             continue
         if not (min_price <= close_price <= max_price):
@@ -264,7 +267,6 @@ for ticker in sp100:
         if avgvol40 < min_volume:
             continue
 
-        # Apply all strategies
         triggers = {}
         picks = []
         for func, strat_name in [
@@ -277,7 +279,6 @@ for ticker in sp100:
             if sig:
                 picks.append((strat_name, reason, score))
 
-        # Only add if at least one triggers
         if picks:
             picks.sort(key=lambda x: -x[2])
             strat_name, reason, score = picks[0]
@@ -288,15 +289,15 @@ for ticker in sp100:
                 "Ticker": ticker,
                 "Strategy": strat_name,
                 "AI Score": score,
-                "Entry Price": round(entry, 2),
-                "Capital Used": round(invested, 2),
+                "Entry Price": entry,
+                "Capital Used": invested,
                 "Shares": shares,
                 "Reason": reason,
                 "Volume": volume_now,
                 "Avg Vol (40)": int(avgvol40),
-                "RSI(3)": round(float(safe_scalar(last['RSI3'])), 2),
-                "EMA40": round(float(safe_scalar(last['EMA40'])), 2),
-                "SMA40": round(float(safe_scalar(last['SMA40'])), 2),
+                "RSI(3)": float(safe_scalar(last['RSI3'])),
+                "EMA40": float(safe_scalar(last['EMA40'])),
+                "SMA40": float(safe_scalar(last['SMA40'])),
                 "Mean Reversion": triggers.get("Mean Reversion", False),
                 "EMA40 Breakout": triggers.get("EMA40 Breakout", False),
                 "MACD+EMA": triggers.get("MACD+EMA", False)
@@ -304,11 +305,16 @@ for ticker in sp100:
     except Exception as e:
         pass
 
-# --- Top 10 Active Stocks (by last bar volume) ---
+# --- Top 10 Active Stocks (by traded value) ---
 if top10_active:
     df_top10 = pd.DataFrame(top10_active)
-    df_top10 = df_top10.sort_values("Last Volume", ascending=False).head(10)
-    st.subheader("🔥 Top 10 Most Active Stocks (by 5-min Volume)")
+    df_top10 = df_top10.sort_values("Traded Value", ascending=False).head(10)
+    # Format numbers
+    df_top10['Last Price'] = df_top10['Last Price'].apply(lambda x: format_number(x, 2))
+    df_top10['Last Volume'] = df_top10['Last Volume'].apply(lambda x: format_number(x, 0))
+    df_top10['Traded Value'] = df_top10['Traded Value'].apply(lambda x: format_number(x, 2))
+    df_top10['Avg Vol (40)'] = df_top10['Avg Vol (40)'].apply(lambda x: format_number(x, 0))
+    st.subheader("🔥 Top 10 Most Active Stocks (by 5-min Traded Value)")
     st.dataframe(df_top10.reset_index(drop=True))
 
 # --- Main AI picks output ---
@@ -317,8 +323,12 @@ st.header("AI-Powered Top 3 Intraday Stock Picks (S&P 100)")
 
 if not df_results.empty:
     df_results = df_results.sort_values(["AI Score", "Strategy", "RSI(3)"], ascending=[False, True, True]).reset_index(drop=True)
-    # Add ranking column
     df_results.insert(0, "Rank", df_results.index + 1)
+    # Format numbers for display
+    for col in ["Entry Price", "Capital Used", "RSI(3)", "EMA40", "SMA40"]:
+        df_results[col] = df_results[col].apply(lambda x: format_number(x, 2))
+    for col in ["Volume", "Avg Vol (40)", "Shares"]:
+        df_results[col] = df_results[col].apply(lambda x: format_number(x, 0))
     st.dataframe(df_results[[
         "Rank","Ticker","Entry Price","Strategy","AI Score",
         "Mean Reversion","EMA40 Breakout","MACD+EMA","Reason","Capital Used","Shares","RSI(3)","Volume","Avg Vol (40)","EMA40","SMA40"
@@ -330,7 +340,7 @@ if not df_results.empty:
     telegram_messages = []
     gsheet_rows = []
     for idx, row in top3.iterrows():
-        entry = float(row['Entry Price'])
+        entry = float(str(row['Entry Price']).replace(",",""))
         target_price = round(entry * 1.02, 2)
         cut_loss_price = round(entry * 0.99, 2)
         now_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -343,9 +353,9 @@ if not df_results.empty:
 
         msg = (
             f"🔥AI Pick #{idx+1}: {row['Ticker']}\n"
-            f"Entry Price: ${entry}\n"
-            f"Target Price (+2%): ${target_price}\n"
-            f"Cut Loss (-1%): ${cut_loss_price}\n"
+            f"Entry Price: ${format_number(entry,2)}\n"
+            f"Target Price (+2%): ${format_number(target_price,2)}\n"
+            f"Cut Loss (-1%): ${format_number(cut_loss_price,2)}\n"
             f"Reason: {row['Reason']}\n"
             f"Strategy: {triggered_strat}\n"
             f"AI Score: {row['AI Score']}\n"
@@ -353,7 +363,7 @@ if not df_results.empty:
         )
         telegram_messages.append(msg)
         gsheet_rows.append([
-            now_time, row['Ticker'], entry, target_price, cut_loss_price,
+            now_time, row['Ticker'], format_number(entry,2), format_number(target_price,2), format_number(cut_loss_price,2),
             triggered_strat, row['AI Score'], row['Reason']
         ])
 
@@ -364,7 +374,7 @@ if not df_results.empty:
         **Signal(s):** {triggered_strat}  
         **AI Confidence Score:** {row['AI Score']}  
         **Reason:** {row['Reason']}  
-        **Entry Price:** ${entry} | **Target:** ${target_price} | **Cut Loss:** ${cut_loss_price}  
+        **Entry Price:** ${format_number(entry,2)} | **Target:** ${format_number(target_price,2)} | **Cut Loss:** ${format_number(cut_loss_price,2)}  
         **RSI(3):** {row['RSI(3)']} | **EMA40:** {row['EMA40']} | **SMA40:** {row['SMA40']} | **Vol:** {row['Volume']}
         """)
         if idx == 0:
@@ -378,7 +388,7 @@ if not df_results.empty:
     for msg in telegram_messages:
         send_telegram_alert(msg)
     # --- Log to Google Sheets ---
-    append_to_gsheet(gsheet_rows)
+    append_to_gsheet(gsheet_rows, gcreds_path)
 else:
     st.info("No stocks meet your filter/strategy criteria right now.")
 
