@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import pytz
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import json
 
 # --- Config ---
 TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
@@ -44,7 +45,7 @@ def safe_scalar(val):
 
 def format_number(num, decimals=2):
     try:
-        if np.isnan(num): return "-"
+        if num is None or num == "" or np.isnan(num): return "-"
         if isinstance(num, int) or decimals == 0:
             return f"{int(num):,}"
         return f"{num:,.{decimals}f}"
@@ -78,7 +79,7 @@ def mean_reversion_signal(df):
         return False, None, 0
     cond = (c > sma) and (rsi < 15)
     score = 75 + max(0, 15 - rsi) if cond else 0
-    return bool(cond), "Mean Reversion: Price > SMA40 & RSI(3)<15", score
+    return bool(cond), "Mean Reversion: Price > SMA40 & RSI(3)<15", float(f"{score:.2f}")
 
 def ema40_breakout_signal(df):
     c = float(safe_scalar(df['Close'].iloc[-1]))
@@ -94,7 +95,7 @@ def ema40_breakout_signal(df):
         dipped = np.any(left_vals < right_vals)
     cond = (c > ema) and ((pc < pema) or dipped)
     score = 70 + min(20, c - ema) if cond else 0
-    return bool(cond), "EMA40 Breakout: Price reclaimed EMA40 (with shakeout)", score
+    return bool(cond), "EMA40 Breakout: Price reclaimed EMA40 (with shakeout)", float(f"{score:.2f}")
 
 def macd_ema_signal(df):
     macd = float(safe_scalar(df['MACD'].iloc[-1]))
@@ -108,7 +109,7 @@ def macd_ema_signal(df):
     cross = (macd_prev < macd_signal_prev) and (macd > macd_signal) and (macd < 0)
     cond = cross and (ema8 > ema21)
     score = 65 + int(abs(macd)*5) if cond else 0
-    return bool(cond), "MACD+EMA: MACD cross up <0 & EMA8>EMA21", score
+    return bool(cond), "MACD+EMA: MACD cross up <0 & EMA8>EMA21", float(f"{score:.2f}")
 
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -120,11 +121,21 @@ def send_telegram_alert(message):
     except Exception as e:
         st.warning(f"Telegram alert failed: {e}")
 
-def append_to_gsheet(data_rows, creds_path):
+def get_gspread_client_from_secrets():
+    info = st.secrets["gcp_service_account"]
+    creds_dict = {k: v for k, v in info.items()}
+    # In some cases, TOML converts the private key to a list, so join if needed
+    if isinstance(creds_dict["private_key"], list):
+        creds_dict["private_key"] = "\n".join(creds_dict["private_key"])
+    creds_json = json.dumps(creds_dict)
+    scope = ["https://spreadsheets.google.com/feeds",'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
+    client = gspread.authorize(creds)
+    return client
+
+def append_to_gsheet(data_rows):
     try:
-        scope = ["https://spreadsheets.google.com/feeds",'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
-        client = gspread.authorize(creds)
+        client = get_gspread_client_from_secrets()
         sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
         for row in data_rows:
             sheet.append_row(row, value_input_option="USER_ENTERED")
@@ -172,7 +183,6 @@ min_price = st.sidebar.number_input("Min Price ($)", value=10.0, key="min_price"
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0, key="max_price")
 min_volume = st.sidebar.number_input("Min Avg Vol (40 bars)", value=100000, key="min_vol")
 capital_per_trade = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0, key="capital_trade")
-gcreds_path = st.sidebar.text_input("Google Credentials Path", value="gcreds.json", help="Path to your gcreds.json service account file for Google Sheets")
 
 # --- Dashboard Header ---
 st.title("🔍 S&P 100 Intraday Screener & AI Top 3 Stock Picks")
@@ -288,7 +298,7 @@ for ticker in sp100:
             results.append({
                 "Ticker": ticker,
                 "Strategy": strat_name,
-                "AI Score": score,
+                "AI Score": float(f"{score:.2f}"),
                 "Entry Price": entry,
                 "Capital Used": invested,
                 "Shares": shares,
@@ -325,7 +335,7 @@ if not df_results.empty:
     df_results = df_results.sort_values(["AI Score", "Strategy", "RSI(3)"], ascending=[False, True, True]).reset_index(drop=True)
     df_results.insert(0, "Rank", df_results.index + 1)
     # Format numbers for display
-    for col in ["Entry Price", "Capital Used", "RSI(3)", "EMA40", "SMA40"]:
+    for col in ["Entry Price", "Capital Used", "RSI(3)", "EMA40", "SMA40", "AI Score"]:
         df_results[col] = df_results[col].apply(lambda x: format_number(x, 2))
     for col in ["Volume", "Avg Vol (40)", "Shares"]:
         df_results[col] = df_results[col].apply(lambda x: format_number(x, 0))
@@ -388,7 +398,7 @@ if not df_results.empty:
     for msg in telegram_messages:
         send_telegram_alert(msg)
     # --- Log to Google Sheets ---
-    append_to_gsheet(gsheet_rows, gcreds_path)
+    append_to_gsheet(gsheet_rows)
 else:
     st.info("No stocks meet your filter/strategy criteria right now.")
 
