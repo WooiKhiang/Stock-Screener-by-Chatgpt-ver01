@@ -124,7 +124,6 @@ def send_telegram_alert(message):
 def get_gspread_client_from_secrets():
     info = st.secrets["gcp_service_account"]
     creds_dict = {k: v for k, v in info.items()}
-    # In some cases, TOML converts the private key to a list, so join if needed
     if isinstance(creds_dict["private_key"], list):
         creds_dict["private_key"] = "\n".join(creds_dict["private_key"])
     creds_json = json.dumps(creds_dict)
@@ -178,17 +177,17 @@ def get_market_status():
         return f"Market Open ({now_et.strftime('%I:%M %p %Z')})"
 
 # --- Streamlit Sidebar ---
-st.sidebar.header("Filter Settings")
+st.sidebar.header("Filter Settings (Intraday)")
 min_price = st.sidebar.number_input("Min Price ($)", value=10.0, key="min_price")
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0, key="max_price")
 min_volume = st.sidebar.number_input("Min Avg Vol (40 bars)", value=100000, key="min_vol")
 capital_per_trade = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0, key="capital_trade")
 
 # --- Dashboard Header ---
-st.title("🔍 S&P 100 Intraday Screener & AI Top 3 Stock Picks")
+st.title("🔍 S&P 100 Intraday & Swing Hybrid Stock Screener")
 st.caption(f"Last run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-with st.expander("About the 3 AI Strategies", expanded=True):
+with st.expander("About the 3 AI Intraday Strategies", expanded=True):
     st.markdown("""
 **Mean Reversion:**  
 Looks for short-term oversold opportunities when price is above SMA40 and RSI(3) is below 15.  
@@ -204,6 +203,7 @@ status = get_market_status()
 st.subheader(f"Market Sentiment: {sentiment}")
 st.caption(f"Market Status: {status}")
 
+# ---------------- INTRADAY SECTION (5m) -----------------------
 results = []
 top10_active = []
 
@@ -403,3 +403,53 @@ else:
     st.info("No stocks meet your filter/strategy criteria right now.")
 
 st.caption("Each recommendation above is ranked by a composite confidence score. Top 10 active stocks are shown for general market activity reference.")
+
+# ---------------- SWING TRADE SECTION (1d, EMA200 breakout) ----------------
+st.header("📈 Swing Trade Picks: EMA200 Breakout Strategy (S&P 100)")
+
+swing_results = []
+swing_min_volume = 500000  # or make this a sidebar input if you want!
+
+for ticker in sp100:
+    try:
+        df = yf.download(ticker, period="1y", interval="1d", progress=False)
+        if df.empty or len(df) < 210:  # Need 200+ days for good EMA200
+            continue
+        df['EMA200'] = df['Close'].ewm(span=200, min_periods=200).mean()
+        df['VolumeAvg20'] = df['Volume'].rolling(20).mean()
+        today = df.iloc[-1]
+        prev = df.iloc[-2]
+        # --- ENTRY LOGIC ---
+        price_crossed = prev['Close'] < prev['EMA200'] and today['Close'] > today['EMA200']
+        volume_confirm = today['Volume'] > 1.2 * today['VolumeAvg20']  # 20%+ above avg
+        if price_crossed and volume_confirm and today['Volume'] > swing_min_volume:
+            entry = today['Close']
+            ema200 = today['EMA200']
+            target = round(entry * 1.04, 2)   # +4% target
+            stop = round(entry * 0.98, 2)     # -2% stop
+            swing_results.append({
+                "Date": today.name.strftime("%Y-%m-%d"),
+                "Ticker": ticker,
+                "Entry Price": entry,
+                "EMA200": ema200,
+                "Target Price": target,
+                "Stop Loss": stop,
+                "Volume": int(today['Volume']),
+                "VolumeAvg20": int(today['VolumeAvg20'])
+            })
+    except Exception as e:
+        pass
+
+if swing_results:
+    df_swing = pd.DataFrame(swing_results).sort_values("Volume", ascending=False)
+    # Format numbers
+    for col in ["Entry Price", "EMA200", "Target Price", "Stop Loss"]:
+        df_swing[col] = df_swing[col].apply(lambda x: format_number(x, 2))
+    for col in ["Volume", "VolumeAvg20"]:
+        df_swing[col] = df_swing[col].apply(lambda x: format_number(x, 0))
+    st.dataframe(df_swing[[
+        "Date", "Ticker", "Entry Price", "EMA200", "Target Price", "Stop Loss", "Volume", "VolumeAvg20"
+    ]], use_container_width=True)
+    st.info("These are swing trade signals—intended for 3–5 day holds with +4% target, -2% stop. Only triggers when price breaks above EMA200 with strong volume.")
+else:
+    st.warning("No swing trade setups found in S&P 100 today (signals are rare, but high quality).")
