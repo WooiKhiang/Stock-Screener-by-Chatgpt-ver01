@@ -218,6 +218,54 @@ st.caption(f"Last run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 st.caption(f"Market Status: {get_market_status()}")
 st.subheader(f"Market Sentiment: {get_market_sentiment()}")
 
+# ------------------ Top 10 Most Active Stocks (Today) ------------------
+st.subheader("Top 10 Most Active S&P 100 Stocks Today (5m data)")
+
+active_rows = []
+for ticker in sp100:
+    try:
+        df = yf.download(ticker, period="1d", interval="5m", progress=False)
+        if df.empty or len(df) < 2:
+            continue
+        vol = int(df['Volume'].sum())
+        open_price = float(df['Open'].iloc[0])
+        last_price = float(df['Close'].iloc[-1])
+        change_pct = 100 * (last_price - open_price) / open_price
+        # RSI(14)
+        delta = df['Close'].diff()
+        up = delta.clip(lower=0)
+        down = -1 * delta.clip(upper=0)
+        roll_up = up.rolling(14).mean()
+        roll_down = down.rolling(14).mean()
+        rs = roll_up / (roll_down + 1e-9)
+        rsi14 = 100 - (100 / (1 + rs))
+        rsi = float(rsi14.iloc[-1])
+        # MACD
+        ema12 = df['Close'].ewm(span=12, min_periods=12).mean()
+        ema26 = df['Close'].ewm(span=26, min_periods=26).mean()
+        macd = ema12 - ema26
+        macd_signal = macd.ewm(span=9, min_periods=9).mean()
+        macd_val = float(macd.iloc[-1])
+        macd_sig = float(macd_signal.iloc[-1])
+        active_rows.append({
+            "Ticker": ticker,
+            "Volume": vol,
+            "Open": format_number(open_price, 2),
+            "Last Price": format_number(last_price, 2),
+            "Change (%)": format_number(change_pct, 2),
+            "RSI(14)": format_number(rsi, 2),
+            "MACD": format_number(macd_val, 2),
+            "MACD Sig": format_number(macd_sig, 2)
+        })
+    except Exception:
+        continue
+
+if active_rows:
+    df_active = pd.DataFrame(active_rows).sort_values("Volume", ascending=False).head(10)
+    st.dataframe(df_active.reset_index(drop=True), use_container_width=True)
+else:
+    st.info("No active stocks found today.")
+
 # --------- Relative Strength Leaders (Top 10) ---------
 def get_relative_strength_leaders():
     base = yf.download('SPY', period='6d', interval='1d', progress=False)['Close']
