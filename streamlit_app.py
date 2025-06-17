@@ -186,12 +186,14 @@ def get_market_sentiment():
     spy = yf.download('SPY', period='1d', interval='5m', progress=False)
     qqq = yf.download('QQQ', period='1d', interval='5m', progress=False)
     try:
+        if spy.empty or qqq.empty:
+            return "Market sentiment unavailable (data missing)"
         spy_open = spy['Open'].iloc[0]
         spy_last = spy['Close'].iloc[-1]
         qqq_open = qqq['Open'].iloc[0]
         qqq_last = qqq['Close'].iloc[-1]
-        spy_pct = (spy_last - spy_open) / spy_open * 100
-        qqq_pct = (qqq_last - qqq_open) / qqq_open * 100
+        spy_pct = float(spy_last - spy_open) / float(spy_open) * 100
+        qqq_pct = float(qqq_last - qqq_open) / float(qqq_open) * 100
         avg_pct = (spy_pct + qqq_pct) / 2
         if avg_pct > 0.5:
             sentiment = f"🟢 Bullish (+{avg_pct:.2f}%)"
