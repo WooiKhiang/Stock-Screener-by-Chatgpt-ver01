@@ -8,11 +8,12 @@ import pytz
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
+import time
 
 # --- Config ---
-TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
-TELEGRAM_CHAT_ID = "713264762"
-GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
+GOOGLE_SHEET_ID = "YOUR_GOOGLE_SHEET_ID"
 GOOGLE_SHEET_NAME = "Sheet1"
 
 sp100 = [
@@ -29,7 +30,22 @@ sp100 = [
     'WFC','WMT','XOM'
 ]
 
-# --- Utility Functions ---
+def format_number(num, decimals=2):
+    try:
+        if num is None or num == "" or np.isnan(num): return "-"
+        if isinstance(num, int) or decimals == 0:
+            return f"{int(num):,}"
+        return f"{num:,.{decimals}f}"
+    except Exception:
+        return str(num)
+
+def get_live_price(ticker):
+    try:
+        info = yf.Ticker(ticker).info
+        return info.get('regularMarketPrice', None)
+    except Exception:
+        return None
+
 def safe_scalar(val):
     if isinstance(val, pd.Series) or isinstance(val, np.ndarray):
         if len(val) == 1:
@@ -42,15 +58,6 @@ def safe_scalar(val):
         return float(val)
     except Exception:
         return np.nan
-
-def format_number(num, decimals=2):
-    try:
-        if num is None or num == "" or np.isnan(num): return "-"
-        if isinstance(num, int) or decimals == 0:
-            return f"{int(num):,}"
-        return f"{num:,.{decimals}f}"
-    except Exception:
-        return str(num)
 
 def calc_indicators(df):
     df['SMA40'] = df['Close'].rolling(window=40).mean()
@@ -69,33 +76,46 @@ def calc_indicators(df):
     df['MACD'] = ema12 - ema26
     df['MACD_signal'] = df['MACD'].ewm(span=9, min_periods=9).mean()
     df['AvgVol40'] = df['Volume'].replace(0, np.nan).rolling(window=40, min_periods=1).mean().fillna(0)
+    df['ATR'] = df['Close'].rolling(14).apply(lambda x: np.mean(np.abs(np.diff(x))), raw=True)
     return df
 
 def mean_reversion_signal(df):
     c = float(safe_scalar(df['Close'].iloc[-1]))
     sma = float(safe_scalar(df['SMA40'].iloc[-1]))
     rsi = float(safe_scalar(df['RSI3'].iloc[-1]))
-    if np.isnan(c) or np.isnan(sma) or np.isnan(rsi):
-        return False, None, 0
-    cond = (c > sma) and (rsi < 15)
+    vol = float(safe_scalar(df['Volume'].iloc[-1]))
+    avgvol = float(safe_scalar(df['AvgVol40'].iloc[-1]))
+    atr = float(safe_scalar(df['ATR'].iloc[-1]))
+    bar_range = float(safe_scalar(df['Close'].iloc[-1] - df['Close'].iloc[-2]))
+    hour = pd.Timestamp(df.index[-1]).tz_localize("UTC").tz_convert("America/New_York").hour
+    # filter: main market hours, high volume, bar range > 0.5 * ATR
+    cond = (
+        (c > sma) and (rsi < 15) and
+        (vol > 1.5 * avgvol) and
+        (abs(bar_range) > 0.5 * atr if not np.isnan(atr) else True) and
+        (10 <= hour <= 15)
+    )
     score = 75 + max(0, 15 - rsi) if cond else 0
-    return bool(cond), "Mean Reversion: Price > SMA40 & RSI(3)<15", float(f"{score:.2f}")
+    return bool(cond), "Mean Reversion: Price > SMA40 & RSI(3)<15 (volume, ATR, time filter)", float(f"{score:.2f}")
 
 def ema40_breakout_signal(df):
     c = float(safe_scalar(df['Close'].iloc[-1]))
     ema = float(safe_scalar(df['EMA40'].iloc[-1]))
     pc = float(safe_scalar(df['Close'].iloc[-2]))
     pema = float(safe_scalar(df['EMA40'].iloc[-2]))
-    if np.isnan(c) or np.isnan(ema) or np.isnan(pc) or np.isnan(pema):
-        return False, None, 0
-    left_vals = df['Close'].iloc[-10:-1].values
-    right_vals = df['EMA40'].iloc[-10:-1].values
-    dipped = False
-    if len(left_vals) == len(right_vals) and len(left_vals) > 0:
-        dipped = np.any(left_vals < right_vals)
-    cond = (c > ema) and ((pc < pema) or dipped)
+    vol = float(safe_scalar(df['Volume'].iloc[-1]))
+    avgvol = float(safe_scalar(df['AvgVol40'].iloc[-1]))
+    atr = float(safe_scalar(df['ATR'].iloc[-1]))
+    hour = pd.Timestamp(df.index[-1]).tz_localize("UTC").tz_convert("America/New_York").hour
+    dipped = np.any(df['Close'].iloc[-10:-1] < df['EMA40'].iloc[-10:-1])
+    cond = (
+        (c > ema) and ((pc < pema) or dipped) and
+        (vol > 1.5 * avgvol) and
+        (abs(c - pc) > 0.5 * atr if not np.isnan(atr) else True) and
+        (10 <= hour <= 15)
+    )
     score = 70 + min(20, c - ema) if cond else 0
-    return bool(cond), "EMA40 Breakout: Price reclaimed EMA40 (with shakeout)", float(f"{score:.2f}")
+    return bool(cond), "EMA40 Breakout (with filter)", float(f"{score:.2f}")
 
 def macd_ema_signal(df):
     macd = float(safe_scalar(df['MACD'].iloc[-1]))
@@ -104,22 +124,19 @@ def macd_ema_signal(df):
     macd_signal_prev = float(safe_scalar(df['MACD_signal'].iloc[-2]))
     ema8 = float(safe_scalar(df['EMA8'].iloc[-1]))
     ema21 = float(safe_scalar(df['EMA21'].iloc[-1]))
-    if any(np.isnan(x) for x in [macd, macd_signal, macd_prev, macd_signal_prev, ema8, ema21]):
-        return False, None, 0
+    vol = float(safe_scalar(df['Volume'].iloc[-1]))
+    avgvol = float(safe_scalar(df['AvgVol40'].iloc[-1]))
+    atr = float(safe_scalar(df['ATR'].iloc[-1]))
+    hour = pd.Timestamp(df.index[-1]).tz_localize("UTC").tz_convert("America/New_York").hour
     cross = (macd_prev < macd_signal_prev) and (macd > macd_signal) and (macd < 0)
-    cond = cross and (ema8 > ema21)
+    cond = (
+        cross and (ema8 > ema21) and
+        (vol > 1.5 * avgvol) and
+        (abs(macd - macd_prev) > 0.25 * atr if not np.isnan(atr) else True) and
+        (10 <= hour <= 15)
+    )
     score = 65 + int(abs(macd)*5) if cond else 0
-    return bool(cond), "MACD+EMA: MACD cross up <0 & EMA8>EMA21", float(f"{score:.2f}")
-
-def send_telegram_alert(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    try:
-        resp = requests.post(url, data=payload)
-        if not resp.ok:
-            st.warning(f"Telegram alert failed: {resp.text}")
-    except Exception as e:
-        st.warning(f"Telegram alert failed: {e}")
+    return bool(cond), "MACD+EMA (with filter)", float(f"{score:.2f}")
 
 def get_gspread_client_from_secrets():
     info = st.secrets["gcp_service_account"]
@@ -140,6 +157,30 @@ def append_to_gsheet(data_rows):
             sheet.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         st.warning(f"Failed to append to Google Sheet: {e}")
+
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        resp = requests.post(url, data=payload)
+        if not resp.ok:
+            st.warning(f"Telegram alert failed: {resp.text}")
+    except Exception as e:
+        st.warning(f"Telegram alert failed: {e}")
+
+def get_market_status():
+    now_utc = datetime.utcnow()
+    eastern = pytz.timezone("US/Eastern")
+    now_et = now_utc.replace(tzinfo=pytz.utc).astimezone(eastern)
+    time_now = now_et.time()
+    open_time = datetime.strptime("09:30", "%H:%M").time()
+    close_time = datetime.strptime("16:00", "%H:%M").time()
+    if time_now < open_time:
+        return f"Pre-market ({now_et.strftime('%I:%M %p %Z')})"
+    elif time_now > close_time:
+        return f"After-market ({now_et.strftime('%I:%M %p %Z')})"
+    else:
+        return f"Market Open ({now_et.strftime('%I:%M %p %Z')})"
 
 def get_market_sentiment():
     spy = yf.download('SPY', period='1d', interval='5m', progress=False)
@@ -162,120 +203,76 @@ def get_market_sentiment():
     except Exception as e:
         return f"Market sentiment unavailable ({e})"
 
-def get_market_status():
-    now_utc = datetime.utcnow()
-    eastern = pytz.timezone("US/Eastern")
-    now_et = now_utc.replace(tzinfo=pytz.utc).astimezone(eastern)
-    time_now = now_et.time()
-    open_time = datetime.strptime("09:30", "%H:%M").time()
-    close_time = datetime.strptime("16:00", "%H:%M").time()
-    if time_now < open_time:
-        return f"Pre-market ({now_et.strftime('%I:%M %p %Z')})"
-    elif time_now > close_time:
-        return f"After-market ({now_et.strftime('%I:%M %p %Z')})"
-    else:
-        return f"Market Open ({now_et.strftime('%I:%M %p %Z')})"
-
 # --- Streamlit Sidebar ---
-st.sidebar.header("Filter Settings (Intraday)")
-min_price = st.sidebar.number_input("Min Price ($)", value=10.0, key="min_price")
-max_price = st.sidebar.number_input("Max Price ($)", value=2000.0, key="max_price")
-min_volume = st.sidebar.number_input("Min Avg Vol (40 bars)", value=100000, key="min_vol")
-capital_per_trade = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0, key="capital_trade")
+st.sidebar.header("Trade Settings")
+min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
+max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
+min_volume = st.sidebar.number_input("Min Avg Vol (40 bars)", value=100000)
+capital_per_trade = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0)
+show_live_price = st.sidebar.checkbox("Show 'Live' (Ticker.info) price", value=True)
 
-# --- Dashboard Header ---
-st.title("🔍 S&P 100 Intraday & Swing Hybrid Stock Screener")
+st.title("🔍 AI-Powered US Stocks Screener – Intraday, Swing, and Catalyst Hybrid")
 st.caption(f"Last run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Market Status: {get_market_status()}")
+st.subheader(f"Market Sentiment: {get_market_sentiment()}")
 
-with st.expander("About the 3 AI Intraday Strategies", expanded=True):
-    st.markdown("""
-**Mean Reversion:**  
-Looks for short-term oversold opportunities when price is above SMA40 and RSI(3) is below 15.  
-**EMA40 Breakout:**  
-Identifies when price breaks above its 40-period EMA, especially if it recently dipped below and recovers.  
-**MACD+EMA:**  
-Finds bullish MACD cross-ups below zero, with EMA8 > EMA21 to confirm trend shift.
-""")
+# --------- Relative Strength Leaders (Top 10) ---------
+def get_relative_strength_leaders():
+    base = yf.download('SPY', period='6d', interval='1d', progress=False)['Close']
+    leaders = []
+    for ticker in sp100:
+        try:
+            prices = yf.download(ticker, period='6d', interval='1d', progress=False)['Close']
+            if len(prices) < 5 or len(base) < 5:
+                continue
+            rel = prices[-5:].pct_change().sum() - base[-5:].pct_change().sum()
+            leaders.append((ticker, rel))
+            time.sleep(0.1)  # avoid rate limit
+        except Exception:
+            continue
+    leaders.sort(key=lambda x: -x[1])
+    return [x[0] for x in leaders[:10]]
 
-# --- Show market sentiment & status ---
-sentiment = get_market_sentiment()
-status = get_market_status()
-st.subheader(f"Market Sentiment: {sentiment}")
-st.caption(f"Market Status: {status}")
+rel_leaders = get_relative_strength_leaders()
+st.markdown(f"**Relative Strength Top 10 Leaders (5d):** {'  '.join(rel_leaders)}")
 
-# ---------------- INTRADAY SECTION (5m) -----------------------
-results = []
-top10_active = []
+# --------- New Catalyst/Gap+Volume Strategy ---------
+def catalyst_gap_signal(df):
+    # Identify if today opened >2% above yesterday's close and volume is >2x avg
+    if len(df) < 2: return False, None, 0
+    prev = df.iloc[-2]
+    today = df.iloc[-1]
+    gap = (today['Open'] - prev['Close']) / prev['Close']
+    vol = today['Volume']
+    avgvol = df['Volume'].iloc[-20:].mean()
+    cond = (gap > 0.02) and (vol > 2 * avgvol)
+    score = 85 if cond else 0
+    return bool(cond), "Gap+Volume Breakout (>2% gap up, >2x vol)", float(score)
+
+# --------- MAIN SCREENERS ---------
+results_intraday = []
+results_rel = []
+results_catalyst = []
+results_swing = []
 
 for ticker in sp100:
     try:
+        # --------- Intraday (5m) ---------
         df = yf.download(ticker, period="5d", interval="5m", progress=False)
         if df.empty or len(df) < 50:
             continue
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = ["_".join([str(x) for x in c]).lower() for c in df.columns]
-        else:
-            df.columns = [str(c).lower() for c in df.columns]
-        close_col = None
-        candidates = ['close', 'adjclose', 'adj close']
-        for cand in candidates:
-            for col in df.columns:
-                if cand == col.strip().replace(' ', '').lower():
-                    close_col = col
-                    break
-            if close_col: break
-        if not close_col:
-            for col in df.columns:
-                if 'close' in col.replace(' ', '').lower():
-                    close_col = col
-                    break
-        if not close_col:
-            continue
-        if isinstance(df[close_col], pd.DataFrame):
-            df['Close'] = df[close_col].iloc[:,0]
-        else:
-            df['Close'] = df[close_col]
-        vol_col = None
-        candidates = ['volume', 'regularmarketvolume']
-        for cand in candidates:
-            for col in df.columns:
-                if cand == col.strip().replace(' ', '').lower():
-                    vol_col = col
-                    break
-            if vol_col: break
-        if not vol_col:
-            for col in df.columns:
-                if 'vol' in col.replace(' ', '').lower():
-                    vol_col = col
-                    break
-        if not vol_col:
-            continue
-        if isinstance(df[vol_col], pd.DataFrame):
-            df['Volume'] = df[vol_col].iloc[:,0]
-        else:
-            df['Volume'] = df[vol_col]
-
+        df['Close'] = df['Close']
+        df['Volume'] = df['Volume']
         df = calc_indicators(df)
         last = df.iloc[-1]
         close_price = float(safe_scalar(last['Close']))
         avgvol40 = float(safe_scalar(last['AvgVol40']))
-        volume_now = int(safe_scalar(df['Volume'][df['Volume'] > 0].iloc[-1])) if (df['Volume'] > 0).any() else 0
-        traded_value = close_price * volume_now
+        volume_now = int(safe_scalar(last['Volume']))
+        live_price = get_live_price(ticker) if show_live_price else None
 
-        top10_active.append({
-            "Ticker": ticker,
-            "Last Price": close_price,
-            "Last Volume": volume_now,
-            "Traded Value": traded_value,
-            "Avg Vol (40)": int(avgvol40)
-        })
-
-        if any(np.isnan([close_price, avgvol40])):
-            continue
-        if not (min_price <= close_price <= max_price):
-            continue
-        if avgvol40 < min_volume:
-            continue
+        # Main filter
+        if not (min_price <= close_price <= max_price): continue
+        if avgvol40 < min_volume: continue
 
         triggers = {}
         picks = []
@@ -295,11 +292,12 @@ for ticker in sp100:
             entry = close_price
             shares = int(capital_per_trade // entry)
             invested = shares * entry
-            results.append({
+            results_intraday.append({
                 "Ticker": ticker,
                 "Strategy": strat_name,
                 "AI Score": float(f"{score:.2f}"),
-                "Entry Price": entry,
+                "Entry Price (5m close)": entry,
+                "Live Price (info)": live_price if live_price else "-",
                 "Capital Used": invested,
                 "Shares": shares,
                 "Reason": reason,
@@ -307,149 +305,168 @@ for ticker in sp100:
                 "Avg Vol (40)": int(avgvol40),
                 "RSI(3)": float(safe_scalar(last['RSI3'])),
                 "EMA40": float(safe_scalar(last['EMA40'])),
-                "SMA40": float(safe_scalar(last['SMA40'])),
-                "Mean Reversion": triggers.get("Mean Reversion", False),
-                "EMA40 Breakout": triggers.get("EMA40 Breakout", False),
-                "MACD+EMA": triggers.get("MACD+EMA", False)
+                "SMA40": float(safe_scalar(last['SMA40']))
             })
-    except Exception as e:
-        pass
 
-# --- Top 10 Active Stocks (by traded value) ---
-if top10_active:
-    df_top10 = pd.DataFrame(top10_active)
-    df_top10 = df_top10.sort_values("Traded Value", ascending=False).head(10)
-    # Format numbers
-    df_top10['Last Price'] = df_top10['Last Price'].apply(lambda x: format_number(x, 2))
-    df_top10['Last Volume'] = df_top10['Last Volume'].apply(lambda x: format_number(x, 0))
-    df_top10['Traded Value'] = df_top10['Traded Value'].apply(lambda x: format_number(x, 2))
-    df_top10['Avg Vol (40)'] = df_top10['Avg Vol (40)'].apply(lambda x: format_number(x, 0))
-    st.subheader("🔥 Top 10 Most Active Stocks (by 5-min Traded Value)")
-    st.dataframe(df_top10.reset_index(drop=True))
+        # --------- Relative Strength + Signal (top 10 only) ---------
+        if ticker in rel_leaders:
+            for func, strat_name in [
+                (mean_reversion_signal, "Mean Reversion"),
+                (ema40_breakout_signal, "EMA40 Breakout"),
+                (macd_ema_signal, "MACD+EMA")
+            ]:
+                sig, reason, score = func(df)
+                if sig:
+                    entry = close_price
+                    shares = int(capital_per_trade // entry)
+                    invested = shares * entry
+                    results_rel.append({
+                        "Ticker": ticker,
+                        "Strategy": strat_name,
+                        "AI Score": float(f"{score:.2f}"),
+                        "Entry Price (5m close)": entry,
+                        "Live Price (info)": live_price if live_price else "-",
+                        "Capital Used": invested,
+                        "Shares": shares,
+                        "Reason": f"RelStrength: {reason}",
+                        "Volume": volume_now,
+                        "Avg Vol (40)": int(avgvol40),
+                        "RSI(3)": float(safe_scalar(last['RSI3'])),
+                        "EMA40": float(safe_scalar(last['EMA40'])),
+                        "SMA40": float(safe_scalar(last['SMA40']))
+                    })
 
-# --- Main AI picks output ---
-df_results = pd.DataFrame(results)
-st.header("AI-Powered Top 3 Intraday Stock Picks (S&P 100)")
+        # --------- Catalyst/Gap+Volume (daily) ---------
+        dfd = yf.download(ticker, period='3d', interval='1d', progress=False)
+        if not dfd.empty and len(dfd) >= 2:
+            sig, reason, score = catalyst_gap_signal(dfd)
+            if sig:
+                today = dfd.iloc[-1]
+                entry = float(today['Open'])
+                shares = int(capital_per_trade // entry)
+                invested = shares * entry
+                results_catalyst.append({
+                    "Ticker": ticker,
+                    "Strategy": "Gap+Volume",
+                    "AI Score": float(f"{score:.2f}"),
+                    "Entry Price (gap)": entry,
+                    "Live Price (info)": live_price if live_price else "-",
+                    "Capital Used": invested,
+                    "Shares": shares,
+                    "Reason": reason,
+                    "Volume": int(today['Volume']),
+                    "Avg Vol (20d)": int(dfd['Volume'][-20:].mean()),
+                    "Gap %": round(100*(today['Open']/dfd.iloc[-2]['Close']-1),2)
+                })
 
-if not df_results.empty:
-    df_results = df_results.sort_values(["AI Score", "Strategy", "RSI(3)"], ascending=[False, True, True]).reset_index(drop=True)
-    df_results.insert(0, "Rank", df_results.index + 1)
-    # Format numbers for display
-    for col in ["Entry Price", "Capital Used", "RSI(3)", "EMA40", "SMA40", "AI Score"]:
-        df_results[col] = df_results[col].apply(lambda x: format_number(x, 2))
-    for col in ["Volume", "Avg Vol (40)", "Shares"]:
-        df_results[col] = df_results[col].apply(lambda x: format_number(x, 0))
-    st.dataframe(df_results[[
-        "Rank","Ticker","Entry Price","Strategy","AI Score",
-        "Mean Reversion","EMA40 Breakout","MACD+EMA","Reason","Capital Used","Shares","RSI(3)","Volume","Avg Vol (40)","EMA40","SMA40"
-    ]], use_container_width=True)
-
-    # --- Top 3 Recommendations (sorted by AI Score) ---
-    top3 = df_results.head(3)
-    st.subheader("📈 Today's AI Stock Recommendations")
-    telegram_messages = []
-    gsheet_rows = []
-    for idx, row in top3.iterrows():
-        entry = float(str(row['Entry Price']).replace(",",""))
-        target_price = round(entry * 1.02, 2)
-        cut_loss_price = round(entry * 0.99, 2)
-        now_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        strategy_list = []
-        if row["Mean Reversion"]: strategy_list.append("Mean Reversion")
-        if row["EMA40 Breakout"]: strategy_list.append("EMA40 Breakout")
-        if row["MACD+EMA"]: strategy_list.append("MACD+EMA")
-        triggered_strat = ", ".join(strategy_list) if strategy_list else row["Strategy"]
-
-        msg = (
-            f"🔥AI Pick #{idx+1}: {row['Ticker']}\n"
-            f"Entry Price: ${format_number(entry,2)}\n"
-            f"Target Price (+2%): ${format_number(target_price,2)}\n"
-            f"Cut Loss (-1%): ${format_number(cut_loss_price,2)}\n"
-            f"Reason: {row['Reason']}\n"
-            f"Strategy: {triggered_strat}\n"
-            f"AI Score: {row['AI Score']}\n"
-            f"Time: {now_time}"
-        )
-        telegram_messages.append(msg)
-        gsheet_rows.append([
-            now_time, row['Ticker'], format_number(entry,2), format_number(target_price,2), format_number(cut_loss_price,2),
-            triggered_strat, row['AI Score'], row['Reason']
-        ])
-
-        # Show in dashboard
-        rank_emoji = "🥇" if idx==0 else ("🥈" if idx==1 else "🥉")
-        st.markdown(f"""
-        {rank_emoji} **Rank #{idx+1}: {row['Ticker']}**  
-        **Signal(s):** {triggered_strat}  
-        **AI Confidence Score:** {row['AI Score']}  
-        **Reason:** {row['Reason']}  
-        **Entry Price:** ${format_number(entry,2)} | **Target:** ${format_number(target_price,2)} | **Cut Loss:** ${format_number(cut_loss_price,2)}  
-        **RSI(3):** {row['RSI(3)']} | **EMA40:** {row['EMA40']} | **SMA40:** {row['SMA40']} | **Vol:** {row['Volume']}
-        """)
-        if idx == 0:
-            st.info("Rank #1: Highest confidence and strongest signal based on all indicators and strategy score. Most potential for intraday growth today.")
-        elif idx == 1:
-            st.info("Rank #2: Good signal, but a bit less compelling than #1. Still has solid edge today.")
-        elif idx == 2:
-            st.info("Rank #3: Valid setup, but less optimal than #1 or #2 based on strategy and indicator strength.")
-
-    # --- Send Telegram Alerts ---
-    for msg in telegram_messages:
-        send_telegram_alert(msg)
-    # --- Log to Google Sheets ---
-    append_to_gsheet(gsheet_rows)
-else:
-    st.info("No stocks meet your filter/strategy criteria right now.")
-
-st.caption("Each recommendation above is ranked by a composite confidence score. Top 10 active stocks are shown for general market activity reference.")
-
-# ---------------- SWING TRADE SECTION (1d, EMA200 breakout) ----------------
-st.header("📈 Swing Trade Picks: EMA200 Breakout Strategy (S&P 100)")
-
-swing_results = []
-swing_min_volume = 500000  # or make this a sidebar input if you want!
-
-for ticker in sp100:
-    try:
-        df = yf.download(ticker, period="1y", interval="1d", progress=False)
-        if df.empty or len(df) < 210:  # Need 200+ days for good EMA200
-            continue
-        df['EMA200'] = df['Close'].ewm(span=200, min_periods=200).mean()
-        df['VolumeAvg20'] = df['Volume'].rolling(20).mean()
-        today = df.iloc[-1]
-        prev = df.iloc[-2]
-        # --- ENTRY LOGIC ---
+        # --------- Swing (EMA200 breakout, daily) ---------
+        dfd = yf.download(ticker, period="1y", interval="1d", progress=False)
+        if dfd.empty or len(dfd) < 210: continue
+        dfd['EMA200'] = dfd['Close'].ewm(span=200, min_periods=200).mean()
+        dfd['VolumeAvg20'] = dfd['Volume'].rolling(20).mean()
+        today = dfd.iloc[-1]
+        prev = dfd.iloc[-2]
         price_crossed = prev['Close'] < prev['EMA200'] and today['Close'] > today['EMA200']
-        volume_confirm = today['Volume'] > 1.2 * today['VolumeAvg20']  # 20%+ above avg
-        if price_crossed and volume_confirm and today['Volume'] > swing_min_volume:
+        volume_confirm = today['Volume'] > 1.2 * today['VolumeAvg20']
+        if price_crossed and volume_confirm and today['Volume'] > 500000:
             entry = today['Close']
             ema200 = today['EMA200']
             target = round(entry * 1.04, 2)   # +4% target
             stop = round(entry * 0.98, 2)     # -2% stop
-            swing_results.append({
+            results_swing.append({
                 "Date": today.name.strftime("%Y-%m-%d"),
                 "Ticker": ticker,
                 "Entry Price": entry,
+                "Live Price (info)": live_price if live_price else "-",
                 "EMA200": ema200,
                 "Target Price": target,
                 "Stop Loss": stop,
                 "Volume": int(today['Volume']),
-                "VolumeAvg20": int(today['VolumeAvg20'])
+                "VolumeAvg20": int(today['VolumeAvg20']),
+                "Reason": "EMA200 Breakout + Volume"
             })
-    except Exception as e:
-        pass
 
-if swing_results:
-    df_swing = pd.DataFrame(swing_results).sort_values("Volume", ascending=False)
-    # Format numbers
-    for col in ["Entry Price", "EMA200", "Target Price", "Stop Loss"]:
+    except Exception as e:
+        continue
+
+# --------------- DASHBOARD OUTPUT ---------------
+
+def show_top_section(results, title, entry_col):
+    if results:
+        df = pd.DataFrame(results)
+        df = df.sort_values(["AI Score"], ascending=False).head(3).reset_index(drop=True)
+        df.insert(0, "Rank", df.index+1)
+        for col in ["Entry Price (5m close)", "Live Price (info)", "EMA40", "SMA40", "RSI(3)", "AI Score"]:
+            if col in df:
+                df[col] = df[col].apply(lambda x: format_number(x,2))
+        for col in ["Volume", "Avg Vol (40)", "Shares", "VolumeAvg20"]:
+            if col in df:
+                df[col] = df[col].apply(lambda x: format_number(x,0))
+        st.subheader(title)
+        st.dataframe(df, use_container_width=True)
+
+        # --- Send top 3 to Telegram & Google Sheet ---
+        eastern = pytz.timezone("US/Eastern")
+        now_et = datetime.now(pytz.utc).astimezone(eastern)
+        now_time = now_et.strftime('%Y-%m-%d %H:%M:%S %Z')
+        telegram_msgs, gsheet_rows = [], []
+        for idx, row in df.iterrows():
+            entry = float(str(row[entry_col]).replace(",",""))
+            target_price = round(entry * 1.02, 2)
+            cut_loss_price = round(entry * 0.99, 2)
+            msg = (
+                f"#{title}\nRank #{row['Rank']}: {row['Ticker']}\n"
+                f"Entry: ${row[entry_col]} | Live: {row['Live Price (info)']}\n"
+                f"Target: ${format_number(target_price,2)} | Stop: ${format_number(cut_loss_price,2)}\n"
+                f"Reason: {row['Reason']}\n"
+                f"Time: {now_time}"
+            )
+            telegram_msgs.append(msg)
+            gsheet_rows.append([
+                now_time, row['Ticker'], format_number(entry,2), format_number(target_price,2), format_number(cut_loss_price,2),
+                row.get('Strategy', ''), row.get('AI Score', ''), row.get('Reason', '')
+            ])
+        for msg in telegram_msgs:
+            send_telegram_alert(msg)
+        append_to_gsheet(gsheet_rows)
+    else:
+        st.info(f"No stocks meet {title} criteria right now.")
+
+show_top_section(results_intraday, "Intraday AI Strategies (5m, Filtered)", "Entry Price (5m close)")
+show_top_section(results_rel, "Relative Strength Leaders: Top Signals", "Entry Price (5m close)")
+show_top_section(results_catalyst, "Catalyst/Gaps: Top Gap+Volume Picks", "Entry Price (gap)")
+
+# --------- SWING SECTION (Daily EMA200) ---------
+if results_swing:
+    df_swing = pd.DataFrame(results_swing).sort_values("Volume", ascending=False).head(3)
+    for col in ["Entry Price", "Live Price (info)", "EMA200", "Target Price", "Stop Loss"]:
         df_swing[col] = df_swing[col].apply(lambda x: format_number(x, 2))
     for col in ["Volume", "VolumeAvg20"]:
         df_swing[col] = df_swing[col].apply(lambda x: format_number(x, 0))
-    st.dataframe(df_swing[[
-        "Date", "Ticker", "Entry Price", "EMA200", "Target Price", "Stop Loss", "Volume", "VolumeAvg20"
-    ]], use_container_width=True)
-    st.info("These are swing trade signals—intended for 3–5 day holds with +4% target, -2% stop. Only triggers when price breaks above EMA200 with strong volume.")
+    st.subheader("Swing Picks (EMA200 Breakout, Daily)")
+    st.dataframe(df_swing.reset_index(drop=True), use_container_width=True)
+    # log to Telegram & Google Sheets
+    eastern = pytz.timezone("US/Eastern")
+    now_et = datetime.now(pytz.utc).astimezone(eastern)
+    now_time = now_et.strftime('%Y-%m-%d %H:%M:%S %Z')
+    swing_msgs, swing_rows = [], []
+    for idx, row in df_swing.iterrows():
+        entry = float(str(row['Entry Price']).replace(",", ""))
+        target_price = float(str(row['Target Price']).replace(",", ""))
+        stop_price = float(str(row['Stop Loss']).replace(",", ""))
+        msg = (
+            f"#SwingPicks\n{row['Date']} {row['Ticker']} Entry: ${row['Entry Price']} | Live: {row['Live Price (info)']}\n"
+            f"Target: ${row['Target Price']} | Stop: ${row['Stop Loss']}\n"
+            f"Reason: {row['Reason']}\n"
+            f"Time: {now_time}"
+        )
+        swing_msgs.append(msg)
+        swing_rows.append([
+            now_time, row['Ticker'], row['Entry Price'], row['Target Price'], row['Stop Loss'],
+            "EMA200 Breakout + Volume", "", row['Reason']
+        ])
+    for msg in swing_msgs:
+        send_telegram_alert(msg)
+    append_to_gsheet(swing_rows)
 else:
-    st.warning("No swing trade setups found in S&P 100 today (signals are rare, but high quality).")
+    st.info("No swing trade setups found today.")
