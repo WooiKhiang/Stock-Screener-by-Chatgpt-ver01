@@ -225,11 +225,16 @@ def get_relative_strength_leaders():
             prices = yf.download(ticker, period='6d', interval='1d', progress=False)['Close']
             if len(prices) < 5 or len(base) < 5:
                 continue
-            rel = prices[-5:].pct_change().sum() - base[-5:].pct_change().sum()
+            # Align indices and ensure both are Series of length 5
+            prices = prices[-5:]
+            base_aligned = base[-5:]
+            rel = float(prices.pct_change().sum() - base_aligned.pct_change().sum())
             leaders.append((ticker, rel))
             time.sleep(0.1)  # avoid rate limit
-        except Exception:
+        except Exception as e:
             continue
+    # Keep only good floats (not NaN)
+    leaders = [x for x in leaders if isinstance(x[1], float) and not np.isnan(x[1])]
     leaders.sort(key=lambda x: -x[1])
     return [x[0] for x in leaders[:10]]
 
