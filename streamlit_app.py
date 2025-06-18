@@ -83,39 +83,21 @@ def mean_reversion_signal(df):
     c = float(safe_scalar(df['Close'].iloc[-1]))
     sma = float(safe_scalar(df['SMA40'].iloc[-1]))
     rsi = float(safe_scalar(df['RSI3'].iloc[-1]))
-    vol = float(safe_scalar(df['Volume'].iloc[-1]))
-    avgvol = float(safe_scalar(df['AvgVol40'].iloc[-1]))
-    atr = float(safe_scalar(df['ATR'].iloc[-1]))
-    bar_range = float(safe_scalar(df['Close'].iloc[-1] - df['Close'].iloc[-2]))
-    hour = pd.Timestamp(df.index[-1]).tz_localize("UTC").tz_convert("America/New_York").hour
-    # filter: main market hours, high volume, bar range > 0.5 * ATR
-    cond = (
-        (c > sma) and (rsi < 15) and
-        (vol > 1.5 * avgvol) and
-        (abs(bar_range) > 0.5 * atr if not np.isnan(atr) else True) and
-        (10 <= hour <= 15)
-    )
+    # DEBUG: All filters removed except basic signal
+    cond = (c > sma) and (rsi < 15)
     score = 75 + max(0, 15 - rsi) if cond else 0
-    return bool(cond), "Mean Reversion: Price > SMA40 & RSI(3)<15 (volume, ATR, time filter)", float(f"{score:.2f}")
+    return bool(cond), "DEBUG: Mean Reversion (no filter)", float(f"{score:.2f}")
 
 def ema40_breakout_signal(df):
     c = float(safe_scalar(df['Close'].iloc[-1]))
     ema = float(safe_scalar(df['EMA40'].iloc[-1]))
     pc = float(safe_scalar(df['Close'].iloc[-2]))
     pema = float(safe_scalar(df['EMA40'].iloc[-2]))
-    vol = float(safe_scalar(df['Volume'].iloc[-1]))
-    avgvol = float(safe_scalar(df['AvgVol40'].iloc[-1]))
-    atr = float(safe_scalar(df['ATR'].iloc[-1]))
-    hour = pd.Timestamp(df.index[-1]).tz_localize("UTC").tz_convert("America/New_York").hour
     dipped = np.any(df['Close'].iloc[-10:-1] < df['EMA40'].iloc[-10:-1])
-    cond = (
-        (c > ema) and ((pc < pema) or dipped) and
-        (vol > 1.5 * avgvol) and
-        (abs(c - pc) > 0.5 * atr if not np.isnan(atr) else True) and
-        (10 <= hour <= 15)
-    )
+    # DEBUG: All filters removed except basic signal
+    cond = (c > ema) and ((pc < pema) or dipped)
     score = 70 + min(20, c - ema) if cond else 0
-    return bool(cond), "EMA40 Breakout (with filter)", float(f"{score:.2f}")
+    return bool(cond), "DEBUG: EMA40 Breakout (no filter)", float(f"{score:.2f}")
 
 def macd_ema_signal(df):
     macd = float(safe_scalar(df['MACD'].iloc[-1]))
@@ -124,19 +106,11 @@ def macd_ema_signal(df):
     macd_signal_prev = float(safe_scalar(df['MACD_signal'].iloc[-2]))
     ema8 = float(safe_scalar(df['EMA8'].iloc[-1]))
     ema21 = float(safe_scalar(df['EMA21'].iloc[-1]))
-    vol = float(safe_scalar(df['Volume'].iloc[-1]))
-    avgvol = float(safe_scalar(df['AvgVol40'].iloc[-1]))
-    atr = float(safe_scalar(df['ATR'].iloc[-1]))
-    hour = pd.Timestamp(df.index[-1]).tz_localize("UTC").tz_convert("America/New_York").hour
+    # DEBUG: All filters removed except basic signal
     cross = (macd_prev < macd_signal_prev) and (macd > macd_signal) and (macd < 0)
-    cond = (
-        cross and (ema8 > ema21) and
-        (vol > 1.5 * avgvol) and
-        (abs(macd - macd_prev) > 0.25 * atr if not np.isnan(atr) else True) and
-        (10 <= hour <= 15)
-    )
+    cond = cross and (ema8 > ema21)
     score = 65 + int(abs(macd)*5) if cond else 0
-    return bool(cond), "MACD+EMA (with filter)", float(f"{score:.2f}")
+    return bool(cond), "DEBUG: MACD+EMA (no filter)", float(f"{score:.2f}")
 
 def get_gspread_client_from_secrets():
     info = st.secrets["gcp_service_account"]
