@@ -155,8 +155,8 @@ def get_market_status():
         return f"Market Open ({now_et.strftime('%I:%M %p %Z')})"
 
 def get_market_sentiment():
-    spy = normalize_df_cols(yf.download('SPY', period='1d', interval='5m', progress=False))
-    qqq = normalize_df_cols(yf.download('QQQ', period='1d', interval='5m', progress=False))
+    spy = normalize_df_cols(yf.download('SPY', period='1d', interval='5m', progress=False, threads=False))
+    qqq = normalize_df_cols(yf.download('QQQ', period='1d', interval='5m', progress=False, threads=False))
     try:
         if spy.empty or qqq.empty:
             return "Market sentiment unavailable (data missing)"
@@ -182,7 +182,7 @@ st.subheader("Raw Data Sanity Check (Today, Last 5m bar)")
 debug_rows = []
 for ticker in sp100[:20]:
     try:
-        df = normalize_df_cols(yf.download(ticker, period="1d", interval="5m", progress=False))
+        df = normalize_df_cols(yf.download(ticker, period="1d", interval="5m", progress=False, threads=False))
         if df.empty:
             debug_rows.append({"Ticker": ticker, "Status": "EMPTY"})
         else:
@@ -219,7 +219,7 @@ st.subheader("Top 10 Most Active S&P 100 Stocks Today (5m data)")
 active_rows = []
 for ticker in sp100:
     try:
-        df = normalize_df_cols(yf.download(ticker, period="1d", interval="5m", progress=False))
+        df = normalize_df_cols(yf.download(ticker, period="1d", interval="5m", progress=False, threads=False))
         if df.empty or len(df) < 2:
             continue
         vol = int(df['volume'].sum())
@@ -263,11 +263,11 @@ else:
 
 # --------- Relative Strength Leaders (Top 10) ---------
 def get_relative_strength_leaders():
-    base = normalize_df_cols(yf.download('SPY', period='6d', interval='1d', progress=False))['close']
+    base = normalize_df_cols(yf.download('SPY', period='6d', interval='1d', progress=False, threads=False))['close']
     leaders = []
     for ticker in sp100:
         try:
-            prices = normalize_df_cols(yf.download(ticker, period='6d', interval='1d', progress=False))['close']
+            prices = normalize_df_cols(yf.download(ticker, period='6d', interval='1d', progress=False, threads=False))['close']
             if len(prices) < 5 or len(base) < 5:
                 continue
             prices = prices[-5:]
@@ -304,7 +304,7 @@ results_swing = []
 
 for ticker in sp100:
     try:
-        df = normalize_df_cols(yf.download(ticker, period="5d", interval="5m", progress=False))
+        df = normalize_df_cols(yf.download(ticker, period="5d", interval="5m", progress=False, threads=False))
         if df.empty or len(df) < 50:
             continue
         df = calc_indicators(df)
@@ -349,7 +349,6 @@ for ticker in sp100:
                 "SMA40": float(safe_scalar(last['sma40']))
             })
 
-        # --------- Relative Strength + Signal (top 10 only) ---------
         if ticker in rel_leaders:
             for func, strat_name in [
                 (mean_reversion_signal, "Mean Reversion"),
@@ -376,7 +375,7 @@ for ticker in sp100:
                         "SMA40": float(safe_scalar(last['sma40']))
                     })
 
-        dfd = normalize_df_cols(yf.download(ticker, period='3d', interval='1d', progress=False))
+        dfd = normalize_df_cols(yf.download(ticker, period='3d', interval='1d', progress=False, threads=False))
         if not dfd.empty and len(dfd) >= 2:
             sig, reason, score = catalyst_gap_signal(dfd)
             if sig:
@@ -397,7 +396,7 @@ for ticker in sp100:
                     "Gap %": round(100*(today['open']/dfd.iloc[-2]['close']-1),2)
                 })
 
-        dfd = normalize_df_cols(yf.download(ticker, period="1y", interval="1d", progress=False))
+        dfd = normalize_df_cols(yf.download(ticker, period="1y", interval="1d", progress=False, threads=False))
         if dfd.empty or len(dfd) < 210: continue
         dfd['ema200'] = dfd['close'].ewm(span=200, min_periods=200).mean()
         dfd['volumeavg20'] = dfd['volume'].rolling(20).mean()
