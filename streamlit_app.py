@@ -10,7 +10,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json
 import time
 
-# --- S&P 100 DEFINITION: Always define this first!
+# --- S&P 100 DEFINITION
 sp100 = [
     'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO',
     'AXP','BA','BAC','BK','BKNG','BLK','BMY','BRK-B','C','CAT',
@@ -30,6 +30,12 @@ TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
 TELEGRAM_CHAT_ID = "713264762"
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "Sheet1"
+
+def flatten_df(df):
+    """Ensure columns are always flat (not MultiIndex)"""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [str(c[-1]) if isinstance(c, tuple) else str(c) for c in df.columns]
+    return df
 
 def format_number(num, decimals=2):
     try:
@@ -148,8 +154,8 @@ def get_market_status():
         return f"Market Open ({now_et.strftime('%I:%M %p %Z')})"
 
 def get_market_sentiment():
-    spy = yf.download('SPY', period='1d', interval='5m', progress=False)
-    qqq = yf.download('QQQ', period='1d', interval='5m', progress=False)
+    spy = flatten_df(yf.download('SPY', period='1d', interval='5m', progress=False))
+    qqq = flatten_df(yf.download('QQQ', period='1d', interval='5m', progress=False))
     try:
         if spy.empty or qqq.empty:
             return "Market sentiment unavailable (data missing)"
@@ -173,9 +179,9 @@ def get_market_sentiment():
 # --- Debug: Raw Data Check ---
 st.subheader("Raw Data Sanity Check (Today, Last 5m bar)")
 debug_rows = []
-for ticker in sp100[:20]:  # Just first 20 to avoid slowness
+for ticker in sp100[:20]:
     try:
-        df = yf.download(ticker, period="1d", interval="5m", progress=False)
+        df = flatten_df(yf.download(ticker, period="1d", interval="5m", progress=False))
         if df.empty:
             debug_rows.append({"Ticker": ticker, "Status": "EMPTY"})
         else:
@@ -212,7 +218,7 @@ st.subheader("Top 10 Most Active S&P 100 Stocks Today (5m data)")
 active_rows = []
 for ticker in sp100:
     try:
-        df = yf.download(ticker, period="1d", interval="5m", progress=False)
+        df = flatten_df(yf.download(ticker, period="1d", interval="5m", progress=False))
         if df.empty or len(df) < 2:
             continue
         vol = int(df['Volume'].sum())
@@ -256,11 +262,11 @@ else:
 
 # --------- Relative Strength Leaders (Top 10) ---------
 def get_relative_strength_leaders():
-    base = yf.download('SPY', period='6d', interval='1d', progress=False)['Close']
+    base = flatten_df(yf.download('SPY', period='6d', interval='1d', progress=False))['Close']
     leaders = []
     for ticker in sp100:
         try:
-            prices = yf.download(ticker, period='6d', interval='1d', progress=False)['Close']
+            prices = flatten_df(yf.download(ticker, period='6d', interval='1d', progress=False))['Close']
             if len(prices) < 5 or len(base) < 5:
                 continue
             prices = prices[-5:]
@@ -268,7 +274,7 @@ def get_relative_strength_leaders():
             rel = float(prices.pct_change().sum() - base_aligned.pct_change().sum())
             leaders.append((ticker, rel))
             time.sleep(0.1)
-        except Exception as e:
+        except Exception:
             continue
     leaders = [x for x in leaders if isinstance(x[1], float) and not np.isnan(x[1])]
     leaders.sort(key=lambda x: -x[1])
@@ -297,7 +303,7 @@ results_swing = []
 
 for ticker in sp100:
     try:
-        df = yf.download(ticker, period="5d", interval="5m", progress=False)
+        df = flatten_df(yf.download(ticker, period="5d", interval="5m", progress=False))
         if df.empty or len(df) < 50:
             continue
         df = calc_indicators(df)
@@ -342,6 +348,7 @@ for ticker in sp100:
                 "SMA40": float(safe_scalar(last['SMA40']))
             })
 
+        # --------- Relative Strength + Signal (top 10 only) ---------
         if ticker in rel_leaders:
             for func, strat_name in [
                 (mean_reversion_signal, "Mean Reversion"),
@@ -368,7 +375,7 @@ for ticker in sp100:
                         "SMA40": float(safe_scalar(last['SMA40']))
                     })
 
-        dfd = yf.download(ticker, period='3d', interval='1d', progress=False)
+        dfd = flatten_df(yf.download(ticker, period='3d', interval='1d', progress=False))
         if not dfd.empty and len(dfd) >= 2:
             sig, reason, score = catalyst_gap_signal(dfd)
             if sig:
@@ -389,7 +396,7 @@ for ticker in sp100:
                     "Gap %": round(100*(today['Open']/dfd.iloc[-2]['Close']-1),2)
                 })
 
-        dfd = yf.download(ticker, period="1y", interval="1d", progress=False)
+        dfd = flatten_df(yf.download(ticker, period="1y", interval="1d", progress=False))
         if dfd.empty or len(dfd) < 210: continue
         dfd['EMA200'] = dfd['Close'].ewm(span=200, min_periods=200).mean()
         dfd['VolumeAvg20'] = dfd['Volume'].rolling(20).mean()
