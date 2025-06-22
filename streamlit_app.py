@@ -38,6 +38,20 @@ def normalize_df_cols(df):
         df.columns = [str(c).lower() for c in df.columns]
     return df
 
+def get_close_column(df):
+    # Try 'close', 'adj close', or fallback to the first column with 'close' in it
+    cols = [col.lower() for col in df.columns]
+    if 'close' in cols:
+        return df[df.columns[cols.index('close')]]
+    elif 'adj close' in cols:
+        return df[df.columns[cols.index('adj close')]]
+    else:
+        close_candidates = [col for col in df.columns if 'close' in col.lower()]
+        if close_candidates:
+            return df[close_candidates[0]]
+        else:
+            raise KeyError("No close column found!")
+
 def format_number(num, decimals=2):
     try:
         if num is None or num == "" or np.isnan(num): return "-"
@@ -160,10 +174,10 @@ def get_market_sentiment():
     try:
         if spy.empty or qqq.empty:
             return "Market sentiment unavailable (data missing)"
-        spy_open = spy['open'].iloc[0]
-        spy_last = spy['close'].iloc[-1]
-        qqq_open = qqq['open'].iloc[0]
-        qqq_last = qqq['close'].iloc[-1]
+        spy_open = get_close_column(spy).iloc[0]
+        spy_last = get_close_column(spy).iloc[-1]
+        qqq_open = get_close_column(qqq).iloc[0]
+        qqq_last = get_close_column(qqq).iloc[-1]
         spy_pct = float(spy_last - spy_open) / float(spy_open) * 100
         qqq_pct = float(qqq_last - qqq_open) / float(qqq_open) * 100
         avg_pct = (spy_pct + qqq_pct) / 2
@@ -263,11 +277,23 @@ else:
 
 # --------- Relative Strength Leaders (Top 10) ---------
 def get_relative_strength_leaders():
-    base = normalize_df_cols(yf.download('SPY', period='6d', interval='1d', progress=False, threads=False))['close']
+    base_df = normalize_df_cols(yf.download('SPY', period='6d', interval='1d', progress=False, threads=False))
+    if base_df.empty:
+        return []
+    try:
+        base = get_close_column(base_df)
+    except Exception as e:
+        return []
     leaders = []
     for ticker in sp100:
         try:
-            prices = normalize_df_cols(yf.download(ticker, period='6d', interval='1d', progress=False, threads=False))['close']
+            dfp = normalize_df_cols(yf.download(ticker, period='6d', interval='1d', progress=False, threads=False))
+            if dfp.empty:
+                continue
+            try:
+                prices = get_close_column(dfp)
+            except Exception:
+                continue
             if len(prices) < 5 or len(base) < 5:
                 continue
             prices = prices[-5:]
