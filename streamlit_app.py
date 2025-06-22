@@ -31,10 +31,11 @@ TELEGRAM_CHAT_ID = "713264762"
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "Sheet1"
 
-def flatten_df(df):
-    """Ensure columns are always flat (not MultiIndex)"""
+def normalize_df_cols(df):
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [str(c[-1]) if isinstance(c, tuple) else str(c) for c in df.columns]
+        df.columns = [c[-1].lower() if isinstance(c, tuple) else str(c).lower() for c in df.columns]
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
     return df
 
 def format_number(num, decimals=2):
@@ -60,50 +61,50 @@ def safe_scalar(val):
         return np.nan
 
 def calc_indicators(df):
-    df['SMA40'] = df['Close'].rolling(window=40).mean()
-    df['EMA40'] = df['Close'].ewm(span=40, min_periods=40).mean()
-    df['EMA8'] = df['Close'].ewm(span=8, min_periods=8).mean()
-    df['EMA21'] = df['Close'].ewm(span=21, min_periods=21).mean()
-    delta = df['Close'].diff()
+    df['sma40'] = df['close'].rolling(window=40).mean()
+    df['ema40'] = df['close'].ewm(span=40, min_periods=40).mean()
+    df['ema8'] = df['close'].ewm(span=8, min_periods=8).mean()
+    df['ema21'] = df['close'].ewm(span=21, min_periods=21).mean()
+    delta = df['close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
     roll_up = up.rolling(window=3).mean()
     roll_down = down.rolling(window=3).mean()
     rs = roll_up / (roll_down + 1e-9)
-    df['RSI3'] = 100 - (100 / (1 + rs))
-    ema12 = df['Close'].ewm(span=12, min_periods=12).mean()
-    ema26 = df['Close'].ewm(span=26, min_periods=26).mean()
-    df['MACD'] = ema12 - ema26
-    df['MACD_signal'] = df['MACD'].ewm(span=9, min_periods=9).mean()
-    df['AvgVol40'] = df['Volume'].replace(0, np.nan).rolling(window=40, min_periods=1).mean().fillna(0)
-    df['ATR'] = df['Close'].rolling(14).apply(lambda x: np.mean(np.abs(np.diff(x))), raw=True)
+    df['rsi3'] = 100 - (100 / (1 + rs))
+    ema12 = df['close'].ewm(span=12, min_periods=12).mean()
+    ema26 = df['close'].ewm(span=26, min_periods=26).mean()
+    df['macd'] = ema12 - ema26
+    df['macd_signal'] = df['macd'].ewm(span=9, min_periods=9).mean()
+    df['avgvol40'] = df['volume'].replace(0, np.nan).rolling(window=40, min_periods=1).mean().fillna(0)
+    df['atr'] = df['close'].rolling(14).apply(lambda x: np.mean(np.abs(np.diff(x))), raw=True)
     return df
 
 def mean_reversion_signal(df):
-    c = float(safe_scalar(df['Close'].iloc[-1]))
-    sma = float(safe_scalar(df['SMA40'].iloc[-1]))
-    rsi = float(safe_scalar(df['RSI3'].iloc[-1]))
+    c = float(safe_scalar(df['close'].iloc[-1]))
+    sma = float(safe_scalar(df['sma40'].iloc[-1]))
+    rsi = float(safe_scalar(df['rsi3'].iloc[-1]))
     cond = (c > sma) and (rsi < 15)
     score = 75 + max(0, 15 - rsi) if cond else 0
     return bool(cond), "DEBUG: Mean Reversion (no filter)", float(f"{score:.2f}")
 
 def ema40_breakout_signal(df):
-    c = float(safe_scalar(df['Close'].iloc[-1]))
-    ema = float(safe_scalar(df['EMA40'].iloc[-1]))
-    pc = float(safe_scalar(df['Close'].iloc[-2]))
-    pema = float(safe_scalar(df['EMA40'].iloc[-2]))
-    dipped = np.any(df['Close'].iloc[-10:-1] < df['EMA40'].iloc[-10:-1])
+    c = float(safe_scalar(df['close'].iloc[-1]))
+    ema = float(safe_scalar(df['ema40'].iloc[-1]))
+    pc = float(safe_scalar(df['close'].iloc[-2]))
+    pema = float(safe_scalar(df['ema40'].iloc[-2]))
+    dipped = np.any(df['close'].iloc[-10:-1] < df['ema40'].iloc[-10:-1])
     cond = (c > ema) and ((pc < pema) or dipped)
     score = 70 + min(20, c - ema) if cond else 0
     return bool(cond), "DEBUG: EMA40 Breakout (no filter)", float(f"{score:.2f}")
 
 def macd_ema_signal(df):
-    macd = float(safe_scalar(df['MACD'].iloc[-1]))
-    macd_signal = float(safe_scalar(df['MACD_signal'].iloc[-1]))
-    macd_prev = float(safe_scalar(df['MACD'].iloc[-2]))
-    macd_signal_prev = float(safe_scalar(df['MACD_signal'].iloc[-2]))
-    ema8 = float(safe_scalar(df['EMA8'].iloc[-1]))
-    ema21 = float(safe_scalar(df['EMA21'].iloc[-1]))
+    macd = float(safe_scalar(df['macd'].iloc[-1]))
+    macd_signal = float(safe_scalar(df['macd_signal'].iloc[-1]))
+    macd_prev = float(safe_scalar(df['macd'].iloc[-2]))
+    macd_signal_prev = float(safe_scalar(df['macd_signal'].iloc[-2]))
+    ema8 = float(safe_scalar(df['ema8'].iloc[-1]))
+    ema21 = float(safe_scalar(df['ema21'].iloc[-1]))
     cross = (macd_prev < macd_signal_prev) and (macd > macd_signal) and (macd < 0)
     cond = cross and (ema8 > ema21)
     score = 65 + int(abs(macd)*5) if cond else 0
@@ -154,15 +155,15 @@ def get_market_status():
         return f"Market Open ({now_et.strftime('%I:%M %p %Z')})"
 
 def get_market_sentiment():
-    spy = flatten_df(yf.download('SPY', period='1d', interval='5m', progress=False))
-    qqq = flatten_df(yf.download('QQQ', period='1d', interval='5m', progress=False))
+    spy = normalize_df_cols(yf.download('SPY', period='1d', interval='5m', progress=False))
+    qqq = normalize_df_cols(yf.download('QQQ', period='1d', interval='5m', progress=False))
     try:
         if spy.empty or qqq.empty:
             return "Market sentiment unavailable (data missing)"
-        spy_open = spy['Open'].iloc[0]
-        spy_last = spy['Close'].iloc[-1]
-        qqq_open = qqq['Open'].iloc[0]
-        qqq_last = qqq['Close'].iloc[-1]
+        spy_open = spy['open'].iloc[0]
+        spy_last = spy['close'].iloc[-1]
+        qqq_open = qqq['open'].iloc[0]
+        qqq_last = qqq['close'].iloc[-1]
         spy_pct = float(spy_last - spy_open) / float(spy_open) * 100
         qqq_pct = float(qqq_last - qqq_open) / float(qqq_open) * 100
         avg_pct = (spy_pct + qqq_pct) / 2
@@ -181,7 +182,7 @@ st.subheader("Raw Data Sanity Check (Today, Last 5m bar)")
 debug_rows = []
 for ticker in sp100[:20]:
     try:
-        df = flatten_df(yf.download(ticker, period="1d", interval="5m", progress=False))
+        df = normalize_df_cols(yf.download(ticker, period="1d", interval="5m", progress=False))
         if df.empty:
             debug_rows.append({"Ticker": ticker, "Status": "EMPTY"})
         else:
@@ -189,11 +190,11 @@ for ticker in sp100[:20]:
             debug_rows.append({
                 "Ticker": ticker,
                 "Last Time": last.name,
-                "Open": last["Open"],
-                "High": last["High"],
-                "Low": last["Low"],
-                "Close": last["Close"],
-                "Volume": int(last["Volume"])
+                "Open": last["open"],
+                "High": last["high"],
+                "Low": last["low"],
+                "Close": last["close"],
+                "Volume": int(last["volume"])
             })
     except Exception as e:
         debug_rows.append({"Ticker": ticker, "Status": f"Exception: {e}"})
@@ -218,15 +219,15 @@ st.subheader("Top 10 Most Active S&P 100 Stocks Today (5m data)")
 active_rows = []
 for ticker in sp100:
     try:
-        df = flatten_df(yf.download(ticker, period="1d", interval="5m", progress=False))
+        df = normalize_df_cols(yf.download(ticker, period="1d", interval="5m", progress=False))
         if df.empty or len(df) < 2:
             continue
-        vol = int(df['Volume'].sum())
-        open_price = float(df['Open'].iloc[0])
-        last_price = float(df['Close'].iloc[-1])
+        vol = int(df['volume'].sum())
+        open_price = float(df['open'].iloc[0])
+        last_price = float(df['close'].iloc[-1])
         change_pct = 100 * (last_price - open_price) / open_price
         # RSI(14)
-        delta = df['Close'].diff()
+        delta = df['close'].diff()
         up = delta.clip(lower=0)
         down = -1 * delta.clip(upper=0)
         roll_up = up.rolling(14).mean()
@@ -235,8 +236,8 @@ for ticker in sp100:
         rsi14 = 100 - (100 / (1 + rs))
         rsi = float(rsi14.iloc[-1])
         # MACD
-        ema12 = df['Close'].ewm(span=12, min_periods=12).mean()
-        ema26 = df['Close'].ewm(span=26, min_periods=26).mean()
+        ema12 = df['close'].ewm(span=12, min_periods=12).mean()
+        ema26 = df['close'].ewm(span=26, min_periods=26).mean()
         macd = ema12 - ema26
         macd_signal = macd.ewm(span=9, min_periods=9).mean()
         macd_val = float(macd.iloc[-1])
@@ -262,11 +263,11 @@ else:
 
 # --------- Relative Strength Leaders (Top 10) ---------
 def get_relative_strength_leaders():
-    base = flatten_df(yf.download('SPY', period='6d', interval='1d', progress=False))['Close']
+    base = normalize_df_cols(yf.download('SPY', period='6d', interval='1d', progress=False))['close']
     leaders = []
     for ticker in sp100:
         try:
-            prices = flatten_df(yf.download(ticker, period='6d', interval='1d', progress=False))['Close']
+            prices = normalize_df_cols(yf.download(ticker, period='6d', interval='1d', progress=False))['close']
             if len(prices) < 5 or len(base) < 5:
                 continue
             prices = prices[-5:]
@@ -288,9 +289,9 @@ def catalyst_gap_signal(df):
     if len(df) < 2: return False, None, 0
     prev = df.iloc[-2]
     today = df.iloc[-1]
-    gap = (today['Open'] - prev['Close']) / prev['Close']
-    vol = today['Volume']
-    avgvol = df['Volume'].iloc[-20:].mean()
+    gap = (today['open'] - prev['close']) / prev['close']
+    vol = today['volume']
+    avgvol = df['volume'].iloc[-20:].mean()
     cond = (gap > 0.02) and (vol > 2 * avgvol)
     score = 85 if cond else 0
     return bool(cond), "Gap+Volume Breakout (>2% gap up, >2x vol)", float(score)
@@ -303,14 +304,14 @@ results_swing = []
 
 for ticker in sp100:
     try:
-        df = flatten_df(yf.download(ticker, period="5d", interval="5m", progress=False))
+        df = normalize_df_cols(yf.download(ticker, period="5d", interval="5m", progress=False))
         if df.empty or len(df) < 50:
             continue
         df = calc_indicators(df)
         last = df.iloc[-1]
-        close_price = float(safe_scalar(last['Close']))
-        avgvol40 = float(safe_scalar(last['AvgVol40']))
-        volume_now = int(safe_scalar(last['Volume']))
+        close_price = float(safe_scalar(last['close']))
+        avgvol40 = float(safe_scalar(last['avgvol40']))
+        volume_now = int(safe_scalar(last['volume']))
 
         if not (min_price <= close_price <= max_price): continue
         if avgvol40 < min_volume: continue
@@ -343,9 +344,9 @@ for ticker in sp100:
                 "Reason": reason,
                 "Volume": volume_now,
                 "Avg Vol (40)": int(avgvol40),
-                "RSI(3)": float(safe_scalar(last['RSI3'])),
-                "EMA40": float(safe_scalar(last['EMA40'])),
-                "SMA40": float(safe_scalar(last['SMA40']))
+                "RSI(3)": float(safe_scalar(last['rsi3'])),
+                "EMA40": float(safe_scalar(last['ema40'])),
+                "SMA40": float(safe_scalar(last['sma40']))
             })
 
         # --------- Relative Strength + Signal (top 10 only) ---------
@@ -370,17 +371,17 @@ for ticker in sp100:
                         "Reason": f"RelStrength: {reason}",
                         "Volume": volume_now,
                         "Avg Vol (40)": int(avgvol40),
-                        "RSI(3)": float(safe_scalar(last['RSI3'])),
-                        "EMA40": float(safe_scalar(last['EMA40'])),
-                        "SMA40": float(safe_scalar(last['SMA40']))
+                        "RSI(3)": float(safe_scalar(last['rsi3'])),
+                        "EMA40": float(safe_scalar(last['ema40'])),
+                        "SMA40": float(safe_scalar(last['sma40']))
                     })
 
-        dfd = flatten_df(yf.download(ticker, period='3d', interval='1d', progress=False))
+        dfd = normalize_df_cols(yf.download(ticker, period='3d', interval='1d', progress=False))
         if not dfd.empty and len(dfd) >= 2:
             sig, reason, score = catalyst_gap_signal(dfd)
             if sig:
                 today = dfd.iloc[-1]
-                entry = float(today['Open'])
+                entry = float(today['open'])
                 shares = int(capital_per_trade // entry)
                 invested = shares * entry
                 results_catalyst.append({
@@ -391,22 +392,22 @@ for ticker in sp100:
                     "Capital Used": invested,
                     "Shares": shares,
                     "Reason": reason,
-                    "Volume": int(today['Volume']),
-                    "Avg Vol (20d)": int(dfd['Volume'][-20:].mean()),
-                    "Gap %": round(100*(today['Open']/dfd.iloc[-2]['Close']-1),2)
+                    "Volume": int(today['volume']),
+                    "Avg Vol (20d)": int(dfd['volume'][-20:].mean()),
+                    "Gap %": round(100*(today['open']/dfd.iloc[-2]['close']-1),2)
                 })
 
-        dfd = flatten_df(yf.download(ticker, period="1y", interval="1d", progress=False))
+        dfd = normalize_df_cols(yf.download(ticker, period="1y", interval="1d", progress=False))
         if dfd.empty or len(dfd) < 210: continue
-        dfd['EMA200'] = dfd['Close'].ewm(span=200, min_periods=200).mean()
-        dfd['VolumeAvg20'] = dfd['Volume'].rolling(20).mean()
+        dfd['ema200'] = dfd['close'].ewm(span=200, min_periods=200).mean()
+        dfd['volumeavg20'] = dfd['volume'].rolling(20).mean()
         today = dfd.iloc[-1]
         prev = dfd.iloc[-2]
-        price_crossed = prev['Close'] < prev['EMA200'] and today['Close'] > today['EMA200']
-        volume_confirm = today['Volume'] > 1.2 * today['VolumeAvg20']
-        if price_crossed and volume_confirm and today['Volume'] > 500000:
-            entry = today['Close']
-            ema200 = today['EMA200']
+        price_crossed = prev['close'] < prev['ema200'] and today['close'] > today['ema200']
+        volume_confirm = today['volume'] > 1.2 * today['volumeavg20']
+        if price_crossed and volume_confirm and today['volume'] > 500000:
+            entry = today['close']
+            ema200 = today['ema200']
             target = round(entry * 1.04, 2)
             stop = round(entry * 0.98, 2)
             results_swing.append({
@@ -416,8 +417,8 @@ for ticker in sp100:
                 "EMA200": ema200,
                 "Target Price": target,
                 "Stop Loss": stop,
-                "Volume": int(today['Volume']),
-                "VolumeAvg20": int(today['VolumeAvg20']),
+                "Volume": int(today['volume']),
+                "VolumeAvg20": int(today['volumeavg20']),
                 "Reason": "EMA200 Breakout + Volume"
             })
 
