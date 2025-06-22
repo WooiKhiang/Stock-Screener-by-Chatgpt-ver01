@@ -10,6 +10,32 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json
 import time
 
+# --- Debug ---
+st.subheader("Raw Data Sanity Check (Today, Last 5m bar)")
+
+debug_rows = []
+for ticker in sp100[:20]:  # Just first 20 to avoid slowness
+    try:
+        df = yf.download(ticker, period="1d", interval="5m", progress=False)
+        if df.empty:
+            debug_rows.append({"Ticker": ticker, "Status": "EMPTY"})
+        else:
+            last = df.iloc[-1]
+            debug_rows.append({
+                "Ticker": ticker,
+                "Last Time": last.name,
+                "Open": last["Open"],
+                "High": last["High"],
+                "Low": last["Low"],
+                "Close": last["Close"],
+                "Volume": int(last["Volume"])
+            })
+    except Exception as e:
+        debug_rows.append({"Ticker": ticker, "Status": f"Exception: {e}"})
+
+df_debug = pd.DataFrame(debug_rows)
+st.dataframe(df_debug)
+
 # --- Config ---
 TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
 TELEGRAM_CHAT_ID = "713264762"
