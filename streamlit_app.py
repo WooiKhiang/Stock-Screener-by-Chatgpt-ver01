@@ -1,25 +1,71 @@
 import streamlit as st
 import yfinance as yf
+import pandas as pd
+import numpy as np
 
-st.title("🔎 YFinance Intraday Data Debugger")
+st.title("🔍 Mini Debug Screener: S&P Tickers")
 
-ticker = st.text_input("Ticker (e.g., AAPL, MSFT, SPY)", value="AAPL")
-interval = st.selectbox("Interval", ["1d", "5m", "15m", "1h"], index=1)
-period = st.selectbox("Period", ["5d", "1d", "1mo"], index=0)
-go = st.button("Download Data")
+# --- Select tickers for quick test ---
+tickers = st.multiselect(
+    "Pick tickers (test with a few, then expand)",
+    options=['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'AMZN', 'NVDA', 'SPY', 'META'],
+    default=['AAPL', 'MSFT', 'GOOGL']
+)
 
-if go:
-    st.write(f"Fetching {ticker} for period={period}, interval={interval} ...")
-    try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False, threads=False)
-        st.write("DataFrame shape:", df.shape)
-        st.write("DataFrame columns:", df.columns.tolist())
-        if df.empty:
-            st.warning("Returned DataFrame is EMPTY! No data from yfinance.")
-        else:
-            st.dataframe(df.head(20))
-            st.success("Data loaded successfully.")
-    except Exception as e:
-        st.error(f"Exception fetching data: {e}")
-else:
-    st.info("Select a ticker and press Download Data to test.")
+min_price = st.number_input("Min Price ($)", value=0.0)
+max_price = st.number_input("Max Price ($)", value=2000.0)
+min_vol = st.number_input("Min Avg Vol (40 bars)", value=0)
+
+results = []
+
+for ticker in tickers:
+    df = yf.download(ticker, period='5d', interval='5m', progress=False, threads=False)
+    if df.empty or len(df) < 3:
+        results.append({'Ticker': ticker, 'Status': 'No data'})
+        continue
+
+    # Normalize columns to lowercase and underscore (robust!)
+    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+
+    # Compute indicators
+    df['sma3'] = df['close'].rolling(3).mean()
+    df['avgvol40'] = df['volume'].rolling(40, min_periods=1).mean()
+
+    last = df.iloc[-1]
+    close_price = last['close']
+    avgvol40 = last['avgvol40']
+
+    # Apply simple filters
+    if not (min_price <= close_price <= max_price):
+        results.append({'Ticker': ticker, 'Status': 'Filtered: Price', 'Last Close': close_price, 'AvgVol40': avgvol40})
+        continue
+    if avgvol40 < min_vol:
+        results.append({'Ticker': ticker, 'Status': 'Filtered: Volume', 'Last Close': close_price, 'AvgVol40': avgvol40})
+        continue
+
+    # Simple debug signal: Close > SMA3
+    if close_price > last['sma3']:
+        results.append({
+            'Ticker': ticker,
+            'Status': 'DEBUG SIGNAL FIRED',
+            'Last Close': round(close_price, 2),
+            'SMA3': round(last['sma3'], 2),
+            'AvgVol40': int(avgvol40)
+        })
+    else:
+        results.append({
+            'Ticker': ticker,
+            'Status': 'No Debug Signal',
+            'Last Close': round(close_price, 2),
+            'SMA3': round(last['sma3'], 2),
+            'AvgVol40': int(avgvol40)
+        })
+
+st.dataframe(pd.DataFrame(results))
+
+st.markdown("""
+---
+**Instructions:**  
+- If you see "DEBUG SIGNAL FIRED" for any ticker, your data pipeline is working.
+- Once you see signals, expand your ticker list and start layering in real strategy logic, one-by-one.
+""")
