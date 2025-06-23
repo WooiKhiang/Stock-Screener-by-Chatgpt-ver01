@@ -5,6 +5,14 @@ import numpy as np
 
 st.title("🔍 Mini Debug Screener: S&P Tickers")
 
+def normalize_cols(df):
+    # Handles both single and MultiIndex columns, returns all lowercase simple names
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ['_'.join([str(c) for c in col if c not in [None, '', '']]).lower() for col in df.columns]
+    else:
+        df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
+    return df
+
 # --- Select tickers for quick test ---
 tickers = st.multiselect(
     "Pick tickers (test with a few, then expand)",
@@ -24,8 +32,12 @@ for ticker in tickers:
         results.append({'Ticker': ticker, 'Status': 'No data'})
         continue
 
-    # Normalize columns to lowercase and underscore (robust!)
-    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+    df = normalize_cols(df)
+
+    # Check for close/volume columns
+    if 'close' not in df.columns or 'volume' not in df.columns:
+        results.append({'Ticker': ticker, 'Status': 'Missing columns', 'Columns': str(df.columns.tolist())})
+        continue
 
     # Compute indicators
     df['sma3'] = df['close'].rolling(3).mean()
