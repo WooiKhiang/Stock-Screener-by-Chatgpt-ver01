@@ -6,9 +6,12 @@ import numpy as np
 st.title("🔍 Mini Debug Screener: S&P Tickers")
 
 def normalize_cols(df):
-    # Handles both single and MultiIndex columns, returns all lowercase simple names
+    # Handles both single and MultiIndex columns, converts all to string, then lowercases.
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ['_'.join([str(c) for c in col if c not in [None, '', '']]).lower() for col in df.columns]
+        df.columns = [
+            '_'.join([str(x) for x in col if x not in [None, '', 'nan']]).lower()
+            for col in df.columns
+        ]
     else:
         df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
     return df
@@ -33,6 +36,12 @@ for ticker in tickers:
         continue
 
     df = normalize_cols(df)
+
+    # Fix columns like 'close_aapl', 'open_aapl', etc
+    for base in ['close', 'open', 'high', 'low', 'volume']:
+        possible_col = f"{base}_{ticker.lower()}"
+        if possible_col in df.columns:
+            df[base] = df[possible_col]
 
     # Check for close/volume columns
     if 'close' not in df.columns or 'volume' not in df.columns:
