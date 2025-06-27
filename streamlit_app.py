@@ -6,7 +6,7 @@ import numpy as np
 st.set_page_config(page_title="Hybrid AI US Stock Screener", layout="wide")
 st.title("🚦 Hybrid AI Stock Screener – Intraday/Swing + EMA200 Breakout (S&P 100)")
 
-sp100 = [ # S&P 100 tickers... (as above)
+sp100 = [ # S&P 100 tickers...
     'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO',
     'AXP','BA','BAC','BK','BKNG','BLK','BMY','BRK-B','C','CAT',
     'CHTR','CL','CMCSA','COF','COP','COST','CRM','CSCO','CVS','CVX',
@@ -27,10 +27,28 @@ min_vol = st.sidebar.number_input("Min Avg Vol (40)", value=100000)
 capital = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0)
 
 def norm(df):
+    # Flatten MultiIndex and force all columns to lower case, no spaces
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [('_'.join([str(x) for x in col if x not in [None,'','nan']])).lower() for col in df.columns]
+        df.columns = [('_'.join([str(x) for x in col if x not in [None,'','nan']])).lower().replace(" ","_") for col in df.columns]
     else:
         df.columns = [str(c).lower().replace(" ","_") for c in df.columns]
+    return df
+
+def ensure_core_cols(df):
+    # Rename columns to expected names
+    col_map = {}
+    for c in df.columns:
+        if c == "close" or "close" in c: col_map[c] = "close"
+        if c == "open" or "open" in c: col_map[c] = "open"
+        if c == "high" or "high" in c: col_map[c] = "high"
+        if c == "low" or "low" in c: col_map[c] = "low"
+        if c == "volume" or "vol" in c: col_map[c] = "volume"
+    df = df.rename(columns=col_map)
+    # Now force all required columns to exist
+    need = ["close", "open", "high", "low", "volume"]
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        raise Exception(f"Missing columns: {missing}")
     return df
 
 def formatn(x, d=2):
@@ -66,53 +84,68 @@ def hybrid_signal(df5, df1h):
 def calc_indicators(df):
     df['ema200'] = df['close'].ewm(span=200, min_periods=200).mean()
     df['ema40'] = df['close'].ewm(span=40, min_periods=40).mean()
-    df['rsi14'] = 100 - 100/(1 + df['close'].diff().clip(lower=0).rolling(14).mean() /
-                            (-df['close'].diff().clip(upper=0).rolling(14).mean() + 1e-8))
+    delta = df['close'].diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    roll_up = up.rolling(14).mean()
+    roll_down = down.rolling(14).mean()
+    rs = roll_up / (roll_down + 1e-8)
+    df['rsi14'] = 100 - (100 / (1 + rs))
     return df
 
 results = []
 for ticker in sp100:
-    # 1. Daily chart for EMA200 breakout
-    dfd = yf.download(ticker, period='1y', interval='1d', progress=False, threads=False)
-    if dfd.empty or len(dfd) < 210: continue
-    dfd = norm(dfd)
-    dfd = calc_indicators(dfd)
-    hit, reason, score = ema200_breakout_daily(dfd)
-    if hit:
-        curr = dfd.iloc[-1]
-        price = curr['close']
-        shares = int(capital // price)
-        results.append({
-            "Ticker": ticker,
-            "Strategy": "EMA200 Breakout (Daily)",
-            "Score": score,
-            "Entry": formatn(price),
-            "Shares": shares,
-            "Reason": reason,
-            "Type": "Swing"
-        })
-        continue  # if breakout fires, don't double-count for hybrid
+    try:
+        # --- Daily chart for EMA200 breakout
+        dfd = yf.download(ticker, period='1y', interval='1d', progress=False, threads=False)
+        if dfd.empty or len(dfd) < 210: continue
+        dfd = norm(dfd)
+        dfd = ensure_core_cols(dfd)
+        dfd = calc_indicators(dfd)
+        hit, reason, score = ema200_breakout_daily(dfd)
+        if hit:
+            curr = dfd.iloc[-1]
+            price = curr['close']
+            if not (min_price <= price <= max_price): continue
+            if curr['volume'] < min_vol: continue
+            shares = int(capital // price)
+            results.append({
+                "Ticker": ticker,
+                "Strategy": "EMA200 Breakout (Daily)",
+                "Score": score,
+                "Entry": formatn(price),
+                "Shares": shares,
+                "Reason": reason,
+                "Type": "Swing"
+            })
+            continue  # if breakout fires, don't double-count for hybrid
 
-    # 2. Hybrid: 5-min entry + 1hr confirm
-    df5 = yf.download(ticker, period='3d', interval='5m', progress=False, threads=False)
-    df1h = yf.download(ticker, period='30d', interval='60m', progress=False, threads=False)
-    if df5.empty or df1h.empty: continue
-    df5, df1h = norm(df5), norm(df1h)
-    df5 = calc_indicators(df5)
-    df1h = calc_indicators(df1h)
-    hit, reason, score = hybrid_signal(df5, df1h)
-    if hit:
-        price = df5['close'].iloc[-1]
-        shares = int(capital // price)
-        results.append({
-            "Ticker": ticker,
-            "Strategy": "Hybrid 5min+1hr Confirm",
-            "Score": score,
-            "Entry": formatn(price),
-            "Shares": shares,
-            "Reason": reason,
-            "Type": "Hybrid"
-        })
+        # --- Hybrid: 5-min entry + 1hr confirm
+        df5 = yf.download(ticker, period='3d', interval='5m', progress=False, threads=False)
+        df1h = yf.download(ticker, period='30d', interval='60m', progress=False, threads=False)
+        if df5.empty or df1h.empty: continue
+        df5, df1h = norm(df5), norm(df1h)
+        df5, df1h = ensure_core_cols(df5), ensure_core_cols(df1h)
+        df5 = calc_indicators(df5)
+        df1h = calc_indicators(df1h)
+        hit, reason, score = hybrid_signal(df5, df1h)
+        if hit:
+            price = df5['close'].iloc[-1]
+            if not (min_price <= price <= max_price): continue
+            if df5['volume'].iloc[-1] < min_vol: continue
+            shares = int(capital // price)
+            results.append({
+                "Ticker": ticker,
+                "Strategy": "Hybrid 5min+1hr Confirm",
+                "Score": score,
+                "Entry": formatn(price),
+                "Shares": shares,
+                "Reason": reason,
+                "Type": "Hybrid"
+            })
+    except Exception as e:
+        st.write(f"{ticker}: {e}")
+        continue
 
 if results:
     df_out = pd.DataFrame(results).sort_values("Score", ascending=False).reset_index(drop=True)
