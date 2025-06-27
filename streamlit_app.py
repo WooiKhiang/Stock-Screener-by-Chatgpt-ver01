@@ -6,7 +6,7 @@ import numpy as np
 st.set_page_config(page_title="Hybrid AI US Stock Screener", layout="wide")
 st.title("🚦 Hybrid AI Stock Screener – Intraday/Swing + EMA200 Breakout (S&P 100)")
 
-sp100 = [ # S&P 100 tickers...
+sp100 = [
     'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO',
     'AXP','BA','BAC','BK','BKNG','BLK','BMY','BRK-B','C','CAT',
     'CHTR','CL','CMCSA','COF','COP','COST','CRM','CSCO','CVS','CVX',
@@ -20,11 +20,13 @@ sp100 = [ # S&P 100 tickers...
     'WFC','WMT','XOM'
 ]
 
+# --- Sidebar for settings ---
 st.sidebar.header("Trade Settings")
 min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
 min_vol = st.sidebar.number_input("Min Avg Vol (40)", value=100000)
 capital = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0)
+show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
 def norm(df):
     # Flatten MultiIndex and force all columns to lower case, no spaces
@@ -44,7 +46,6 @@ def ensure_core_cols(df):
         if c == "low" or "low" in c: col_map[c] = "low"
         if c == "volume" or "vol" in c: col_map[c] = "volume"
     df = df.rename(columns=col_map)
-    # Now force all required columns to exist
     need = ["close", "open", "high", "low", "volume"]
     missing = [c for c in need if c not in df.columns]
     if missing:
@@ -56,30 +57,34 @@ def formatn(x, d=2):
     except: return x
 
 def ema200_breakout_daily(df):
-    # Use daily bars
     if len(df) < 210 or 'ema200' not in df.columns: return False, "", 0
     prev, curr = df.iloc[-2], df.iloc[-1]
     breakout = (prev['close'] < prev['ema200']) and (curr['close'] > curr['ema200'])
     vol_ok = curr['volume'] > 1.5 * df['volume'][-20:-1].mean()
     rsi_ok = curr['rsi14'] < 70
+    # Dynamic scoring
+    pct_above_ema = max(0, (curr['close'] - curr['ema200']) / curr['ema200']) * 100
+    vol_mult = curr['volume'] / (df['volume'][-20:-1].mean() + 1e-8)
+    score = 70 + int(pct_above_ema * 10) + int((vol_mult - 1) * 10)
+    score = min(score, 100)
     cond = breakout and vol_ok and rsi_ok
-    score = 99 if cond else 0
-    return cond, "Daily EMA200 Breakout + volume/rsi", score
+    return cond, f"Daily EMA200 Breakout (+{pct_above_ema:.2f}%, Vol x{vol_mult:.2f})", score
 
 def hybrid_signal(df5, df1h):
-    # 5m EMA40 breakout + confirm price > EMA200 on 1hr
     if len(df5) < 50 or len(df1h) < 50: return False, "", 0
-    # 5m logic
     c, ema40 = df5['close'].iloc[-1], df5['ema40'].iloc[-1]
     prev_c, prev_ema = df5['close'].iloc[-2], df5['ema40'].iloc[-2]
     breakout = (prev_c < prev_ema) and (c > ema40)
-    vol_spike = df5['volume'].iloc[-1] > 1.3 * df5['volume'][-40:-1].mean()
-    # 1hr confirm
+    vol_spike = df5['volume'].iloc[-1] / (df5['volume'][-40:-1].mean() + 1e-8)
     curr_1h = df1h.iloc[-1]
     above_ema200 = curr_1h['close'] > curr_1h['ema200']
-    cond = breakout and vol_spike and above_ema200
-    score = 90 if cond else 0
-    return cond, "5min EMA40 Breakout + 1hr EMA200 confirm", score
+    pct_breakout = max(0, (c - ema40) / ema40) * 100
+    pct_above_ema200 = max(0, (curr_1h['close'] - curr_1h['ema200']) / curr_1h['ema200']) * 100
+    rsi_bonus = 5 if 55 <= curr_1h['rsi14'] <= 65 else 0
+    score = 70 + int(pct_breakout * 10) + int((vol_spike - 1) * 10) + int(pct_above_ema200 * 5) + rsi_bonus
+    score = min(score, 100)
+    cond = breakout and (vol_spike > 1.2) and above_ema200
+    return cond, f"5m EMA40 Breakout + 1h Confirm (Breakout: {pct_breakout:.2f}%, Vol x{vol_spike:.2f}, Above EMA200: {pct_above_ema200:.2f}%)", score
 
 def calc_indicators(df):
     df['ema200'] = df['close'].ewm(span=200, min_periods=200).mean()
@@ -94,13 +99,21 @@ def calc_indicators(df):
     return df
 
 results = []
+debug_issues = []
+
 for ticker in sp100:
     try:
         # --- Daily chart for EMA200 breakout
         dfd = yf.download(ticker, period='1y', interval='1d', progress=False, threads=False)
-        if dfd.empty or len(dfd) < 210: continue
+        if dfd.empty or len(dfd) < 210:
+            debug_issues.append({"Ticker": ticker, "Issue": "Daily data empty or short"})
+            continue
         dfd = norm(dfd)
-        dfd = ensure_core_cols(dfd)
+        try:
+            dfd = ensure_core_cols(dfd)
+        except Exception as e:
+            debug_issues.append({"Ticker": ticker, "Issue": str(e)})
+            continue
         dfd = calc_indicators(dfd)
         hit, reason, score = ema200_breakout_daily(dfd)
         if hit:
@@ -123,9 +136,15 @@ for ticker in sp100:
         # --- Hybrid: 5-min entry + 1hr confirm
         df5 = yf.download(ticker, period='3d', interval='5m', progress=False, threads=False)
         df1h = yf.download(ticker, period='30d', interval='60m', progress=False, threads=False)
-        if df5.empty or df1h.empty: continue
+        if df5.empty or df1h.empty:
+            debug_issues.append({"Ticker": ticker, "Issue": "5m/1h data empty"})
+            continue
         df5, df1h = norm(df5), norm(df1h)
-        df5, df1h = ensure_core_cols(df5), ensure_core_cols(df1h)
+        try:
+            df5, df1h = ensure_core_cols(df5), ensure_core_cols(df1h)
+        except Exception as e:
+            debug_issues.append({"Ticker": ticker, "Issue": str(e)})
+            continue
         df5 = calc_indicators(df5)
         df1h = calc_indicators(df1h)
         hit, reason, score = hybrid_signal(df5, df1h)
@@ -144,7 +163,7 @@ for ticker in sp100:
                 "Type": "Hybrid"
             })
     except Exception as e:
-        st.write(f"{ticker}: {e}")
+        debug_issues.append({"Ticker": ticker, "Issue": str(e)})
         continue
 
 if results:
@@ -154,9 +173,14 @@ if results:
 else:
     st.info("No stocks met high-quality hybrid or EMA200 breakout criteria right now.")
 
+if show_debug and debug_issues:
+    st.sidebar.subheader("Debug Info (tickers with data issues)")
+    df_debug = pd.DataFrame(debug_issues)
+    st.sidebar.dataframe(df_debug)
+
 st.markdown("""
 ---
 **Strategy Summary:**  
-- **Hybrid:** Enter on 5min EMA40 breakout *only if* 1hr price > EMA200 (trend confirmed).  
-- **EMA200 Breakout:** Daily close above EMA200 + volume + RSI filter (the classic, rare but high conviction).
+- **Hybrid:** Enter on 5min EMA40 breakout *only if* 1hr price > EMA200 (trend confirmed). Score is proportionate to breakout/volume/confirmation strength.  
+- **EMA200 Breakout:** Daily close above EMA200 + volume + RSI filter (the classic, rare but high conviction, score reflects strength).
 """)
