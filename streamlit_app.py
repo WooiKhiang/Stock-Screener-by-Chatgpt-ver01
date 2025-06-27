@@ -3,10 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-st.title("🔍 Mini Debug Screener: S&P Tickers")
-
 def normalize_cols(df):
-    # Handles both single and MultiIndex columns, converts all to string, then lowercases.
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [
             '_'.join([str(x) for x in col if x not in [None, '', 'nan']]).lower()
@@ -16,77 +13,60 @@ def normalize_cols(df):
         df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
     return df
 
-# --- Select tickers for quick test ---
+def mean_reversion_signal(df):
+    if 'sma40' not in df.columns or 'rsi3' not in df.columns:
+        return False, ""
+    c, sma, rsi = df['close'].iloc[-1], df['sma40'].iloc[-1], df['rsi3'].iloc[-1]
+    cond = (c > sma) and (rsi < 15)
+    return cond, f"MeanRev: close>{sma:.2f} rsi3={rsi:.2f}"
+
+def ema40_breakout_signal(df):
+    if 'ema40' not in df.columns:
+        return False, ""
+    c, ema = df['close'].iloc[-1], df['ema40'].iloc[-1]
+    cond = c > ema
+    return cond, f"EMA40: close>{ema:.2f}"
+
+st.title("AI-Powered US Stock Screener")
+
 tickers = st.multiselect(
-    "Pick tickers (test with a few, then expand)",
+    "Select tickers to scan", 
     options=['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'AMZN', 'NVDA', 'SPY', 'META'],
     default=['AAPL', 'MSFT', 'GOOGL']
 )
-
-min_price = st.number_input("Min Price ($)", value=0.0)
-max_price = st.number_input("Max Price ($)", value=2000.0)
-min_vol = st.number_input("Min Avg Vol (40 bars)", value=0)
-
 results = []
 
 for ticker in tickers:
     df = yf.download(ticker, period='5d', interval='5m', progress=False, threads=False)
-    if df.empty or len(df) < 3:
-        results.append({'Ticker': ticker, 'Status': 'No data'})
+    if df.empty or len(df) < 40:
         continue
-
     df = normalize_cols(df)
-
-    # Fix columns like 'close_aapl', 'open_aapl', etc
+    # Handle suffixed columns
     for base in ['close', 'open', 'high', 'low', 'volume']:
         possible_col = f"{base}_{ticker.lower()}"
         if possible_col in df.columns:
             df[base] = df[possible_col]
+    df['sma40'] = df['close'].rolling(40).mean()
+    df['ema40'] = df['close'].ewm(span=40, min_periods=40).mean()
+    delta = df['close'].diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    roll_up = up.rolling(3).mean()
+    roll_down = down.rolling(3).mean()
+    rs = roll_up / (roll_down + 1e-9)
+    df['rsi3'] = 100 - (100 / (1 + rs))
 
-    # Check for close/volume columns
-    if 'close' not in df.columns or 'volume' not in df.columns:
-        results.append({'Ticker': ticker, 'Status': 'Missing columns', 'Columns': str(df.columns.tolist())})
-        continue
-
-    # Compute indicators
-    df['sma3'] = df['close'].rolling(3).mean()
-    df['avgvol40'] = df['volume'].rolling(40, min_periods=1).mean()
-
-    last = df.iloc[-1]
-    close_price = last['close']
-    avgvol40 = last['avgvol40']
-
-    # Apply simple filters
-    if not (min_price <= close_price <= max_price):
-        results.append({'Ticker': ticker, 'Status': 'Filtered: Price', 'Last Close': close_price, 'AvgVol40': avgvol40})
-        continue
-    if avgvol40 < min_vol:
-        results.append({'Ticker': ticker, 'Status': 'Filtered: Volume', 'Last Close': close_price, 'AvgVol40': avgvol40})
-        continue
-
-    # Simple debug signal: Close > SMA3
-    if close_price > last['sma3']:
-        results.append({
-            'Ticker': ticker,
-            'Status': 'DEBUG SIGNAL FIRED',
-            'Last Close': round(close_price, 2),
-            'SMA3': round(last['sma3'], 2),
-            'AvgVol40': int(avgvol40)
-        })
-    else:
-        results.append({
-            'Ticker': ticker,
-            'Status': 'No Debug Signal',
-            'Last Close': round(close_price, 2),
-            'SMA3': round(last['sma3'], 2),
-            'AvgVol40': int(avgvol40)
-        })
+    for strat_func, strat_name in [
+        (mean_reversion_signal, "Mean Reversion"),
+        (ema40_breakout_signal, "EMA40 Breakout")
+    ]:
+        hit, note = strat_func(df)
+        if hit:
+            results.append({
+                'Ticker': ticker,
+                'Strategy': strat_name,
+                'Note': note,
+                'Close': round(df['close'].iloc[-1],2)
+            })
 
 st.dataframe(pd.DataFrame(results))
-
-st.markdown("""
----
-**Instructions:**  
-- If you see "DEBUG SIGNAL FIRED" for any ticker, your data pipeline is working.
-- Once you see signals, expand your ticker list and start layering in real strategy logic, one-by-one.
-""")
