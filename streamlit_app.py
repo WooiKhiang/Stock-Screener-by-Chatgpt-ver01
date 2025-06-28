@@ -9,14 +9,11 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json
 from datetime import datetime
 
-# --- Config & credentials ---
+# --- Config ---
 TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
 TELEGRAM_CHAT_ID = "713264762"
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "Sheet1"
-
-st.set_page_config(page_title="Hybrid AI US Stock Screener", layout="wide")
-st.title("🚦 Hybrid AI Stock Screener – Intraday/Swing + EMA200 Breakout (S&P 100)")
 
 sp100 = [
     'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO',
@@ -49,7 +46,6 @@ def norm(df):
     return df
 
 def ensure_core_cols(df):
-    # Rename columns to expected names
     col_map = {}
     for c in df.columns:
         if c == "close" or "close" in c: col_map[c] = "close"
@@ -68,38 +64,15 @@ def formatn(x, d=2):
     try: return f"{x:,.{d}f}"
     except: return x
 
-def ema200_breakout_daily(df):
-    if len(df) < 210 or 'ema200' not in df.columns: return False, "", 0
-    prev, curr = df.iloc[-2], df.iloc[-1]
-    breakout = (prev['close'] < prev['ema200']) and (curr['close'] > curr['ema200'])
-    vol_ok = curr['volume'] > 1.5 * df['volume'][-20:-1].mean()
-    rsi_ok = curr['rsi14'] < 70
-    pct_above_ema = max(0, (curr['close'] - curr['ema200']) / curr['ema200']) * 100
-    vol_mult = curr['volume'] / (df['volume'][-20:-1].mean() + 1e-8)
-    score = 70 + int(pct_above_ema * 10) + int((vol_mult - 1) * 10)
-    score = min(score, 100)
-    cond = breakout and vol_ok and rsi_ok
-    return cond, f"Daily EMA200 Breakout (+{pct_above_ema:.2f}%, Vol x{vol_mult:.2f})", score
-
-def hybrid_signal(df5, df1h):
-    if len(df5) < 50 or len(df1h) < 50: return False, "", 0
-    c, ema40 = df5['close'].iloc[-1], df5['ema40'].iloc[-1]
-    prev_c, prev_ema = df5['close'].iloc[-2], df5['ema40'].iloc[-2]
-    breakout = (prev_c < prev_ema) and (c > ema40)
-    vol_spike = df5['volume'].iloc[-1] / (df5['volume'][-40:-1].mean() + 1e-8)
-    curr_1h = df1h.iloc[-1]
-    above_ema200 = curr_1h['close'] > curr_1h['ema200']
-    pct_breakout = max(0, (c - ema40) / ema40) * 100
-    pct_above_ema200 = max(0, (curr_1h['close'] - curr_1h['ema200']) / curr_1h['ema200']) * 100
-    rsi_bonus = 5 if 55 <= curr_1h['rsi14'] <= 65 else 0
-    score = 70 + int(pct_breakout * 10) + int((vol_spike - 1) * 10) + int(pct_above_ema200 * 5) + rsi_bonus
-    score = min(score, 100)
-    cond = breakout and (vol_spike > 1.2) and above_ema200
-    return cond, f"5m EMA40 Breakout + 1h Confirm (Breakout: {pct_breakout:.2f}%, Vol x{vol_spike:.2f}, Above EMA200: {pct_above_ema200:.2f}%)", score
-
 def calc_indicators(df):
     df['ema200'] = df['close'].ewm(span=200, min_periods=200).mean()
     df['ema40'] = df['close'].ewm(span=40, min_periods=40).mean()
+    high_low = df['high'] - df['low']
+    high_prevclose = np.abs(df['high'] - df['close'].shift(1))
+    low_prevclose = np.abs(df['low'] - df['close'].shift(1))
+    ranges = pd.concat([high_low, high_prevclose, low_prevclose], axis=1)
+    df['atr14'] = ranges.max(axis=1).rolling(14).mean()
+    # RSI
     delta = df['close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
@@ -108,6 +81,38 @@ def calc_indicators(df):
     rs = roll_up / (roll_down + 1e-8)
     df['rsi14'] = 100 - (100 / (1 + rs))
     return df
+
+def ema200_breakout_daily(df):
+    if len(df) < 210 or 'ema200' not in df.columns: return False, "", 0
+    prev, curr = df.iloc[-2], df.iloc[-1]
+    breakout = (prev['close'] < prev['ema200']) and (curr['close'] > curr['ema200'])
+    vol_avg = df['volume'][-20:-1].mean() + 1e-8
+    vol_mult = curr['volume'] / vol_avg
+    rsi_ok = curr['rsi14'] < 70
+    pct_above_ema = (curr['close'] - curr['ema200']) / curr['ema200'] * 100
+    # Confidence score = % above EMA200 + volume multiplier, rescaled
+    score = int(60 + pct_above_ema*10 + (vol_mult-1)*15)
+    score = max(60, min(score, 100))
+    cond = breakout and (vol_mult > 1.5) and rsi_ok
+    return cond, f"Daily EMA200 Breakout (+{pct_above_ema:.2f}%, Vol x{vol_mult:.2f})", score
+
+def hybrid_signal(df5, df1h):
+    if len(df5) < 50 or len(df1h) < 50: return False, "", 0
+    c, ema40 = df5['close'].iloc[-1], df5['ema40'].iloc[-1]
+    prev_c, prev_ema = df5['close'].iloc[-2], df5['ema40'].iloc[-2]
+    breakout = (prev_c < prev_ema) and (c > ema40)
+    vol_avg = df5['volume'][-40:-1].mean() + 1e-8
+    vol_spike = df5['volume'].iloc[-1] / vol_avg
+    curr_1h = df1h.iloc[-1]
+    above_ema200 = curr_1h['close'] > curr_1h['ema200']
+    pct_breakout = (c - ema40) / ema40 * 100
+    pct_above_ema200 = (curr_1h['close'] - curr_1h['ema200']) / curr_1h['ema200'] * 100
+    rsi_bonus = 5 if 55 <= curr_1h['rsi14'] <= 65 else 0
+    # Score = breakout % + volume spike + 1hr EMA200 + RSI bonus
+    score = int(55 + pct_breakout*10 + (vol_spike-1)*20 + pct_above_ema200*5 + rsi_bonus)
+    score = max(55, min(score, 99))
+    cond = breakout and (vol_spike > 1.2) and above_ema200
+    return cond, f"5m EMA40 Breakout + 1h Confirm (Breakout: {pct_breakout:.2f}%, Vol x{vol_spike:.2f}, Above EMA200: {pct_above_ema200:.2f}%)", score
 
 # --- Google Sheets & Telegram ---
 def get_gspread_client_from_secrets():
@@ -161,11 +166,13 @@ for ticker in sp100:
         if hit:
             curr = dfd.iloc[-1]
             price = curr['close']
+            atr = curr['atr14']
             if not (min_price <= price <= max_price): continue
             if curr['volume'] < min_vol: continue
             shares = int(capital // price)
-            target_price = round(price * 1.04, 2)
-            cut_loss_price = round(price * 0.98, 2)
+            target_price = round(price + 2*atr, 2)
+            cut_loss_price = round(price - 1.5*atr, 2)
+            local_time = datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
             results.append({
                 "Ticker": ticker,
                 "Strategy": "EMA200 Breakout (Daily)",
@@ -174,8 +181,10 @@ for ticker in sp100:
                 "Target Price": formatn(target_price),
                 "Cut Loss Price": formatn(cut_loss_price),
                 "Shares": shares,
+                "ATR": formatn(atr,2),
                 "Reason": reason,
-                "Type": "Swing"
+                "Type": "Swing",
+                "Time Picked": local_time
             })
             continue  # if breakout fires, don't double-count for hybrid
 
@@ -196,11 +205,13 @@ for ticker in sp100:
         hit, reason, score = hybrid_signal(df5, df1h)
         if hit:
             price = df5['close'].iloc[-1]
+            atr = df5['atr14'].iloc[-1]
             if not (min_price <= price <= max_price): continue
             if df5['volume'].iloc[-1] < min_vol: continue
             shares = int(capital // price)
-            target_price = round(price * 1.02, 2)
-            cut_loss_price = round(price * 0.99, 2)
+            target_price = round(price + 2*atr, 2)
+            cut_loss_price = round(price - 1.5*atr, 2)
+            local_time = datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
             results.append({
                 "Ticker": ticker,
                 "Strategy": "Hybrid 5min+1hr Confirm",
@@ -209,8 +220,10 @@ for ticker in sp100:
                 "Target Price": formatn(target_price),
                 "Cut Loss Price": formatn(cut_loss_price),
                 "Shares": shares,
+                "ATR": formatn(atr,2),
                 "Reason": reason,
-                "Type": "Hybrid"
+                "Type": "Hybrid",
+                "Time Picked": local_time
             })
     except Exception as e:
         debug_issues.append({"Ticker": ticker, "Issue": str(e)})
@@ -223,23 +236,21 @@ if results:
     st.dataframe(df_out.head(5), use_container_width=True)
     
     # ---- TELEGRAM/GOOGLE SHEETS: Top 3 only ----
-    tz = pytz.timezone("US/Eastern")
-    now_et = datetime.now(pytz.utc).astimezone(tz)
-    now_time = now_et.strftime('%Y-%m-%d %H:%M:%S %Z')
+    now_local = datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
     telegram_msgs, gsheet_rows = [], []
     for idx, row in df_out.head(3).iterrows():
         msg = (
             f"#AI_StockPick Rank #{idx+1}\n"
             f"{row['Ticker']} | Strategy: {row['Strategy']}\n"
             f"Entry: ${row['Entry']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
-            f"Shares: {row['Shares']}\n"
+            f"Shares: {row['Shares']} | ATR(14): {row['ATR']}\n"
             f"Reason: {row['Reason']}\n"
-            f"Score: {row['Score']}\n"
-            f"Time: {now_time}"
+            f"Confidence Score: {row['Score']}\n"
+            f"Time Picked: {row['Time Picked']}"
         )
         telegram_msgs.append(msg)
         gsheet_rows.append([
-            now_time, row['Ticker'], row['Entry'], row['Target Price'], row['Cut Loss Price'],
+            row['Time Picked'], row['Ticker'], row['Entry'], row['Target Price'], row['Cut Loss Price'],
             row['Strategy'], row['Score'], row['Reason']
         ])
     for msg in telegram_msgs:
@@ -257,10 +268,12 @@ if show_debug and debug_issues:
 st.markdown("""
 ---
 **Strategy Summary:**  
-- **Hybrid:** Enter on 5min EMA40 breakout *only if* 1hr price > EMA200 (trend confirmed). Score is proportionate to breakout/volume/confirmation strength.  
+- **Hybrid:** Enter on 5min EMA40 breakout *only if* 1hr price > EMA200 (trend confirmed). Score is proportional to breakout/volume/confirmation strength.  
 - **EMA200 Breakout:** Daily close above EMA200 + volume + RSI filter (the classic, rare but high conviction, score reflects strength).
 
-**Target/Cut Loss:**  
-- Hybrid: Target +2%, Cut loss -1%  
-- EMA200: Target +4%, Cut loss -2%
+**Targets/Cut Loss (dynamic ATR):**  
+- Take Profit: Entry + 2×ATR(14)  
+- Cut Loss: Entry - 1.5×ATR(14)
+
+**All times shown: GMT+8 (MY/SG time)**
 """)
