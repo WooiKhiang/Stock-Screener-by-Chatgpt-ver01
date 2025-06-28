@@ -2,6 +2,18 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
+import pytz
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import json
+from datetime import datetime
+
+# --- Config & credentials ---
+TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
+TELEGRAM_CHAT_ID = "713264762"
+GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
+GOOGLE_SHEET_NAME = "Sheet1"
 
 st.set_page_config(page_title="Hybrid AI US Stock Screener", layout="wide")
 st.title("🚦 Hybrid AI Stock Screener – Intraday/Swing + EMA200 Breakout (S&P 100)")
@@ -62,7 +74,6 @@ def ema200_breakout_daily(df):
     breakout = (prev['close'] < prev['ema200']) and (curr['close'] > curr['ema200'])
     vol_ok = curr['volume'] > 1.5 * df['volume'][-20:-1].mean()
     rsi_ok = curr['rsi14'] < 70
-    # Dynamic scoring
     pct_above_ema = max(0, (curr['close'] - curr['ema200']) / curr['ema200']) * 100
     vol_mult = curr['volume'] / (df['volume'][-20:-1].mean() + 1e-8)
     score = 70 + int(pct_above_ema * 10) + int((vol_mult - 1) * 10)
@@ -98,6 +109,37 @@ def calc_indicators(df):
     df['rsi14'] = 100 - (100 / (1 + rs))
     return df
 
+# --- Google Sheets & Telegram ---
+def get_gspread_client_from_secrets():
+    info = st.secrets["gcp_service_account"]
+    creds_dict = {k: v for k, v in info.items()}
+    if isinstance(creds_dict["private_key"], list):
+        creds_dict["private_key"] = "\n".join(creds_dict["private_key"])
+    creds_json = json.dumps(creds_dict)
+    scope = ["https://spreadsheets.google.com/feeds",'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
+    client = gspread.authorize(creds)
+    return client
+
+def append_to_gsheet(data_rows):
+    try:
+        client = get_gspread_client_from_secrets()
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
+        for row in data_rows:
+            sheet.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        st.warning(f"Failed to append to Google Sheet: {e}")
+
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        resp = requests.post(url, data=payload)
+        if not resp.ok:
+            st.warning(f"Telegram alert failed: {resp.text}")
+    except Exception as e:
+        st.warning(f"Telegram alert failed: {e}")
+
 results = []
 debug_issues = []
 
@@ -122,11 +164,15 @@ for ticker in sp100:
             if not (min_price <= price <= max_price): continue
             if curr['volume'] < min_vol: continue
             shares = int(capital // price)
+            target_price = round(price * 1.04, 2)
+            cut_loss_price = round(price * 0.98, 2)
             results.append({
                 "Ticker": ticker,
                 "Strategy": "EMA200 Breakout (Daily)",
                 "Score": score,
                 "Entry": formatn(price),
+                "Target Price": formatn(target_price),
+                "Cut Loss Price": formatn(cut_loss_price),
                 "Shares": shares,
                 "Reason": reason,
                 "Type": "Swing"
@@ -153,11 +199,15 @@ for ticker in sp100:
             if not (min_price <= price <= max_price): continue
             if df5['volume'].iloc[-1] < min_vol: continue
             shares = int(capital // price)
+            target_price = round(price * 1.02, 2)
+            cut_loss_price = round(price * 0.99, 2)
             results.append({
                 "Ticker": ticker,
                 "Strategy": "Hybrid 5min+1hr Confirm",
                 "Score": score,
                 "Entry": formatn(price),
+                "Target Price": formatn(target_price),
+                "Cut Loss Price": formatn(cut_loss_price),
                 "Shares": shares,
                 "Reason": reason,
                 "Type": "Hybrid"
@@ -166,10 +216,36 @@ for ticker in sp100:
         debug_issues.append({"Ticker": ticker, "Issue": str(e)})
         continue
 
+# ---- OUTPUT TABLE & ALERTS ----
 if results:
     df_out = pd.DataFrame(results).sort_values("Score", ascending=False).reset_index(drop=True)
     st.subheader("⭐ AI-Picked Stock Setups (Top 5)")
     st.dataframe(df_out.head(5), use_container_width=True)
+    
+    # ---- TELEGRAM/GOOGLE SHEETS: Top 3 only ----
+    tz = pytz.timezone("US/Eastern")
+    now_et = datetime.now(pytz.utc).astimezone(tz)
+    now_time = now_et.strftime('%Y-%m-%d %H:%M:%S %Z')
+    telegram_msgs, gsheet_rows = [], []
+    for idx, row in df_out.head(3).iterrows():
+        msg = (
+            f"#AI_StockPick Rank #{idx+1}\n"
+            f"{row['Ticker']} | Strategy: {row['Strategy']}\n"
+            f"Entry: ${row['Entry']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
+            f"Shares: {row['Shares']}\n"
+            f"Reason: {row['Reason']}\n"
+            f"Score: {row['Score']}\n"
+            f"Time: {now_time}"
+        )
+        telegram_msgs.append(msg)
+        gsheet_rows.append([
+            now_time, row['Ticker'], row['Entry'], row['Target Price'], row['Cut Loss Price'],
+            row['Strategy'], row['Score'], row['Reason']
+        ])
+    for msg in telegram_msgs:
+        send_telegram_alert(msg)
+    append_to_gsheet(gsheet_rows)
+
 else:
     st.info("No stocks met high-quality hybrid or EMA200 breakout criteria right now.")
 
@@ -183,4 +259,8 @@ st.markdown("""
 **Strategy Summary:**  
 - **Hybrid:** Enter on 5min EMA40 breakout *only if* 1hr price > EMA200 (trend confirmed). Score is proportionate to breakout/volume/confirmation strength.  
 - **EMA200 Breakout:** Daily close above EMA200 + volume + RSI filter (the classic, rare but high conviction, score reflects strength).
+
+**Target/Cut Loss:**  
+- Hybrid: Target +2%, Cut loss -1%  
+- EMA200: Target +4%, Cut loss -2%
 """)
