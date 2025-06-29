@@ -14,7 +14,8 @@ import time
 TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
 TELEGRAM_CHAT_ID = "713264762"
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
-GOOGLE_SHEET_NAME = "SnP"
+GOOGLE_SHEET_US = "SnP"
+GOOGLE_SHEET_KLSE = "KLSE"
 
 sp100 = [
     'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO',
@@ -29,15 +30,13 @@ sp100 = [
     'TMUS','TSLA','TXN','UNH','UNP','UPS','USB','V','VZ','WBA',
     'WFC','WMT','XOM'
 ]
-
-# KLSE stocks to monitor (daily swing)
-klse_list = [
-    'MAYBANK.KL','PCHEM.KL','PBBANK.KL','TENAGA.KL','SIMEPLT.KL','CIMB.KL',
-    'SIME.KL','AXIATA.KL','MAXIS.KL','HARTA.KL','SUPERMX.KL','TOPGLOV.KL',
-    'IHH.KL','PETDAG.KL','PETGAS.KL','TM.KL','DIGI.KL','GENTING.KL','GENM.KL'
+klse100 = [
+    "MAYBANK.KL", "PCHEM.KL", "CIMB.KL", "TENAGA.KL", "AXIATA.KL", "SIME.KL", "GENTING.KL", "PETGAS.KL",
+    "TM.KL", "HAPSENG.KL", "SIMEPLT.KL", "HARTA.KL", "MAXIS.KL", "DIALOG.KL", "TOPGLOV.KL", "PPB.KL",
+    "IHH.KL", "PETDAG.KL", "PETRONM.KL", "MISC.KL", "DIGI.KL", "KLK.KL", "BANKISLAM.KL", "SUNWAY.KL",
+    "SOP.KL", "FGV.KL", "RHBBANK.KL", "SIMEPROP.KL", "AFFIN.KL", "MBMR.KL"
 ]
 
-# ---- Helper Functions ----
 def formatn(num, d=2):
     try:
         if num is None or num == "" or np.isnan(num): return "-"
@@ -52,8 +51,6 @@ def norm(df):
     return df
 
 def ensure_core_cols(df):
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join([str(x).lower() for x in c if x]) for c in df.columns]
     req = ["close","open","high","low","volume"]
     missing = [x for x in req if x not in df.columns]
     if missing:
@@ -66,33 +63,32 @@ def calc_indicators(df):
     df['ema10'] = df['close'].ewm(span=10, min_periods=10).mean()
     df['ema20'] = df['close'].ewm(span=20, min_periods=20).mean()
     df['ema50'] = df['close'].ewm(span=50, min_periods=50).mean()
-    # RSI
     delta = df['close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
-    roll_up = up.rolling(14).mean()
-    roll_down = down.rolling(14).mean()
+    roll_up = up.rolling(window=14).mean()
+    roll_down = down.rolling(window=14).mean()
     rs = roll_up / (roll_down + 1e-9)
     df['rsi14'] = 100 - (100 / (1 + rs))
-    # MACD
     ema12 = df['close'].ewm(span=12, min_periods=12).mean()
     ema26 = df['close'].ewm(span=26, min_periods=26).mean()
     df['macd'] = ema12 - ema26
     df['macdsignal'] = df['macd'].ewm(span=9, min_periods=9).mean()
-    # ATR
-    high_low = df['high'] - df['low']
-    high_prevclose = np.abs(df['high'] - df['close'].shift(1))
-    low_prevclose = np.abs(df['low'] - df['close'].shift(1))
-    ranges = pd.concat([high_low, high_prevclose, low_prevclose], axis=1)
-    df['atr14'] = ranges.max(axis=1).rolling(14).mean()
+    df['atr14'] = pd.Series(df['high']-df['low']).rolling(14).mean()
     return df
 
-def is_market_open():
-    # Allow PRE, REGULAR, POST market for signal sending (US)
+def is_market_open_us():
     eastern = pytz.timezone("US/Eastern")
     now_et = datetime.now(pytz.utc).astimezone(eastern)
     t = now_et.time()
     return ((dt_time(4,0) <= t < dt_time(20,0)))
+
+def is_market_open_klse():
+    # KLSE: Monday–Friday, 9am–12:30pm, 2:30pm–5pm MYT (GMT+8)
+    now = datetime.now(pytz.timezone("Asia/Kuala_Lumpur"))
+    t = now.time()
+    if now.weekday() >= 5: return False
+    return ((dt_time(9,0) <= t < dt_time(12,30)) or (dt_time(14,30) <= t < dt_time(17,0)))
 
 def send_telegram_alert(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -108,10 +104,15 @@ def get_gspread_client_from_secrets():
     creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
     return gspread.authorize(creds)
 
-def append_to_gsheet(rows):
+def append_to_gsheet(rows, sheet_name):
     try:
         client = get_gspread_client_from_secrets()
-        sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
+        try:
+            sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(sheet_name)
+        except:
+            # Create new worksheet if not exists
+            client.open_by_key(GOOGLE_SHEET_ID).add_worksheet(title=sheet_name, rows="2000", cols="20")
+            sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(sheet_name)
         for row in rows:
             sheet.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
@@ -120,7 +121,7 @@ def append_to_gsheet(rows):
 def local_time_str():
     return datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
 
-# ---- Sidebar ----
+# --- Sidebar ----
 st.sidebar.header("Filter Settings")
 min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
@@ -132,13 +133,15 @@ macd_stack_on = st.sidebar.checkbox("MACD Stack (Momentum)", value=True)
 hybrid_on = st.sidebar.checkbox("Hybrid 5min+1h Confirm", value=True)
 ema200_on = st.sidebar.checkbox("EMA200 Breakout (Swing)", value=True)
 show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
+klse_on = st.sidebar.checkbox("Enable KLSE Screener", value=True)
 
-st.title("AI-Powered US Stocks Screener: Intraday, Swing & Pre/Post-Market Hybrid")
+st.title("AI-Powered US & KLSE Stocks Screener: Intraday, Swing, Hybrid (with last signals log)")
 st.caption(f"Last run: {local_time_str()}")
 
 if "alerted_today" not in st.session_state: st.session_state["alerted_today"] = set()
-debug_issues, results = [], []
+debug_issues, results, klse_results = [], [], []
 
+# ---- US S&P 100 Section ----
 for ticker in sp100:
     try:
         # --- Hybrid 5m+1h Confirm ---
@@ -180,7 +183,7 @@ for ticker in sp100:
                 sigid = (ticker, "Hybrid 5min+1hr Confirm")
                 results.append({
                     "Ticker": ticker,
-                    "Strategy": "Hybrid 5min+1hr Confirm",
+                    "Strategy": "Hybrid 5min+1h Confirm",
                     "Score": score,
                     "Entry": formatn(price),
                     "Target Price": formatn(target_price),
@@ -288,14 +291,14 @@ for ticker in sp100:
         debug_issues.append({"Ticker": ticker, "Issue": str(e)})
         continue
 
-# ---- OUTPUT TABLE & ALERTS ----
+# ---- OUTPUT TABLE & ALERTS: US ----
 if results:
     df_out = pd.DataFrame(results).sort_values("Score", ascending=False).reset_index(drop=True)
-    st.subheader("⭐ AI-Picked Stock Setups (Top 5)")
+    st.subheader("⭐ AI-Picked US Stock Setups (Top 5)")
     st.dataframe(df_out.head(5), use_container_width=True)
-    
+
     # ---- TELEGRAM/GOOGLE SHEETS: Top 3 only ----
-    if is_market_open():
+    if is_market_open_us():
         telegram_msgs, gsheet_rows = [], []
         for idx, row in df_out.head(3).iterrows():
             if row['SigID'] in st.session_state["alerted_today"]:
@@ -315,72 +318,120 @@ if results:
             ])
             st.session_state["alerted_today"].add(row['SigID'])
         for msg in telegram_msgs: send_telegram_alert(msg)
-        if gsheet_rows: append_to_gsheet(gsheet_rows)
+        if gsheet_rows: append_to_gsheet(gsheet_rows, GOOGLE_SHEET_US)
 else:
-    st.warning("No current signals found.")
+    st.warning("No current US signals found.")
 
-# ---- LAST SIGNALS HISTORY TABLE (Google Sheets) ----
-st.subheader("📜 Last 10 Signals History (from Google Sheet)")
+# ---- KLSE Section ----
+if klse_on:
+    for ticker in klse100:
+        try:
+            dfd = yf.download(ticker, period="1y", interval="1d", progress=False, threads=False)
+            if dfd.empty or len(dfd) < 210: continue
+            dfd = norm(dfd)
+            try: dfd = ensure_core_cols(dfd)
+            except Exception as e:
+                continue
+            dfd = calc_indicators(dfd)
+            prev, curr = dfd.iloc[-2], dfd.iloc[-1]
+            breakout = (prev['close'] < prev['ema200']) and (curr['close'] > curr['ema200'])
+            vol_avg = dfd['volume'][-20:-1].mean() + 1e-8
+            vol_mult = curr['volume'] / vol_avg
+            rsi_ok = curr['rsi14'] < 70
+            pct_above_ema = (curr['close'] - curr['ema200']) / curr['ema200'] * 100
+            score = 60 + min(40, pct_above_ema*6 + (vol_mult-1)*12)
+            score = int(max(50, min(score, 100)))
+            cond = breakout and (vol_mult > 1.5) and rsi_ok
+            if cond:
+                entry = curr['close']
+                atr = dfd['atr14'].iloc[-1]
+                target_val = max(2*atr, entry*min_target_pct)
+                cut_val = max(1.5*atr, entry*min_cutloss_pct)
+                if target_val < entry*min_target_pct: continue
+                shares = int(capital_per_trade // entry)
+                target_price = round(entry + target_val, 2)
+                cut_loss_price = round(entry - cut_val, 2)
+                sigid = (ticker, "KLSE EMA200 Breakout")
+                klse_results.append({
+                    "Ticker": ticker,
+                    "Strategy": "EMA200 Breakout",
+                    "Score": score,
+                    "Entry": formatn(entry),
+                    "Target Price": formatn(target_price),
+                    "Cut Loss Price": formatn(cut_loss_price),
+                    "Shares": shares,
+                    "ATR": formatn(atr,2),
+                    "Reason": f"Breakout +{pct_above_ema:.2f}%, Vol x{vol_mult:.2f}",
+                    "Type": "KLSE Swing",
+                    "Time Picked": local_time_str(),
+                    "SigID": sigid
+                })
+            time.sleep(0.04)
+        except Exception as e:
+            continue
+
+    # --- KLSE ALERTS / LOG ---
+    if klse_results and is_market_open_klse():
+        dfk_out = pd.DataFrame(klse_results).sort_values("Score", ascending=False).reset_index(drop=True)
+        st.subheader("⭐ AI-Picked KLSE Stock Setups (Top 5)")
+        st.dataframe(dfk_out.head(5), use_container_width=True)
+
+        klse_telegram_msgs, klse_gsheet_rows = [], []
+        for idx, row in dfk_out.head(3).iterrows():
+            if row['SigID'] in st.session_state["alerted_today"]:
+                continue
+            msg = (
+                f"#KLSE_Swing\n"
+                f"Ticker: {row['Ticker']} | Score: {row['Score']}\n"
+                f"Entry: {row['Entry']} | Target: {row['Target Price']} | Stop: {row['Cut Loss Price']}\n"
+                f"ATR: {row['ATR']}\n"
+                f"Reason: {row['Reason']}\n"
+                f"Time: {row['Time Picked']} (GMT+8)"
+            )
+            klse_telegram_msgs.append(msg)
+            klse_gsheet_rows.append([
+                row['Time Picked'], row['Ticker'], row['Entry'], row['Target Price'], row['Cut Loss Price'],
+                "KLSE EMA200 Breakout", row['Score'], row['Reason']
+            ])
+            st.session_state["alerted_today"].add(row['SigID'])
+        for msg in klse_telegram_msgs:
+            send_telegram_alert(msg)
+        if klse_gsheet_rows: append_to_gsheet(klse_gsheet_rows, GOOGLE_SHEET_KLSE)
+    elif klse_results:
+        st.subheader("⭐ AI-Picked KLSE Stock Setups (Top 5)")
+        st.dataframe(pd.DataFrame(klse_results).head(5), use_container_width=True)
+    else:
+        st.info("No current KLSE signals found.")
+
+# ---- "LAST SIGNALS" DISPLAY (Google Sheets) ----
+st.markdown("---")
+st.subheader("📜 Recent US Signals (Last 10, from Google Sheet)")
 try:
     client = get_gspread_client_from_secrets()
-    sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
-    data = sheet.get_all_values()
-    df_hist = pd.DataFrame(data[1:], columns=data[0])  # skip header row
-    st.dataframe(df_hist.tail(10).iloc[::-1].reset_index(drop=True), use_container_width=True)
+    sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_US)
+    records = sheet.get_all_records()
+    if records:
+        df_last = pd.DataFrame(records).tail(10)
+        st.dataframe(df_last, use_container_width=True)
+    else:
+        st.info("No recent US signals found in Sheet1.")
 except Exception as e:
-    st.info(f"History unavailable ({e})")
+    st.info(f"Unable to load US signals: {e}")
 
-# ---- KLSE SWING SECTION ----
-st.markdown("---")
-st.subheader("🇲🇾 KLSE Handpicked Swing Stocks (Daily, EMA200 Breakout)")
-klse_results = []
-for ticker in klse_list:
+if klse_on:
+    st.subheader("📜 Recent KLSE Signals (Last 10, from Google Sheet)")
     try:
-        dfd = yf.download(ticker, period="1y", interval="1d", progress=False, threads=False)
-        if dfd.empty or len(dfd) < 210: continue
-        dfd = norm(dfd)
-        try: dfd = ensure_core_cols(dfd)
-        except Exception: continue
-        dfd = calc_indicators(dfd)
-        prev, curr = dfd.iloc[-2], dfd.iloc[-1]
-        breakout = (prev['close'] < prev['ema200']) and (curr['close'] > curr['ema200'])
-        vol_avg = dfd['volume'][-20:-1].mean() + 1e-8
-        vol_mult = curr['volume'] / vol_avg
-        rsi_ok = curr['rsi14'] < 70
-        pct_above_ema = (curr['close'] - curr['ema200']) / curr['ema200'] * 100
-        score = 60 + min(40, pct_above_ema*6 + (vol_mult-1)*12)
-        score = int(max(50, min(score, 100)))
-        cond = breakout and (vol_mult > 1.5) and rsi_ok
-        if cond:
-            entry = curr['close']
-            atr = dfd['atr14'].iloc[-1]
-            target_val = max(2*atr, entry*0.01)
-            cut_val = max(1.5*atr, entry*0.007)
-            if target_val < entry*0.01: continue
-            shares = int(5000 // entry)
-            target_price = round(entry + target_val, 2)
-            cut_loss_price = round(entry - cut_val, 2)
-            klse_results.append({
-                "Ticker": ticker,
-                "Score": score,
-                "Entry": formatn(entry),
-                "Target Price": formatn(target_price),
-                "Cut Loss Price": formatn(cut_loss_price),
-                "Shares": shares,
-                "ATR": formatn(atr,2),
-                "Reason": f"Breakout +{pct_above_ema:.2f}%, Vol x{vol_mult:.2f}",
-                "Time Picked": local_time_str()
-            })
+        client = get_gspread_client_from_secrets()
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_KLSE)
+        records = sheet.get_all_records()
+        if records:
+            df_last = pd.DataFrame(records).tail(10)
+            st.dataframe(df_last, use_container_width=True)
+        else:
+            st.info("No recent KLSE signals found in KLSE tab.")
     except Exception as e:
-        continue
+        st.info(f"Unable to load KLSE signals: {e}")
 
-if klse_results:
-    dfk = pd.DataFrame(klse_results).sort_values("Score", ascending=False).reset_index(drop=True)
-    st.dataframe(dfk, use_container_width=True)
-else:
-    st.info("No KLSE swing stocks triggered today.")
-
-# --- Debug Info (optional)
 if show_debug:
     st.subheader("Debug: Issues Encountered")
     if debug_issues:
@@ -388,4 +439,4 @@ if show_debug:
     else:
         st.info("No issues.")
 
-st.caption("© AI Screener | S&P 100 & KLSE. US signals run pre-market, regular, and after-hours. KLSE uses daily bars only. Confidence scoring reflects signal strength.")
+st.caption("© AI Screener | S&P 100 + KLSE (Bursa Malaysia). Signals logged with market time, tab-separated. Confidence scoring reflects signal strength. All times are GMT+8.")
