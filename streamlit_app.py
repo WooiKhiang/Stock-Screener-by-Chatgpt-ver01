@@ -42,7 +42,6 @@ def formatn(num, d=2):
         return str(num)
 
 def norm(df):
-    # flatten, lower, strip spaces
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["_".join([str(x).lower() for x in c if x]) for c in df.columns]
     else:
@@ -164,7 +163,7 @@ debug_issues, results = [], []
 
 for ticker in sp100:
     try:
-        # --- Market Sentiment filter ---
+        # Market Sentiment filter
         if sentiment_text == "🔴 Bearish" and not is_defensive_sector(ticker):
             continue
 
@@ -175,9 +174,12 @@ for ticker in sp100:
             if df5.empty or df1h.empty: continue
             df5 = norm(df5)
             df1h = norm(df1h)
-            try: df5 = ensure_core_cols(df5); df1h = ensure_core_cols(df1h)
+            try:
+                df5 = ensure_core_cols(df5)
+                df1h = ensure_core_cols(df1h)
             except Exception as e:
-                debug_issues.append({"Ticker": ticker, "Issue": str(e)}); continue
+                debug_issues.append({"Ticker": ticker, "Issue": str(e)})
+                continue
             df5 = calc_indicators(df5)
             df1h = calc_indicators(df1h)
             c, ema40 = df5['close'].iloc[-1], df5['ema40'].iloc[-1]
@@ -225,9 +227,11 @@ for ticker in sp100:
             df = yf.download(ticker, period='3d', interval='5m', progress=False, threads=False)
             if df.empty: continue
             df = norm(df)
-            try: df = ensure_core_cols(df)
+            try:
+                df = ensure_core_cols(df)
             except Exception as e:
-                debug_issues.append({"Ticker": ticker, "Issue": str(e)}); continue
+                debug_issues.append({"Ticker": ticker, "Issue": str(e)})
+                continue
             df = calc_indicators(df)
             c, ema10, ema20, ema50 = df['close'].iloc[-1], df['ema10'].iloc[-1], df['ema20'].iloc[-1], df['ema50'].iloc[-1]
             macd, macdsignal = df['macd'].iloc[-1], df['macdsignal'].iloc[-1]
@@ -273,9 +277,11 @@ for ticker in sp100:
             dfd = yf.download(ticker, period="1y", interval="1d", progress=False, threads=False)
             if dfd.empty or len(dfd) < 210: continue
             dfd = norm(dfd)
-            try: dfd = ensure_core_cols(dfd)
+            try:
+                dfd = ensure_core_cols(dfd)
             except Exception as e:
-                debug_issues.append({"Ticker": ticker, "Issue": str(e)}); continue
+                debug_issues.append({"Ticker": ticker, "Issue": str(e)})
+                continue
             dfd = calc_indicators(dfd)
             prev, curr = dfd.iloc[-2], dfd.iloc[-1]
             breakout = (prev['close'] < prev['ema200']) and (curr['close'] > curr['ema200'])
