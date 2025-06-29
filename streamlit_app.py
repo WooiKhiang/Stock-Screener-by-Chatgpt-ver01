@@ -7,7 +7,7 @@ import pytz
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
-from datetime import datetime
+from datetime import datetime, time as dt_time
 
 # --- Config ---
 TELEGRAM_BOT_TOKEN = "7280991990:AAEk5x4XFCW_sTohAQGUujy1ECAQHjSY_OU"
@@ -29,16 +29,20 @@ sp100 = [
     'WFC','WMT','XOM'
 ]
 
-# --- Sidebar for settings ---
-st.sidebar.header("Trade Settings")
-min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
-max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
-min_vol = st.sidebar.number_input("Min Avg Vol (40)", value=100000)
-capital = st.sidebar.number_input("Capital per Trade ($)", value=1000.0, step=100.0)
-show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
+# --- Spam prevention: alert memory (session) ---
+if "alerted_today" not in st.session_state:
+    st.session_state["alerted_today"] = set()  # (ticker, strategy)
+
+# --- Market hours check ---
+def is_market_open():
+    now_et = datetime.now(pytz.timezone("US/Eastern"))
+    if now_et.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        return False
+    open_t = dt_time(9, 30)
+    close_t = dt_time(16, 0)
+    return open_t <= now_et.time() <= close_t
 
 def norm(df):
-    # Flatten MultiIndex and force all columns to lower case, no spaces
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [('_'.join([str(x) for x in col if x not in [None,'','nan']])).lower().replace(" ","_") for col in df.columns]
     else:
@@ -90,7 +94,6 @@ def ema200_breakout_daily(df):
     vol_mult = curr['volume'] / vol_avg
     rsi_ok = curr['rsi14'] < 70
     pct_above_ema = (curr['close'] - curr['ema200']) / curr['ema200'] * 100
-    # Confidence score = % above EMA200 + volume multiplier, rescaled
     score = int(60 + pct_above_ema*10 + (vol_mult-1)*15)
     score = max(60, min(score, 100))
     cond = breakout and (vol_mult > 1.5) and rsi_ok
@@ -108,7 +111,6 @@ def hybrid_signal(df5, df1h):
     pct_breakout = (c - ema40) / ema40 * 100
     pct_above_ema200 = (curr_1h['close'] - curr_1h['ema200']) / curr_1h['ema200'] * 100
     rsi_bonus = 5 if 55 <= curr_1h['rsi14'] <= 65 else 0
-    # Score = breakout % + volume spike + 1hr EMA200 + RSI bonus
     score = int(55 + pct_breakout*10 + (vol_spike-1)*20 + pct_above_ema200*5 + rsi_bonus)
     score = max(55, min(score, 99))
     cond = breakout and (vol_spike > 1.2) and above_ema200
@@ -145,6 +147,15 @@ def send_telegram_alert(message):
     except Exception as e:
         st.warning(f"Telegram alert failed: {e}")
 
+# --- Main Processing ---
+st.title("⭐ AI-Powered S&P100 Stock Screener (Spam-Proof, Smart Targeting)")
+st.caption(f"Last run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+market_status = "OPEN" if is_market_open() else "CLOSED"
+st.caption(f"Market Status: {market_status} (Alerts sent only if open)")
+
+min_target_pct = 0.01   # Minimum 1% target (as decimal)
+min_cutloss_pct = 0.007 # Minimum 0.7% cut loss
+
 results = []
 debug_issues = []
 
@@ -169,10 +180,14 @@ for ticker in sp100:
             atr = curr['atr14']
             if not (min_price <= price <= max_price): continue
             if curr['volume'] < min_vol: continue
-            shares = int(capital // price)
-            target_price = round(price + 2*atr, 2)
-            cut_loss_price = round(price - 1.5*atr, 2)
+            target_val = max(2*atr, price*min_target_pct)
+            cut_val = max(1.5*atr, price*min_cutloss_pct)
+            if target_val < price*min_target_pct: continue  # filter out too small
+            shares = int(st.session_state.get("capital", 1000) // price)
+            target_price = round(price + target_val, 2)
+            cut_loss_price = round(price - cut_val, 2)
             local_time = datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
+            sigid = (ticker, "EMA200 Breakout (Daily)")
             results.append({
                 "Ticker": ticker,
                 "Strategy": "EMA200 Breakout (Daily)",
@@ -184,9 +199,10 @@ for ticker in sp100:
                 "ATR": formatn(atr,2),
                 "Reason": reason,
                 "Type": "Swing",
-                "Time Picked": local_time
+                "Time Picked": local_time,
+                "SigID": sigid
             })
-            continue  # if breakout fires, don't double-count for hybrid
+            continue
 
         # --- Hybrid: 5-min entry + 1hr confirm
         df5 = yf.download(ticker, period='3d', interval='5m', progress=False, threads=False)
@@ -208,10 +224,14 @@ for ticker in sp100:
             atr = df5['atr14'].iloc[-1]
             if not (min_price <= price <= max_price): continue
             if df5['volume'].iloc[-1] < min_vol: continue
-            shares = int(capital // price)
-            target_price = round(price + 2*atr, 2)
-            cut_loss_price = round(price - 1.5*atr, 2)
+            target_val = max(2*atr, price*min_target_pct)
+            cut_val = max(1.5*atr, price*min_cutloss_pct)
+            if target_val < price*min_target_pct: continue
+            shares = int(st.session_state.get("capital", 1000) // price)
+            target_price = round(price + target_val, 2)
+            cut_loss_price = round(price - cut_val, 2)
             local_time = datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
+            sigid = (ticker, "Hybrid 5min+1hr Confirm")
             results.append({
                 "Ticker": ticker,
                 "Strategy": "Hybrid 5min+1hr Confirm",
@@ -223,7 +243,8 @@ for ticker in sp100:
                 "ATR": formatn(atr,2),
                 "Reason": reason,
                 "Type": "Hybrid",
-                "Time Picked": local_time
+                "Time Picked": local_time,
+                "SigID": sigid
             })
     except Exception as e:
         debug_issues.append({"Ticker": ticker, "Issue": str(e)})
@@ -236,44 +257,49 @@ if results:
     st.dataframe(df_out.head(5), use_container_width=True)
     
     # ---- TELEGRAM/GOOGLE SHEETS: Top 3 only ----
-    now_local = datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
-    telegram_msgs, gsheet_rows = [], []
-    for idx, row in df_out.head(3).iterrows():
-        msg = (
-            f"#AI_StockPick Rank #{idx+1}\n"
-            f"{row['Ticker']} | Strategy: {row['Strategy']}\n"
-            f"Entry: ${row['Entry']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
-            f"Shares: {row['Shares']} | ATR(14): {row['ATR']}\n"
-            f"Reason: {row['Reason']}\n"
-            f"Confidence Score: {row['Score']}\n"
-            f"Time Picked: {row['Time Picked']}"
-        )
-        telegram_msgs.append(msg)
-        gsheet_rows.append([
-            row['Time Picked'], row['Ticker'], row['Entry'], row['Target Price'], row['Cut Loss Price'],
-            row['Strategy'], row['Score'], row['Reason']
-        ])
-    for msg in telegram_msgs:
-        send_telegram_alert(msg)
-    append_to_gsheet(gsheet_rows)
+    if is_market_open():
+        now_local = datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
+        telegram_msgs, gsheet_rows = [], []
+        for idx, row in df_out.head(3).iterrows():
+            sigid = row['SigID']
+            if sigid in st.session_state["alerted_today"]:
+                continue  # skip duplicate
+            st.session_state["alerted_today"].add(sigid)
+            msg = (
+                f"#AI_StockPick Rank #{idx+1}\n"
+                f"{row['Ticker']} | Strategy: {row['Strategy']}\n"
+                f"Entry: ${row['Entry']} | Target: ${row['Target Price']} | Cut Loss: ${row['Cut Loss Price']}\n"
+                f"Shares: {row['Shares']} | ATR(14): {row['ATR']}\n"
+                f"Reason: {row['Reason']}\n"
+                f"Confidence Score: {row['Score']}\n"
+                f"Time Picked: {row['Time Picked']}"
+            )
+            telegram_msgs.append(msg)
+            gsheet_rows.append([
+                row['Time Picked'], row['Ticker'], row['Entry'], row['Target Price'], row['Cut Loss Price'],
+                row['Strategy'], row['Score'], row['Reason']
+            ])
+        for msg in telegram_msgs:
+            send_telegram_alert(msg)
+        append_to_gsheet(gsheet_rows)
+    else:
+        st.info("🔕 Market closed, no new alerts/logs sent.")
 
 else:
     st.info("No stocks met high-quality hybrid or EMA200 breakout criteria right now.")
 
-if show_debug and debug_issues:
+# --- Debug Info
+if st.sidebar.checkbox("Show Debug Info Table", value=False):
     st.sidebar.subheader("Debug Info (tickers with data issues)")
-    df_debug = pd.DataFrame(debug_issues)
-    st.sidebar.dataframe(df_debug)
+    if debug_issues:
+        df_debug = pd.DataFrame(debug_issues)
+        st.sidebar.dataframe(df_debug)
+    else:
+        st.sidebar.write("No debug issues.")
 
 st.markdown("""
 ---
-**Strategy Summary:**  
-- **Hybrid:** Enter on 5min EMA40 breakout *only if* 1hr price > EMA200 (trend confirmed). Score is proportional to breakout/volume/confirmation strength.  
-- **EMA200 Breakout:** Daily close above EMA200 + volume + RSI filter (the classic, rare but high conviction, score reflects strength).
-
-**Targets/Cut Loss (dynamic ATR):**  
-- Take Profit: Entry + 2×ATR(14)  
-- Cut Loss: Entry - 1.5×ATR(14)
-
+**Spam prevention:** Alerts/logs fire only during US market open, and only for new signals.  
+**ATR/Target filter:** No trade unless target ≥ 1% of price; no micro-win setups!
 **All times shown: GMT+8 (MY/SG time)**
 """)
