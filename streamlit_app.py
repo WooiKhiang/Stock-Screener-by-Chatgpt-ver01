@@ -404,15 +404,17 @@ for ticker in klse_list:
     except Exception as e:
         continue
 
+st.subheader("🇲🇾 KLSE: EMA200 Breakout (Daily)")
 if klse_results:
     df_klse = pd.DataFrame(klse_results)
-    st.subheader("🇲🇾 KLSE: EMA200 Breakout (Daily)")
     st.dataframe(df_klse, use_container_width=True)
     try:
         append_to_gsheet(df_klse.values.tolist(), KLSE_GOOGLE_SHEET_NAME)
     except Exception as e:
         st.warning(f"KLSE sheet log error: {e}")
-
+else:
+    st.info("No KLSE EMA200 breakouts found today.")
+    
 if show_debug:
     st.subheader("Debug: Issues Encountered")
     if debug_issues:
