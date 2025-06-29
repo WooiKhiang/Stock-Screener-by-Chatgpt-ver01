@@ -30,6 +30,13 @@ sp100 = [
     'WFC','WMT','XOM'
 ]
 
+# KLSE stocks to monitor (daily swing)
+klse_list = [
+    'MAYBANK.KL','PCHEM.KL','PBBANK.KL','TENAGA.KL','SIMEPLT.KL','CIMB.KL',
+    'SIME.KL','AXIATA.KL','MAXIS.KL','HARTA.KL','SUPERMX.KL','TOPGLOV.KL',
+    'IHH.KL','PETDAG.KL','PETGAS.KL','TM.KL','DIGI.KL','GENTING.KL','GENM.KL'
+]
+
 # ---- Helper Functions ----
 def formatn(num, d=2):
     try:
@@ -41,15 +48,12 @@ def formatn(num, d=2):
         return str(num)
 
 def norm(df):
-    """Flatten, lower, strip spaces in col names."""
     df.columns = [c.lower().replace(" ", "_") for c in df.columns]
     return df
 
 def ensure_core_cols(df):
-    # if MultiIndex, flatten
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["_".join([str(x).lower() for x in c if x]) for c in df.columns]
-    # ensure all core
     req = ["close","open","high","low","volume"]
     missing = [x for x in req if x not in df.columns]
     if missing:
@@ -62,28 +66,33 @@ def calc_indicators(df):
     df['ema10'] = df['close'].ewm(span=10, min_periods=10).mean()
     df['ema20'] = df['close'].ewm(span=20, min_periods=20).mean()
     df['ema50'] = df['close'].ewm(span=50, min_periods=50).mean()
-    df['rsi14'] = pd.Series(df['close']).rolling(window=14).apply(
-        lambda x: 100 - (100 / (1 + (np.mean(np.maximum(x[1:]-x[:-1],0)) / (np.mean(np.maximum(-(x[1:]-x[:-1]),0))+1e-9)))), raw=True)
+    # RSI
     delta = df['close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
-    roll_up = up.rolling(window=14).mean()
-    roll_down = down.rolling(window=14).mean()
+    roll_up = up.rolling(14).mean()
+    roll_down = down.rolling(14).mean()
     rs = roll_up / (roll_down + 1e-9)
     df['rsi14'] = 100 - (100 / (1 + rs))
+    # MACD
     ema12 = df['close'].ewm(span=12, min_periods=12).mean()
     ema26 = df['close'].ewm(span=26, min_periods=26).mean()
     df['macd'] = ema12 - ema26
     df['macdsignal'] = df['macd'].ewm(span=9, min_periods=9).mean()
-    df['atr14'] = pd.Series(df['high']-df['low']).rolling(14).mean()
+    # ATR
+    high_low = df['high'] - df['low']
+    high_prevclose = np.abs(df['high'] - df['close'].shift(1))
+    low_prevclose = np.abs(df['low'] - df['close'].shift(1))
+    ranges = pd.concat([high_low, high_prevclose, low_prevclose], axis=1)
+    df['atr14'] = ranges.max(axis=1).rolling(14).mean()
     return df
 
 def is_market_open():
-    # Allow PRE, REGULAR, POST market for signal sending
+    # Allow PRE, REGULAR, POST market for signal sending (US)
     eastern = pytz.timezone("US/Eastern")
     now_et = datetime.now(pytz.utc).astimezone(eastern)
     t = now_et.time()
-    return ((dt_time(4,0) <= t < dt_time(20,0)))  # US stocks: pre 4am-9:30am, reg 9:30am-4pm, post 4pm-8pm
+    return ((dt_time(4,0) <= t < dt_time(20,0)))
 
 def send_telegram_alert(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -310,6 +319,68 @@ if results:
 else:
     st.warning("No current signals found.")
 
+# ---- LAST SIGNALS HISTORY TABLE (Google Sheets) ----
+st.subheader("📜 Last 10 Signals History (from Google Sheet)")
+try:
+    client = get_gspread_client_from_secrets()
+    sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
+    data = sheet.get_all_values()
+    df_hist = pd.DataFrame(data[1:], columns=data[0])  # skip header row
+    st.dataframe(df_hist.tail(10).iloc[::-1].reset_index(drop=True), use_container_width=True)
+except Exception as e:
+    st.info(f"History unavailable ({e})")
+
+# ---- KLSE SWING SECTION ----
+st.markdown("---")
+st.subheader("🇲🇾 KLSE Handpicked Swing Stocks (Daily, EMA200 Breakout)")
+klse_results = []
+for ticker in klse_list:
+    try:
+        dfd = yf.download(ticker, period="1y", interval="1d", progress=False, threads=False)
+        if dfd.empty or len(dfd) < 210: continue
+        dfd = norm(dfd)
+        try: dfd = ensure_core_cols(dfd)
+        except Exception: continue
+        dfd = calc_indicators(dfd)
+        prev, curr = dfd.iloc[-2], dfd.iloc[-1]
+        breakout = (prev['close'] < prev['ema200']) and (curr['close'] > curr['ema200'])
+        vol_avg = dfd['volume'][-20:-1].mean() + 1e-8
+        vol_mult = curr['volume'] / vol_avg
+        rsi_ok = curr['rsi14'] < 70
+        pct_above_ema = (curr['close'] - curr['ema200']) / curr['ema200'] * 100
+        score = 60 + min(40, pct_above_ema*6 + (vol_mult-1)*12)
+        score = int(max(50, min(score, 100)))
+        cond = breakout and (vol_mult > 1.5) and rsi_ok
+        if cond:
+            entry = curr['close']
+            atr = dfd['atr14'].iloc[-1]
+            target_val = max(2*atr, entry*0.01)
+            cut_val = max(1.5*atr, entry*0.007)
+            if target_val < entry*0.01: continue
+            shares = int(5000 // entry)
+            target_price = round(entry + target_val, 2)
+            cut_loss_price = round(entry - cut_val, 2)
+            klse_results.append({
+                "Ticker": ticker,
+                "Score": score,
+                "Entry": formatn(entry),
+                "Target Price": formatn(target_price),
+                "Cut Loss Price": formatn(cut_loss_price),
+                "Shares": shares,
+                "ATR": formatn(atr,2),
+                "Reason": f"Breakout +{pct_above_ema:.2f}%, Vol x{vol_mult:.2f}",
+                "Time Picked": local_time_str()
+            })
+    except Exception as e:
+        continue
+
+if klse_results:
+    dfk = pd.DataFrame(klse_results).sort_values("Score", ascending=False).reset_index(drop=True)
+    st.dataframe(dfk, use_container_width=True)
+else:
+    st.info("No KLSE swing stocks triggered today.")
+
+# --- Debug Info (optional)
 if show_debug:
     st.subheader("Debug: Issues Encountered")
     if debug_issues:
@@ -317,4 +388,4 @@ if show_debug:
     else:
         st.info("No issues.")
 
-st.caption("© AI Screener | S&P 100. Signals include pre-market, regular, and after-hours. Confidence scoring reflects signal strength.")
+st.caption("© AI Screener | S&P 100 & KLSE. US signals run pre-market, regular, and after-hours. KLSE uses daily bars only. Confidence scoring reflects signal strength.")
