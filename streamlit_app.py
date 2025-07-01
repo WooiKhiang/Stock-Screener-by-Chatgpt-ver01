@@ -163,9 +163,10 @@ debug_issues, results = [], []
 
 for ticker in sp100:
     try:
-        # Market Sentiment filter
+        # Market Sentiment filter: Only restrict on Bearish; for Sideways and Bullish, scan all
         if sentiment_text == "🔴 Bearish" and not is_defensive_sector(ticker):
             continue
+        # No restriction for "🟡 Sideways" or "🟢 Bullish"
 
         # --- Hybrid 5m+1h Confirm ---
         if hybrid_on:
