@@ -5,37 +5,37 @@ import numpy as np
 import pytz
 from datetime import datetime, time as dt_time
 
-# -- Ticker Universe --
-SP100 = [
-    'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO','AXP','BA','BAC','BK','BKNG','BLK','BMY','BRK-B','C','CAT',
-    'CHTR','CL','CMCSA','COF','COP','COST','CRM','CSCO','CVS','CVX','DHR','DIS','DOW','DUK','EMR','EXC','F','FDX','FOX','FOXA',
-    'GD','GE','GILD','GM','GOOG','GOOGL','GS','HD','HON','IBM','INTC','JNJ','JPM','KHC','KMI','KO','LIN','LLY','LMT','LOW',
-    'MA','MCD','MDLZ','MDT','MET','META','MMM','MO','MRK','MS','MSFT','NEE','NFLX','NKE','NVDA','ORCL','PEP','PFE','PG','PM',
-    'PYPL','QCOM','RTX','SBUX','SCHW','SO','SPG','T','TGT','TMO','TMUS','TSLA','TXN','UNH','UNP','UPS','USB','V','VZ','WBA',
+# ---- CONFIG ----
+sp100 = [
+    'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO',
+    'AXP','BA','BAC','BK','BKNG','BLK','BMY','BRK-B','C','CAT',
+    'CHTR','CL','CMCSA','COF','COP','COST','CRM','CSCO','CVS','CVX',
+    'DHR','DIS','DOW','DUK','EMR','EXC','F','FDX','FOX','FOXA',
+    'GD','GE','GILD','GM','GOOG','GOOGL','GS','HD','HON','IBM',
+    'INTC','JNJ','JPM','KHC','KMI','KO','LIN','LLY','LMT','LOW',
+    'MA','MCD','MDLZ','MDT','MET','META','MMM','MO','MRK','MS',
+    'MSFT','NEE','NFLX','NKE','NVDA','ORCL','PEP','PFE','PG','PM',
+    'PYPL','QCOM','RTX','SBUX','SCHW','SO','SPG','T','TGT','TMO',
+    'TMUS','TSLA','TXN','UNH','UNP','UPS','USB','V','VZ','WBA',
     'WFC','WMT','XOM'
 ]
-NDX100 = [
-    'AAPL','MSFT','GOOGL','GOOG','AMZN','NVDA','META','PEP','COST','AVGO','TMUS','CSCO','ADBE','CMCSA','TXN','AMGN','AMAT','INTC','QCOM','GILD',
-    'REGN','LRCX','ADP','SBUX','MDLZ','VRTX','ISRG','INTU','MU','MAR','ADI','CTAS','ATVI','KLAC','MELI','IDXX','CDNS','ASML','DXCM','PANW',
-    'CSX','SNPS','MNST','ORLY','EXC','AEP','KDP','ODFL','FAST','PCAR','XEL','SGEN','ROST','PAYX','BIIB','EA','DLTR','PDD','ILMN','SIRI',
-    'ANSS','TEAM','MRVL','WDAY','CPRT','CTSH','JD','LCID','BKR','CHTR','ALGN','EBAY','SWKS','TTD','ZS','VRSK','NTES','OKTA','MTCH','CRWD',
-    'DOCU','DDOG','FANG','PTON','VRSN','FOXA','FOX','ZM','BIDU','SPLK','UAL','LULU','EXPE','SGEN','NXPI','BMRN','WBD','LKQ'
-]
-TICKERS = sorted(set(SP100 + NDX100))
 
-# -- Helper functions --
-def formatn(num, d=2, pct=False):
+nasdaq100 = [
+    'AAPL','ADBE','ADP','AMD','AMGN','AMZN','ANSS','ASML','ATVI','ADSK','BIIB','BKNG','CDNS','CDW','CERN','CHTR','CMCSA','COST','CPRT','CRWD','CSCO','CSX','CTAS','CTSH','DDOG','DLTR','DOCU','DXCM','EA','EBAY','EXC','FAST','FISV','FTNT','GILD','GOOG','GOOGL','HON','IDXX','ILMN','INTC','INTU','ISRG','JD','KDP','KHC','KLAC','LCID','LRCX','LULU','MAR','MCHP','MDLZ','MELI','META','MNST','MRNA','MSFT','MU','NFLX','NVDA','NXPI','ODFL','OKTA','ORLY','PANW','PAYX','PCAR','PEP','PDD','PYPL','QCOM','REGN','ROST','SBUX','SGEN','SIRI','SNPS','SPLK','SWKS','TEAM','TMUS','TSLA','TXN','VRSK','VRSN','VRTX','WBA','WDAY','XEL','ZM','ZS'
+]
+universe = sorted(list(set(sp100 + nasdaq100)))
+
+# ---- UTILS ----
+def formatn(val, d=2):
+    if isinstance(val, str): return val
     try:
-        if num is None or num == "" or np.isnan(num): return "-"
-        if pct:
-            return f"{num:.{d}f}%"
-        if isinstance(num, int) or d == 0:
-            return f"{int(num):,}"
-        return f"{num:,.{d}f}"
-    except Exception:
-        return str(num)
+        if np.isnan(val): return "-"
+        if abs(val) >= 1e6: return f"{val:,.0f}"
+        return f"{val:,.{d}f}"
+    except Exception: return str(val)
 
 def norm(df):
+    # flatten, lower, strip spaces
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["_".join([str(x).lower() for x in c if x]) for c in df.columns]
     else:
@@ -59,6 +59,7 @@ def ensure_core_cols(df):
 def calc_indicators(df):
     df['ema10'] = df['close'].ewm(span=10, min_periods=10).mean()
     df['ema20'] = df['close'].ewm(span=20, min_periods=20).mean()
+    df['ema50'] = df['close'].ewm(span=50, min_periods=50).mean()
     # RSI
     delta = df['close'].diff()
     up = delta.clip(lower=0)
@@ -74,12 +75,9 @@ def calc_indicators(df):
     df['macdsignal'] = df['macd'].ewm(span=9, min_periods=9).mean()
     return df
 
-def local_time_str():
-    return datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
-
 def get_market_sentiment():
     try:
-        spy = yf.download('SPY', period='1d', interval='5m', progress=False, threads=False)
+        spy = yf.download('SPY', period='2d', interval='1h', progress=False, threads=False)
         if spy.empty: return 0, "Sentiment: Unknown"
         spy = norm(spy)
         spy = ensure_core_cols(spy)
@@ -91,88 +89,103 @@ def get_market_sentiment():
     except Exception:
         return 0, "Sentiment: Unknown"
 
-# --- Sidebar ---
-st.sidebar.header("KIV Signal Parameters")
-min_vol = st.sidebar.number_input("Min Volume (last 1h bar)", value=100000, step=10000)
+def local_time_str():
+    return datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
+
+# ---- SIDEBAR ----
+st.sidebar.title("KIV Signal Parameters")
+min_vol = st.sidebar.number_input("Min Volume (last 1h bar)", value=100000)
 min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
-min_rsi = st.sidebar.number_input("Min RSI", value=35, min_value=0, max_value=100)
-max_rsi = st.sidebar.number_input("Max RSI", value=65, min_value=0, max_value=100)
+rsi_min = st.sidebar.number_input("Min RSI (14)", value=35)
+rsi_max = st.sidebar.number_input("Max RSI (14)", value=65)
 
-# --- Market Sentiment ---
+# ---- TITLE ----
 sentiment_pct, sentiment_text = get_market_sentiment()
 st.title("AI-Powered US Stocks Screener: 1h KIV + MACD Reference Table")
 st.caption(f"Last run: {local_time_str()}")
-st.markdown(f"### Market Sentiment: {'🟢' if 'Bullish' in sentiment_text else '🔴' if 'Bearish' in sentiment_text else '🟡'} {sentiment_text} ({formatn(sentiment_pct,2,pct=True)})")
+st.markdown(f"**Market Sentiment:** {sentiment_text} ({formatn(sentiment_pct,2)}%)")
 
-# --- Screener Logic ---
-kiv_results = []
-macd_crosses = []
-for ticker in TICKERS:
+# ---- MAIN LOGIC ----
+kiv_rows = []
+macdref_rows = []
+
+N_REF = 20  # Last N bars for MACD ref
+
+for ticker in universe:
     try:
         df = yf.download(ticker, period='30d', interval='1h', progress=False, threads=False)
-        if df.empty or len(df) < 30: continue
+        if df.empty or len(df) < max(25, N_REF+10): continue
         df = norm(df)
         df = ensure_core_cols(df)
         df = calc_indicators(df)
-        macd = df['macd'].iloc[-1]
-        macdsignal = df['macdsignal'].iloc[-1]
-        close = df['close'].iloc[-1]
-        vol = df['volume'].iloc[-1]
-        rsi = df['rsi14'].iloc[-1]
-        # --- Main KIV Signal Logic (strict) ---
-        macd_prev_10 = df['macd'].iloc[-10] if len(df) > 10 else None
-        macd_prev_5 = df['macd'].iloc[-5] if len(df) > 5 else None
-        ema10 = df['ema10'].iloc[-1]
-        ema20 = df['ema20'].iloc[-1]
-        rsi_is_growing = rsi > df['rsi14'].iloc[-2] > df['rsi14'].iloc[-3]
-        macd_uptrend = macd_prev_10 is not None and macd_prev_5 is not None and macd_prev_10 < macd_prev_5 < macd
-        cond_kiv = (
-            macd > 0 and macdsignal < 0 and
-            macd_uptrend and
-            min_rsi <= rsi <= max_rsi and rsi_is_growing and
-            ema10 > ema20 and ema10 > df['ema10'].iloc[-2] and
-            min_price <= close <= max_price and vol >= min_vol
-        )
-        if cond_kiv:
-            kiv_results.append({
+        # --- KIV: Only last bar ---
+        i = -1  # last bar only
+        row = df.iloc[i]
+        # (1) MACD cross up zero (prev <0, now >0), signal still <0
+        macd_prev, macd_now = df['macd'].iloc[i-1], df['macd'].iloc[i]
+        macdsig_now = df['macdsignal'].iloc[i]
+        cross_up = (macd_prev < 0) and (macd_now > 0) and (macdsig_now < 0)
+        # (2) MACD trend: 10 bars ago < 5 bars ago < now
+        macd_10 = df['macd'].iloc[i-10] if i-10 >= -len(df) else None
+        macd_5 = df['macd'].iloc[i-5] if i-5 >= -len(df) else None
+        macd_uptrend = (macd_10 is not None and macd_5 is not None and macd_10 < macd_5 < macd_now)
+        # (3) RSI range + rising from below
+        rsi_now = row['rsi14']
+        rsi_prev = df['rsi14'].iloc[i-5]
+        rsi_cond = rsi_min <= rsi_now <= rsi_max and (rsi_now > rsi_prev)
+        # (4) EMA10 > EMA20 and EMA10 rising
+        ema10, ema20 = row['ema10'], row['ema20']
+        ema10_prev = df['ema10'].iloc[i-5]
+        ema_cond = (ema10 > ema20) and (ema10 > ema10_prev)
+        # --- All criteria ---
+        price, vol = row['close'], row['volume']
+        price_ok = min_price <= price <= max_price
+        vol_ok = vol >= min_vol
+
+        if all([cross_up, macd_uptrend, rsi_cond, ema_cond, price_ok, vol_ok]):
+            kiv_rows.append({
                 "Ticker": ticker,
-                "Signal Time": local_time_str(),
-                "MACD": formatn(macd, 4),
-                "MACD Signal": formatn(macdsignal, 4),
-                "RSI": formatn(rsi, 2),
-                "Price": formatn(close, 2),
+                "Signal Time": row.name.strftime('%Y-%m-%d %H:%M'),
+                "MACD": formatn(macd_now, 4),
+                "MACD Signal": formatn(macdsig_now, 4),
+                "Price": formatn(price, 2),
+                "RSI": formatn(rsi_now, 2),
                 "Volume": f"{int(vol):,}"
             })
-        # --- MACD Cross Reference Table (no RSI/EMA) ---
-        macd_ref_cross = (macd > 0) and (macdsignal < 0)
-        if macd_ref_cross:
-            macd_crosses.append({
-                "Ticker": ticker,
-                "Signal Time": local_time_str(),
-                "MACD": formatn(macd, 4),
-                "MACD Signal": formatn(macdsignal, 4),
-                "Price": formatn(close, 2),
-                "Volume": f"{int(vol):,}"
-            })
+        # --- Reference table: last N bars, all events (NO FILTERS except MACD cross up zero & sig <0) ---
+        for j in range(-N_REF, 0):
+            if j < -len(df)+1: continue
+            macd_p, macd_c = df['macd'].iloc[j-1], df['macd'].iloc[j]
+            macdsig_c = df['macdsignal'].iloc[j]
+            if macd_p < 0 and macd_c > 0 and macdsig_c < 0:
+                macdref_rows.append({
+                    "Ticker": ticker,
+                    "Signal Time": df.index[j].strftime('%Y-%m-%d %H:%M'),
+                    "MACD": formatn(macd_c, 4),
+                    "MACD Signal": formatn(macdsig_c, 4),
+                    "Price": formatn(df['close'].iloc[j], 2),
+                    "Volume": f"{int(df['volume'].iloc[j]):,}"
+                })
     except Exception as e:
         continue
 
-# --- Output Main KIV Signal Table ---
-st.markdown("#### 📝 1h KIV Signal Setups (Strict All-Criteria Matches)")
-if kiv_results:
-    df_kiv = pd.DataFrame(kiv_results)
+# ---- MAIN TABLE ----
+st.markdown("### 📝 1h KIV Signal Setups (Strict All-Criteria Matches)")
+if kiv_rows:
+    df_kiv = pd.DataFrame(kiv_rows)
     st.dataframe(df_kiv, use_container_width=True)
+    st.caption(f"Example: {df_kiv.iloc[0].to_dict()}")
 else:
     st.info("No current 1h KIV signals found.")
 
-# --- Output Reference Table ---
-st.markdown("#### 🗒️ Reference: MACD Crosses Zero, Signal Still Below Zero (No RSI/EMA Filter)")
-if macd_crosses:
-    df_ref = pd.DataFrame(macd_crosses)
+# ---- REFERENCE TABLE ----
+st.markdown("### 📝 Reference: MACD Crosses Zero, Signal Still Below Zero (No RSI/EMA Filter)")
+if macdref_rows:
+    df_ref = pd.DataFrame(macdref_rows)
     st.dataframe(df_ref, use_container_width=True)
+    st.caption(f"Example: {df_ref.iloc[0].to_dict()}")
 else:
-    st.info("No current MACD ref signals found.")
+    st.info("No recent MACD cross-up signals found in last 20 bars.")
 
-st.caption("© AI Screener | S&P 100 + NASDAQ 100. 1h chart. Market sentiment adjusts screening. RSI filter only applies to KIV Table.")
-
+st.caption("© AI Screener | S&P 100 + NASDAQ 100 | 1h chart. Market sentiment adjusts screening. Reference table = research-only.")
