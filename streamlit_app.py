@@ -7,9 +7,11 @@ from datetime import datetime, time as dt_time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
-import time
 
-# ---- Ticker List ----
+# ---- Config ----
+GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
+GOOGLE_SHEET_NAME = "MACD Cross"
+
 sp100 = [
     'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO',
     'AXP','BA','BAC','BK','BKNG','BLK','BMY','BRK-B','C','CAT',
@@ -25,21 +27,22 @@ sp100 = [
 ]
 
 nasdaq100 = [
-    'AAPL','MSFT','AMZN','NVDA','GOOGL','GOOG','META','AVGO','ADBE','COST','TSLA','PEP',
-    'AMD','NFLX','CSCO','INTC','CMCSA','TXN','QCOM','HON','INTU','SBUX','AMGN','GILD',
-    'BKNG','ISRG','MDLZ','REGN','ADI','VRTX','ABNB','LRCX','MU','SNPS','ASML','CRWD',
-    'MRNA','PDD','PYPL','ZM','KLAC','WDAY','MAR','PANW','DXCM','MNST','CDNS','ROST','KDP',
-    'AEP','CSX','PCAR','CHTR','MELI','IDXX','EXC','CTAS','XEL','ORLY','PAYX','FAST',
-    'TEAM','SGEN','ANSS','ALGN','VRSK','CTSH','SIRI'
+    "AAPL","MSFT","GOOGL","AMZN","META","NVDA","TSLA","GOOG","COST","PEP",
+    "AVGO","QCOM","AMGN","TXN","CSCO","ADBE","TMUS","NFLX","AMD","HON",
+    "SBUX","BKNG","INTC","AMAT","ADI","MDLZ","PDD","REGN","ISRG","VRTX",
+    "GILD","ZM","FISV","MAR","PANW","MELI","LRCX","ADP","CRWD","ASML",
+    "CTSH","CHTR","ORLY","KLAC","IDXX","CDNS","AEP","MNST","MRNA","BIDU",
+    "ROST","CPRT","CTAS","WDAY","FAST","SGEN","DLTR","BIIB","ODFL","PAYX",
+    "XEL","KDP","DXCM","PCAR","EA","CSGP","DDOG","SIRI","EXC","ANSS",
+    "SPLK","VRSK","SGEN","ALGN","WBA","WBD","LCID","CEG","ZS","JD","FOXA",
+    "OKTA","GEN","TEAM","VERU","PINS","DOCU","BKR","MTCH","MRVL","LULU",
+    "ILMN","PEAK","KHC","HBAN","CDW","SGEN","TECH","WDC","TTD"
 ]
-
-all_tickers = sorted(set(sp100 + nasdaq100))
+universe = sorted(set(sp100 + nasdaq100))
 
 # ---- Helper Functions ----
-def formatn(num, d=2, pct=False):
+def formatn(num, d=2):
     try:
-        if pct:
-            return f"{num:.2f}%"
         if num is None or num == "" or np.isnan(num): return "-"
         if isinstance(num, int) or d == 0:
             return f"{int(num):,}"
@@ -71,6 +74,12 @@ def ensure_core_cols(df):
 def calc_indicators(df):
     df['ema10'] = df['close'].ewm(span=10, min_periods=10).mean()
     df['ema20'] = df['close'].ewm(span=20, min_periods=20).mean()
+    # MACD
+    ema12 = df['close'].ewm(span=12, min_periods=12).mean()
+    ema26 = df['close'].ewm(span=26, min_periods=26).mean()
+    df['macd'] = ema12 - ema26
+    df['macdsignal'] = df['macd'].ewm(span=9, min_periods=9).mean()
+    df['hist'] = df['macd'] - df['macdsignal']
     # RSI
     delta = df['close'].diff()
     up = delta.clip(lower=0)
@@ -79,16 +88,9 @@ def calc_indicators(df):
     roll_down = down.rolling(window=14).mean()
     rs = roll_up / (roll_down + 1e-9)
     df['rsi14'] = 100 - (100 / (1 + rs))
-    # MACD
-    ema12 = df['close'].ewm(span=12, min_periods=12).mean()
-    ema26 = df['close'].ewm(span=26, min_periods=26).mean()
-    df['macd'] = ema12 - ema26
-    df['macdsignal'] = df['macd'].ewm(span=9, min_periods=9).mean()
-    df['hist'] = df['macd'] - df['macdsignal']
+    # Volume avg
+    df['avgvol20'] = df['volume'].rolling(20).mean()
     return df
-
-def local_time_str():
-    return datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
 
 def get_market_sentiment():
     try:
@@ -104,114 +106,122 @@ def get_market_sentiment():
     except Exception:
         return 0, "Sentiment: Unknown"
 
-# ---- Sidebar (RSI Filter) ----
-st.sidebar.header("KIV RSI Filter (applies to KIV signals only)")
-min_rsi = st.sidebar.number_input("Min RSI", value=35, min_value=0, max_value=100)
-max_rsi = st.sidebar.number_input("Max RSI", value=70, min_value=0, max_value=100)
+def local_time_str():
+    return datetime.now(pytz.timezone("Asia/Singapore")).strftime('%Y-%m-%d %H:%M:%S')
 
-# ---- Market Sentiment ----
+def get_gspread_client_from_secrets():
+    info = st.secrets["gcp_service_account"]
+    creds_dict = {k: v for k, v in info.items()}
+    if isinstance(creds_dict["private_key"], list):
+        creds_dict["private_key"] = "\n".join(creds_dict["private_key"])
+    creds_json = json.dumps(creds_dict)
+    scope = ["https://spreadsheets.google.com/feeds",'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
+    return gspread.authorize(creds)
+
+def append_to_gsheet(rows, sheet_name):
+    try:
+        client = get_gspread_client_from_secrets()
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(sheet_name)
+        for row in rows:
+            sheet.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        st.warning(f"Google Sheet ({sheet_name}): {e}")
+
+# ---- Sidebar ----
+st.sidebar.header("Filter Settings")
+min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
+max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
+min_vol = st.sidebar.number_input("Min Volume (last bar)", value=100_000)
+min_avgvol = st.sidebar.number_input("Min Avg Volume (20 bars)", value=200_000)
+rsi_min = st.sidebar.number_input("RSI Min", value=35, min_value=1, max_value=99)
+rsi_max = st.sidebar.number_input("RSI Max", value=60, min_value=1, max_value=99)
+show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
+
+# ---- Main ----
 sentiment_pct, sentiment_text = get_market_sentiment()
-st.title("AI S&P100 + NASDAQ100: 1h MACD KIV Screener")
+st.title("MACD/EMA/RSI Stock Screener (S&P 100 + NASDAQ 100, 1h)")
 st.caption(f"Last run: {local_time_str()}")
 st.caption(f"Market Sentiment: {sentiment_text} ({sentiment_pct:.2f}%)")
 
-# ---- KIV List Finder ----
-kiv_results = []
-reference_results = []
+if "alerted_today" not in st.session_state: st.session_state["alerted_today"] = set()
+debug_issues, results, reference = [], [], []
 
-for ticker in all_tickers:
+for ticker in universe:
     try:
-        df = yf.download(ticker, period='60d', interval='1h', progress=False, threads=False)
-        if df.empty or len(df) < 20: continue
+        df = yf.download(ticker, period='15d', interval='1h', progress=False, threads=False)
+        if df.empty or len(df) < 35: continue
         df = norm(df)
         df = ensure_core_cols(df)
         df = calc_indicators(df)
-
-        macd = df['macd']
-        macdsig = df['macdsignal']
-        hist = df['hist']
-        rsi = df['rsi14']
-        close = df['close']
-        ema10 = df['ema10']
-        ema20 = df['ema20']
-        time_idx = df.index
-
-        # Check for MACD cross up zero, MACD signal below zero, reference table
-        cross_idx = np.where((macd > 0) & (macd.shift(1) < 0) & (macdsig < 0))[0]
-        for idx in cross_idx:
-            row = {
+        # Reference events: MACD cross up zero, signal still below zero
+        curr, prev = df.iloc[-1], df.iloc[-2]
+        cross_up = (prev['macd'] < 0) and (curr['macd'] > 0) and (curr['macdsignal'] < 0)
+        if cross_up:
+            reference.append({
                 "Ticker": ticker,
-                "Datetime": time_idx[idx].strftime('%Y-%m-%d %H:%M'),
-                "MACD": formatn(macd.iloc[idx], 3),
-                "MACDsig": formatn(macdsig.iloc[idx], 3),
-                "RSI": formatn(rsi.iloc[idx], 2),
-                "Close": formatn(close.iloc[idx]),
-            }
-            reference_results.append(row)
-
-        # Now, apply KIV rules (only for most recent bar)
-        idx = len(df)-1
-        # 1. MACD cross up zero (now > 0, prev < 0), macdsig < 0 now
-        cond_macd = (macd.iloc[idx] > 0 and macd.iloc[idx-1] < 0 and macdsig.iloc[idx] < 0)
-        # 2. MACD 10 bars ago < MACD 5 bars ago < current MACD (rising)
-        cond_macd_rising = (macd.iloc[idx-10] < macd.iloc[idx-5] < macd.iloc[idx])
-        # 3. RSI in range
-        rsi_now = rsi.iloc[idx]
-        cond_rsi = (min_rsi <= rsi_now <= max_rsi)
-        # 4. EMA10 > EMA20 and EMA10 rising
-        cond_ema = (ema10.iloc[idx] > ema20.iloc[idx]) and (ema10.iloc[idx] > ema10.iloc[idx-1])
-        # 5. Histogram momentum: now > 5 bars ago
-        cond_hist = (hist.iloc[idx-5] <= hist.iloc[idx])
-        # If all KIV conditions met:
-        if cond_macd and cond_macd_rising and cond_rsi and cond_ema and cond_hist:
-            # Entry/TP logic
-            rsi_zone = "Low" if rsi_now < 60 else "High"
-            entry_price = close.iloc[idx]
-            tp_pct = 0.05
-            cl_pct = 0.025
-            if rsi_now < 60:
-                # Immediate entry
-                action = "Enter now (RSI 35–60)"
-                buy_price = entry_price
-            else:
-                # Wait for 1% dip
-                action = "Wait for 1% dip (RSI 60–70)"
-                buy_price = entry_price * 0.99
-            take_profit = buy_price * (1+tp_pct)
-            cut_loss = buy_price * (1-cl_pct)
-            kiv_results.append({
-                "Ticker": ticker,
-                "Datetime": time_idx[idx].strftime('%Y-%m-%d %H:%M'),
-                "RSI": formatn(rsi_now, 2),
-                "Entry Action": action,
-                "Entry Price": formatn(buy_price, 2),
-                "Take Profit": formatn(take_profit, 2),
-                "Cut Loss": formatn(cut_loss, 2),
-                "MACD": formatn(macd.iloc[idx], 3),
-                "MACDsig": formatn(macdsig.iloc[idx], 3),
-                "EMA10": formatn(ema10.iloc[idx], 2),
-                "EMA20": formatn(ema20.iloc[idx], 2),
-                "Histogram": formatn(hist.iloc[idx], 3),
+                "Time": local_time_str(),
+                "Close": formatn(curr['close']),
+                "MACD": formatn(curr['macd'], 3),
+                "MACD Signal": formatn(curr['macdsignal'], 3),
+                "Hist": formatn(curr['hist'], 3),
+                "RSI": formatn(curr['rsi14'], 2),
+                "EMA10": formatn(curr['ema10'], 2),
+                "EMA20": formatn(curr['ema20'], 2),
+                "Vol": formatn(curr['volume'], 0)
             })
-
+        # Screener: only apply main logic
+        screener_cond = (
+            cross_up and
+            (rsi_min <= curr['rsi14'] <= rsi_max) and
+            (curr['ema10'] > curr['ema20']) and
+            (curr['hist'] > 0) and
+            (min_price <= curr['close'] <= max_price) and
+            (curr['volume'] >= min_vol) and
+            (curr['avgvol20'] >= min_avgvol)
+        )
+        if screener_cond:
+            results.append({
+                "Ticker": ticker,
+                "Time": local_time_str(),
+                "Close": formatn(curr['close']),
+                "MACD": formatn(curr['macd'], 3),
+                "MACD Signal": formatn(curr['macdsignal'], 3),
+                "Hist": formatn(curr['hist'], 3),
+                "RSI": formatn(curr['rsi14'], 2),
+                "EMA10": formatn(curr['ema10'], 2),
+                "EMA20": formatn(curr['ema20'], 2),
+                "Volume": formatn(curr['volume'], 0),
+                "AvgVol20": formatn(curr['avgvol20'], 0)
+            })
     except Exception as e:
+        debug_issues.append({"Ticker": ticker, "Issue": str(e)})
         continue
 
-# ---- OUTPUT ----
-if kiv_results:
-    st.subheader("🟢 1h KIV Buy List (Filtered, Ready to Watch/Enter)")
-    df_kiv = pd.DataFrame(kiv_results)
-    st.dataframe(df_kiv, use_container_width=True)
-    st.markdown("**Entry/TP logic:**\n- RSI 35–60: Buy at close\n- RSI 60–70: Wait for 1% drop\n- TP: 5%, CL: 2.5%, Time stop: 5 bars")
+# ---- OUTPUT TABLES ----
+if results:
+    df_out = pd.DataFrame(results)
+    st.subheader("⭐ Filtered Signals (MACD/RSI/EMA/Vol)")
+    st.dataframe(df_out, use_container_width=True)
+    try:
+        append_to_gsheet(df_out.values.tolist(), GOOGLE_SHEET_NAME)
+    except Exception as e:
+        st.warning(f"Failed to write to sheet: {e}")
 else:
-    st.info("No current 1h KIV signals found.")
+    st.info("No current signals found.")
 
-if reference_results:
-    st.subheader("📋 MACD Zero Cross Reference (Recent 1h Events, All Tickers)")
-    df_ref = pd.DataFrame(reference_results)
+if reference:
+    df_ref = pd.DataFrame(reference)
+    st.subheader("📝 Reference: MACD Cross Up Zero, Signal Below Zero (No Filter)")
     st.dataframe(df_ref, use_container_width=True)
-    st.markdown("_Shows all events where MACD crosses zero upwards and signal < 0 (regardless of other filters, for research/historical context)._")
 else:
-    st.info("No MACD zero-cross reference events in latest bars.")
+    st.info("No recent MACD cross-up-zero events for reference.")
 
-st.caption("© AI S&P100+NASDAQ100 1h KIV Screener. Rules & TP/CL as discussed. All times GMT+8.")
+if show_debug:
+    st.subheader("Debug: Issues Encountered")
+    if debug_issues:
+        st.dataframe(pd.DataFrame(debug_issues))
+    else:
+        st.info("No issues.")
+
+st.caption("© MACD Screener | S&P 100 & NASDAQ 100 | 1-hour bar. Screener saves all results to Google Sheet tab 'MACD Cross'.")
