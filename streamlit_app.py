@@ -31,6 +31,10 @@ sp500 = [
     "ALLE","VFC","WY","NOV","GNRC","IPG","AOS","LUMN","NWSA","FOX","NWS","FOX","FMC","LW","CPB","JBHT",
     "DISCK","DISCA","DVA","ZION","LKQ","IVZ","CF","NDSN","ROL","FRT","NCLH","CMA","AIZ","FANG","PKG",
     "AAP","DRI","LNT","STX","NRZ","MOS","KIM","TPR","WHR","IP","SWK","HAS","CZR","EMN","UA","UAA","AAL"
+    "AES","ANET","BR","BRO","CE","CHRW","CTLT","DLTR","DOV","EBAY","EPAM","ETSY","EXPD","FDS","FTNT","GEN","GRMN","HUBB","INVH","KEY",
+    "KDP","LDOS","MKC","MPWR","NDSN","NTRS","OGN","ON","PARA","PAYC",
+    "PAYX","PEAK","PTC","PWR","RE","RHI","RMD","SNPS","STE","TDG",
+    "TECH","TER","URI","VMC","WDC","WTW","ZBRA"
 ]
 
 if "sent_today" not in st.session_state:
