@@ -116,7 +116,7 @@ history_rows = []
 ref_crosses = []
 bars_to_check = 10  # For reference/history, last 10 bars
 
-for ticker in sp100:
+for ticker in sp500:
     try:
         df = yf.download(ticker, period="30d", interval="1h", progress=False, threads=False)
         if df.empty or len(df) < bars_to_check+2:
