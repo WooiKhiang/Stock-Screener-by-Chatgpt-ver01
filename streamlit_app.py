@@ -11,7 +11,7 @@ import json
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "MACD Cross"
 
-# ==== S&P 500 Ticker List ====
+# -- S&P 100 for demo. Replace with your sp500 list for prod --
 sp500 = [
     "AAPL","MSFT","AMZN","NVDA","GOOGL","META","GOOG","BRK-B","LLY","UNH","TSLA","JPM","V","XOM","MA","AVGO",
     "PG","JNJ","COST","HD","MRK","ADBE","ABBV","CRM","WMT","AMD","PEP","KO","CVX","BAC","MCD","NFLX","DIS",
@@ -33,9 +33,8 @@ sp500 = [
     "DISCK","DISCA","DVA","ZION","LKQ","IVZ","CF","NDSN","ROL","FRT","NCLH","CMA","AIZ","FANG","PKG",
     "AAP","DRI","LNT","STX","NRZ","MOS","KIM","TPR","WHR","IP","SWK","HAS","CZR","EMN","UA","UAA","AAL"
 ]
-# The above is a representative S&P 500 (shortened for demo). For full S&P500, paste all tickers.
 
-# ---- Session-based Spam Guard ----
+# --- Session-based Spam Guard ---
 if "sent_today" not in st.session_state:
     st.session_state["sent_today"] = set()
 
@@ -47,7 +46,7 @@ def is_already_sent(ticker, dt_et):
     st.session_state["sent_today"].add(key)
     return False
 
-# ---- Google Sheet Helper ----
+# --- Google Sheet Helper ---
 def get_gspread_client_from_secrets():
     info = st.secrets["gcp_service_account"]
     creds_dict = {k: v for k, v in info.items()}
@@ -85,16 +84,42 @@ st.sidebar.header("MACD Cross Screener Settings")
 rsi_max = st.sidebar.number_input("Max RSI", value=60, min_value=20, max_value=100)
 min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
-min_vol = st.sidebar.number_input("Min Volume (last bar)", value=100_000)
+min_vol = st.sidebar.number_input("Min Volume (avg last 10 bars)", value=100_000)
 
-st.title("MACD Cross Up Zero Screener (S&P 500, US ET)")
+# ---- Strategy Explanation ----
+with st.expander("ℹ️ **Screener Strategy Explained**", expanded=True):
+    st.markdown("""
+**Signal Criteria (Main Table):**
+- 1H Chart (US/Eastern time).
+- MACD crosses UP zero (prev bar MACD < 0, curr MACD > 0).
+- MACD signal line still < 0 at cross.
+- RSI (14) below sidebar threshold (default 60).
+- EMA10 > EMA20 (trend confirmation).
+- MACD histogram positive.
+- Min price/volume filter (customizable).
+- Only one alert per ticker per hour-bar (spam-guarded).
+
+**Reference Table (All Crosses):**
+- Shows all S&P 100 tickers that had *any* MACD cross up zero with signal < 0, **last 10 bars**, regardless of RSI or EMA.
+- For study/historical checks—no filters.
+
+**History Table (Signals):**
+- Recent signals that fired (met ALL main criteria), last 10 bars, for research and review.
+""")
+
+st.title("MACD Cross Up Zero Screener (S&P 100, US ET)")
 st.caption(f"Last run: {datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d %H:%M')} (US/Eastern)")
 
+# --- Main Screener & Data Grab ---
 results = []
-for ticker in sp500:
+history_rows = []
+ref_crosses = []
+bars_to_check = 10  # For reference/history, last 10 bars
+
+for ticker in sp100:
     try:
-        df = yf.download(ticker, period="60d", interval="1h", progress=False, threads=False)
-        if df.empty or len(df) < 30:
+        df = yf.download(ticker, period="30d", interval="1h", progress=False, threads=False)
+        if df.empty or len(df) < bars_to_check+2:
             continue
         df = norm(df)
         # Indicators
@@ -114,14 +139,32 @@ for ticker in sp500:
         df["hist"] = df["macd"] - df["macdsignal"]
         df["avgvol"] = df["volume"].rolling(10).mean()
 
+        # Reference: Show all MACD cross up events (last 10 bars)
+        for idx in range(-bars_to_check, 0):
+            curr = df.iloc[idx]
+            prev = df.iloc[idx-1]
+            dt_utc = curr.name.tz_localize("UTC") if curr.name.tzinfo is None else curr.name
+            dt_et = dt_utc.tz_convert("US/Eastern")
+            cond_macd_cross = prev["macd"] < 0 and prev["macd"] < prev["macdsignal"] and curr["macd"] > 0 and curr["macd"] > curr["macdsignal"] and curr["macdsignal"] < 0
+            if cond_macd_cross:
+                ref_crosses.append({
+                    "Ticker": ticker,
+                    "Time": dt_et.strftime("%Y-%m-%d %H:%M"),
+                    "Price": formatn(curr["close"]),
+                    "MACD": formatn(curr["macd"], 4),
+                    "Signal": formatn(curr["macdsignal"], 4),
+                    "RSI": formatn(curr["rsi14"], 2),
+                    "EMA10": formatn(curr["ema10"]),
+                    "EMA20": formatn(curr["ema20"]),
+                    "Volume": formatn(curr["volume"], 0),
+                    "Hist": formatn(curr["hist"], 4)
+                })
+
+        # Main Signal: Only fire on current bar if meets all criteria
         curr = df.iloc[-1]
         prev = df.iloc[-2]
-
-        # --- Convert to US/Eastern Time for signal logging and display ---
         dt_utc = curr.name.tz_localize("UTC") if curr.name.tzinfo is None else curr.name
         dt_et = dt_utc.tz_convert("US/Eastern")
-
-        # Core Signal Criteria
         cond_macd_cross = prev["macd"] < 0 and prev["macd"] < prev["macdsignal"] and curr["macd"] > 0 and curr["macd"] > curr["macdsignal"] and curr["macdsignal"] < 0
         cond_rsi = curr["rsi14"] < rsi_max
         cond_ema = curr["ema10"] > curr["ema20"]
@@ -132,7 +175,7 @@ for ticker in sp500:
         if cond_macd_cross and cond_rsi and cond_ema and cond_hist and cond_price and cond_vol:
             if is_already_sent(ticker, dt_et):
                 continue
-            results.append({
+            row = {
                 "Ticker": ticker,
                 "Price": formatn(curr["close"]),
                 "MACD": formatn(curr["macd"], 4),
@@ -143,16 +186,18 @@ for ticker in sp500:
                 "Volume": formatn(curr["volume"], 0),
                 "Hist": formatn(curr["hist"], 4),
                 "Time": dt_et.strftime("%Y-%m-%d %H:%M (ET)")
-            })
-
+            }
+            results.append(row)
+            history_rows.append(row)
     except Exception as e:
         continue
 
+# --- Main Signals Table ---
 if results:
     df_out = pd.DataFrame(results)
-    st.subheader("📈 New MACD Cross Up Zero Signals (US ET, No Spam)")
+    st.subheader("📈 New MACD Cross Up Zero Signals (S&P 100, US ET, No Spam)")
     st.dataframe(df_out, use_container_width=True)
-    # ---- Push to Google Sheets ----
+    # Push to Google Sheet
     gsheet_rows = [
         [row["Time"], row["Ticker"], row["Price"], row["MACD"], row["Signal"], row["RSI"], row["EMA10"], row["EMA20"], row["Volume"], row["Hist"]]
         for row in results
@@ -161,4 +206,16 @@ if results:
 else:
     st.info("No current MACD cross up zero signals found (spam guard active).")
 
-st.caption("Signals displayed/pushed only once per ticker per hour bar (US ET) per session. Adjust RSI, volume, or price filters to broaden search if empty.")
+# --- History Table: Last 10 bars that met ALL criteria (main signal) ---
+if history_rows:
+    st.subheader("🕒 History: Signals That Met All Criteria (Last 10 Bars)")
+    df_hist = pd.DataFrame(history_rows[-10:])
+    st.dataframe(df_hist, use_container_width=True)
+
+# --- Reference Table: All MACD cross up (no filter) in last 10 bars ---
+if ref_crosses:
+    st.subheader("🔍 Reference: Recent MACD Cross Up Zero Events (last 10 bars, no filter)")
+    df_ref = pd.DataFrame(ref_crosses)
+    st.dataframe(df_ref, use_container_width=True)
+
+st.caption("Signals are for reference only. Use with risk controls. Screener logic and reference tables above for research.")
