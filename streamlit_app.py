@@ -1,10 +1,9 @@
 import streamlit as st
-from stqdm import stqdm  # ✅ Added to fix NameError
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import pytz
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
@@ -13,28 +12,22 @@ import json
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "MACD Cross"
 
-# [sp500 list remains unchanged — omitted here for brevity]
 sp500 = [
     "AAPL","MSFT","AMZN","NVDA","GOOGL","META","GOOG","BRK-B","LLY","UNH","TSLA","JPM","V","XOM","MA","AVGO",
     "PG","JNJ","COST","HD","MRK","ADBE","ABBV","CRM","WMT","AMD","PEP","KO","CVX","BAC","MCD","NFLX","DIS",
-    "LIN","ACN","ABT","TMO","INTC","DHR","TXN","NEE","WFC","BMY","PM","UNP","QCOM","HON","LOW","RTX","AMGN",
-    "SBUX","MS","NKE","VZ","COP","SCHW","GS","AMAT","INTU","MDT","ISRG","CAT","T","GE","SPGI","IBM","LMT",
-    "BLK","ELV","EL","DE","ADP","CB","NOW","MDLZ","PLD","PYPL","CSCO","MU","VRTX","DUK","SYK","SO","GILD",
-    "AXP","ZTS","BKNG","TJX","REGN","BDX","MMC","CI","ADI","PGR","TGT","ITW","SLB","MO","EW","APD","HCA",
-    "C","PNC","SHW","FI","USB","LRCX","EMR","ORCL","WM","FISV","AON","FDX","ICE","TRV","ETN","GM","DG",
-    "ROP","MCO","NSC","KLAC","PRU","AIG","EOG","MCK","AFL","SPG","SRE","IDXX","ALL","ODFL","AEP","PSA",
-    "MAR","ADM","D","CTAS","STZ","ROST","DOW","YUM","BIIB","HLT","PEG","CMG","EXC","CDNS","MCHP","TT",
-    "DLR","CTVA","MSCI","HSY","CME","WELL","F","GWW","SYY","HAL","TROW","XEL","CPRT","NEM","TSCO","IQV",
-    "WMB","OXY","KHC","OTIS","PH","MRNA","SBAC","VRSK","PPG","KMB","ED","NUE","RMD","LEN","PCAR","STT",
-    "MTD","ILMN","MNST","A","HUM","ECL","AEE","XYL","AWK","AME","CMI","AZO","FAST","BAX","PPL","CHD",
-    "CNC","TSN","EFX","EIX","DVN","FLT","AMP","FRC","RSG","AAL","CL","BALL","AVB","HRL","XYL","BXP",
-    "ESS","DGX","LH","QRVO","VTR","WAT","BKR","BEN","COO","NDAQ","MGM","PWR","ZBH","UHS","LYB","WAB",
-    "AKAM","NVR","NTAP","PFG","MAS","KEYS","MTB","HES","J","L","CBOE","UAL","APA","MKTX","RJF","VNO",
-    "DHI","FFIV","HSIC","NWL","SEE","HWM","GL","RF","BIO","IRM","WRB","HOLX","NRG","CNP","ALK","HII",
-    "ALLE","VFC","WY","NOV","GNRC","IPG","AOS","LUMN","NWSA","FOX","NWS","FOX","FMC","LW","CPB","JBHT",
-    "DISCK","DISCA","DVA","ZION","LKQ","IVZ","CF","NDSN","ROL","FRT","NCLH","CMA","AIZ","FANG","PKG",
-    "AAP","DRI","LNT","STX","NRZ","MOS","KIM","TPR","WHR","IP","SWK","HAS","CZR","EMN","UA","UAA","AAL"
-]
+    "LIN","ACN","ABT","TMO","INTC","DHR","TXN","NEE","WFC","BMY","PM","UNP","QCOM","HON","SBUX","AMT","AMGN",
+    "LOW","ISRG","VRTX","RTX","BLK","CAT","MDT","ELV","GS","NOW","DE","SPGI","PLD","ADI","SCHW","C","CVS",
+    "MDLZ","MMC","ADP","SYK","LRCX","GILD","CI","REGN","MO","DUK","TGT","BSX","PGR","CB","SO","EQIX","BKNG",
+    "PXD","AON","BDX","ITW","ZTS","APD","TFC","CME","FISV","PNC","HUM","USB","SHW","MS","EMR","CL","D","EW",
+    "GD","MCO","NSC","FDX","CSX","AEP","AIG","ETN","PSA","WM","ROP","TRV","NOC","ECL","OXY","MCK","IDXX",
+    "PCAR","EXC","SRE","CTAS","ROST","TT","VLO","PAYX","PH","MAR","STZ","CMG","AFL","ORLY","HAL","HES","PEG",
+    "KR","DHI","CDNS","DLR","XEL","VRSK","MLM","YUM","AMP","MTD","ROK","DLTR","OTIS","HBAN","F","AEE","WELL",
+    "ED","ODFL","KMB","ALL","DVN","WMB","EA","SBAC","LEN","SPG","RMD","CEG","BAX","KEYS","MKC","GEN","HSY",
+    "CTVA","CMS","SYY","CNP","GPC","RSG","WST","RF","CARR","AWK","CBOE","CMS","HOLX","GWW","SWKS","BKR","A",
+    "CMS","FTNT","SJM","TSCO","ZBH","CINF","NUE","EXR","DOV","ATO","STE","MAS","TTWO","RCL","DPZ","WAB",
+    "TECH","JKHY","KHC","VTRS","TYL","KIM","GL","CLX","FE","NDSN","LW","APA","BXP","EXPD","HII","FMC","FDS",
+    "IFF","WY","BALL","IPG","NWSA","NWS","CPT","K","NDAQ","NRG","BEN","NWL"
+]  # Make sure this is up-to-date for S&P500
 
 # ---- FUNCTIONS ----
 
@@ -117,6 +110,7 @@ def load_recent_signals(sheet_name, days=7):
         client = get_gspread_client_from_secrets()
         sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(sheet_name)
         data = sheet.get_all_values()
+        # (Time, Ticker) for deduplication
         recents = set()
         if data and len(data) > 1:
             for row in data[1:]:
@@ -160,6 +154,7 @@ st.title("AI-Powered US Stocks Screener: MACD Crosses Zero (S&P 500)")
 st.caption(f"Last run: {get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')} US/Eastern")
 st.markdown(f"**Market Sentiment:** {sentiment_text} ({sentiment_pct:.2f}%)")
 
+# ---- STRATEGY SUMMARY ----
 st.info("""
 **Current Screener Criteria**  
 • 1h chart (US/Eastern time, pre/post/regular)  
@@ -172,14 +167,15 @@ st.info("""
 • All signals in last N days (default 7), deduplicated for Google Sheets  
 """)
 
-# ---- RECENT SIGNALS ----
+# ---- RECENT SIGNALS FROM SHEET ----
 recent_signals = load_recent_signals(GOOGLE_SHEET_NAME, days=lookback_days)
 rows_to_append = []
 kiv_results = []
 history_tbl = []
 
-# ---- MAIN LOOP ----
-for ticker in stqdm(sp500, desc="Scanning tickers..."):
+# ---- MAIN SCAN ----
+progress = st.progress(0)
+for n, ticker in enumerate(sp500):
     try:
         df = yf.download(ticker, period=f"{lookback_days+3}d", interval="1h", progress=False, threads=False)
         if df.empty or len(df) < 20: continue
@@ -188,9 +184,12 @@ for ticker in stqdm(sp500, desc="Scanning tickers..."):
         df = calc_indicators(df)
         df = df.dropna()
         df['us_time'] = df.index.tz_convert('US/Eastern')
+        # Min avg volume last 10 bars
         df['avg_vol_10'] = df['volume'].rolling(10).mean()
+        # For each bar in last lookback_days, check the signal logic
         for i in range(1, len(df)):
             dt_bar = df['us_time'].iloc[i]
+            # Only keep bars in lookback period
             if dt_bar < pd.Timestamp.now(tz=pytz.timezone("US/Eastern")) - pd.Timedelta(days=lookback_days):
                 continue
             prev_macd = df['macd'].iloc[i-1]
@@ -214,8 +213,10 @@ for ticker in stqdm(sp500, desc="Scanning tickers..."):
                 "Price": formatn(price,2),
                 "AvgVol10": formatn(avg_vol,0)
             }
+            # History table (all MACD crosses in last lookback_days)
             if prev_macd < 0 and curr_macd > 0 and curr_signal < 0:
                 history_tbl.append(hist_row)
+            # Screener criteria (main signal)
             if (
                 prev_macd < 0 and curr_macd > 0 and curr_signal < 0 and
                 curr_hist > 0 and
@@ -225,7 +226,7 @@ for ticker in stqdm(sp500, desc="Scanning tickers..."):
                 avg_vol >= min_volume
             ):
                 row_key = (dt_bar.strftime("%Y-%m-%d %H:%M"), ticker)
-                if row_key in recent_signals: continue
+                if row_key in recent_signals: continue # dedupe
                 kiv_results.append(hist_row)
                 rows_to_append.append([
                     dt_bar.strftime("%Y-%m-%d %H:%M"), ticker,
@@ -233,10 +234,11 @@ for ticker in stqdm(sp500, desc="Scanning tickers..."):
                     formatn(curr_hist,4), formatn(curr_ema10,2), formatn(curr_ema20,2), formatn(avg_vol,0)
                 ])
                 recent_signals.add(row_key)
-    except Exception:
+    except Exception as e:
         continue
+    progress.progress((n+1)/len(sp500))
 
-# ---- OUTPUT ----
+# ---- DISPLAY TABLES ----
 st.subheader("📈 1h MACD Cross Signals (Current Screener Criteria)")
 if kiv_results:
     df_out = pd.DataFrame(kiv_results)
@@ -248,9 +250,10 @@ else:
 
 st.subheader("🕒 MACD Crosses Zero Events (Last 10 Bars History, No Filter)")
 if history_tbl:
-    df_hist = pd.DataFrame(history_tbl).tail(50)
+    df_hist = pd.DataFrame(history_tbl).tail(50) # show last 50 for reference
     st.dataframe(df_hist, use_container_width=True)
 else:
     st.info("No recent MACD cross-up events found.")
 
-st.caption("© AI Screener | S&P 500 | 1h Chart. MACD Cross. US/Eastern time. See sidebar for settings.")
+# ---- END ----
+st.caption("© AI Screener | S&P 500 | 1h Chart. MACD Cross. US/Eastern time. See sidebar for settings. All results auto-deduped to Google Sheet.")
