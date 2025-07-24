@@ -1,9 +1,10 @@
 import streamlit as st
+from stqdm import stqdm  # ✅ Added to fix NameError
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import pytz
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
@@ -12,6 +13,7 @@ import json
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "MACD Cross"
 
+# [sp500 list remains unchanged — omitted here for brevity]
 sp500 = [
     "AAPL","MSFT","AMZN","NVDA","GOOGL","META","GOOG","BRK-B","LLY","UNH","TSLA","JPM","V","XOM","MA","AVGO",
     "PG","JNJ","COST","HD","MRK","ADBE","ABBV","CRM","WMT","AMD","PEP","KO","CVX","BAC","MCD","NFLX","DIS",
@@ -115,7 +117,6 @@ def load_recent_signals(sheet_name, days=7):
         client = get_gspread_client_from_secrets()
         sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(sheet_name)
         data = sheet.get_all_values()
-        # (Time, Ticker) for deduplication
         recents = set()
         if data and len(data) > 1:
             for row in data[1:]:
@@ -159,7 +160,6 @@ st.title("AI-Powered US Stocks Screener: MACD Crosses Zero (S&P 500)")
 st.caption(f"Last run: {get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')} US/Eastern")
 st.markdown(f"**Market Sentiment:** {sentiment_text} ({sentiment_pct:.2f}%)")
 
-# ---- STRATEGY SUMMARY ----
 st.info("""
 **Current Screener Criteria**  
 • 1h chart (US/Eastern time, pre/post/regular)  
@@ -172,13 +172,13 @@ st.info("""
 • All signals in last N days (default 7), deduplicated for Google Sheets  
 """)
 
-# ---- RECENT SIGNALS FROM SHEET ----
+# ---- RECENT SIGNALS ----
 recent_signals = load_recent_signals(GOOGLE_SHEET_NAME, days=lookback_days)
 rows_to_append = []
 kiv_results = []
 history_tbl = []
 
-# ---- MAIN SCAN ----
+# ---- MAIN LOOP ----
 for ticker in stqdm(sp500, desc="Scanning tickers..."):
     try:
         df = yf.download(ticker, period=f"{lookback_days+3}d", interval="1h", progress=False, threads=False)
@@ -188,12 +188,9 @@ for ticker in stqdm(sp500, desc="Scanning tickers..."):
         df = calc_indicators(df)
         df = df.dropna()
         df['us_time'] = df.index.tz_convert('US/Eastern')
-        # Min avg volume last 10 bars
         df['avg_vol_10'] = df['volume'].rolling(10).mean()
-        # For each bar in last lookback_days, check the signal logic
         for i in range(1, len(df)):
             dt_bar = df['us_time'].iloc[i]
-            # Only keep bars in lookback period
             if dt_bar < pd.Timestamp.now(tz=pytz.timezone("US/Eastern")) - pd.Timedelta(days=lookback_days):
                 continue
             prev_macd = df['macd'].iloc[i-1]
@@ -217,10 +214,8 @@ for ticker in stqdm(sp500, desc="Scanning tickers..."):
                 "Price": formatn(price,2),
                 "AvgVol10": formatn(avg_vol,0)
             }
-            # History table (all MACD crosses in last lookback_days)
             if prev_macd < 0 and curr_macd > 0 and curr_signal < 0:
                 history_tbl.append(hist_row)
-            # Screener criteria (main signal)
             if (
                 prev_macd < 0 and curr_macd > 0 and curr_signal < 0 and
                 curr_hist > 0 and
@@ -230,7 +225,7 @@ for ticker in stqdm(sp500, desc="Scanning tickers..."):
                 avg_vol >= min_volume
             ):
                 row_key = (dt_bar.strftime("%Y-%m-%d %H:%M"), ticker)
-                if row_key in recent_signals: continue # dedupe
+                if row_key in recent_signals: continue
                 kiv_results.append(hist_row)
                 rows_to_append.append([
                     dt_bar.strftime("%Y-%m-%d %H:%M"), ticker,
@@ -238,10 +233,10 @@ for ticker in stqdm(sp500, desc="Scanning tickers..."):
                     formatn(curr_hist,4), formatn(curr_ema10,2), formatn(curr_ema20,2), formatn(avg_vol,0)
                 ])
                 recent_signals.add(row_key)
-    except Exception as e:
+    except Exception:
         continue
 
-# ---- DISPLAY TABLES ----
+# ---- OUTPUT ----
 st.subheader("📈 1h MACD Cross Signals (Current Screener Criteria)")
 if kiv_results:
     df_out = pd.DataFrame(kiv_results)
@@ -253,10 +248,9 @@ else:
 
 st.subheader("🕒 MACD Crosses Zero Events (Last 10 Bars History, No Filter)")
 if history_tbl:
-    df_hist = pd.DataFrame(history_tbl).tail(50) # show last 50 for reference
+    df_hist = pd.DataFrame(history_tbl).tail(50)
     st.dataframe(df_hist, use_container_width=True)
 else:
     st.info("No recent MACD cross-up events found.")
 
-# ---- END ----
-st.caption("© AI Screener | S&P 500 | 1h Chart. MACD Cross. US/Eastern time. See sidebar for settings. All results auto-deduped to Google Sheet.")
+st.caption("© AI Screener | S&P 500 | 1h Chart. MACD Cross. US/Eastern time. See sidebar for settings.")
