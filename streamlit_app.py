@@ -7,13 +7,11 @@ from datetime import datetime, timedelta, time as dt_time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
-import time
 
-# ---- Config ----
+# ---- CONFIG ----
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "MACD Cross"
 
-# Load S&P 500 tickers (truncated for brevity; you can paste the full list!)
 sp500 = [
     "AAPL","MSFT","AMZN","NVDA","GOOGL","META","GOOG","BRK-B","LLY","UNH","TSLA","JPM","V","XOM","MA","AVGO",
     "PG","JNJ","COST","HD","MRK","ADBE","ABBV","CRM","WMT","AMD","PEP","KO","CVX","BAC","MCD","NFLX","DIS",
@@ -36,7 +34,8 @@ sp500 = [
     "AAP","DRI","LNT","STX","NRZ","MOS","KIM","TPR","WHR","IP","SWK","HAS","CZR","EMN","UA","UAA","AAL"
 ]
 
-# ---- Helper Functions ----
+# ---- FUNCTIONS ----
+
 def formatn(num, d=2):
     try:
         if num is None or num == "" or np.isnan(num): return "-"
@@ -86,6 +85,12 @@ def calc_indicators(df):
     df['hist'] = df['macd'] - df['macdsignal']
     return df
 
+def get_us_eastern_time(dt=None):
+    eastern = pytz.timezone("US/Eastern")
+    if dt is None:
+        return datetime.now(pytz.utc).astimezone(eastern)
+    return dt.astimezone(eastern)
+
 def get_gspread_client_from_secrets():
     info = st.secrets["gcp_service_account"]
     creds_dict = {k: v for k, v in info.items()}
@@ -100,113 +105,158 @@ def append_to_gsheet(rows, sheet_name):
     try:
         client = get_gspread_client_from_secrets()
         sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(sheet_name)
-        if hasattr(sheet, 'append_rows'):
-            sheet.append_rows(rows, value_input_option="USER_ENTERED")
-        else:
-            for row in rows:
-                sheet.append_row(row, value_input_option="USER_ENTERED")
+        for row in rows:
+            sheet.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         st.warning(f"Google Sheet ({sheet_name}): {e}")
 
-def us_eastern_now():
-    eastern = pytz.timezone("US/Eastern")
-    return datetime.now(pytz.utc).astimezone(eastern)
+def load_recent_signals(sheet_name, days=7):
+    try:
+        client = get_gspread_client_from_secrets()
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(sheet_name)
+        data = sheet.get_all_values()
+        # (Time, Ticker) for deduplication
+        recents = set()
+        if data and len(data) > 1:
+            for row in data[1:]:
+                date_str, ticker = row[0], row[1]
+                try:
+                    dt = pd.to_datetime(date_str)
+                    if dt >= pd.Timestamp.now(tz=pytz.timezone("US/Eastern")) - pd.Timedelta(days=days):
+                        recents.add((date_str, ticker))
+                except Exception:
+                    continue
+        return recents
+    except Exception as e:
+        st.warning(f"Sheet load error: {e}")
+        return set()
 
-def convert_to_eastern(idx):
-    eastern = pytz.timezone("US/Eastern")
-    if idx.tzinfo is None:
-        idx = idx.tz_localize("UTC").tz_convert(eastern)
-    else:
-        idx = idx.tz_convert(eastern)
-    return idx
+def get_market_sentiment():
+    try:
+        spy = yf.download('SPY', period='1d', interval='5m', progress=False, threads=False)
+        if spy.empty: return 0, "Unknown"
+        spy = norm(spy)
+        spy = ensure_core_cols(spy)
+        open_, last = spy['open'].iloc[0], spy['close'].iloc[-1]
+        pct = (last - open_) / open_ * 100
+        if pct > 0.5: return pct, "🟢 Bullish"
+        elif pct < -0.5: return pct, "🔴 Bearish"
+        else: return pct, "🟡 Sideways"
+    except Exception:
+        return 0, "Unknown"
 
-# ---- Sidebar ----
-st.sidebar.header("Filter Settings")
+# ---- SIDEBAR ----
+st.sidebar.header("KIV Signal Parameters")
+min_volume = st.sidebar.number_input("Min Avg Volume (last 10 bars)", value=100000)
 min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
-min_vol = st.sidebar.number_input("Min Volume (1H)", value=100000)
-rsi_thresh = st.sidebar.number_input("RSI Max", value=60)
-max_days = st.sidebar.number_input("Max Signal Days (History)", value=7, min_value=1, max_value=30, step=1)
+rsi_thresh = st.sidebar.slider("RSI (14) threshold", 40, 80, 60)
+lookback_days = st.sidebar.slider("Lookback Days", 1, 7, 7)
 
-st.title("S&P 500: MACD Cross Screener (1H, Auto, Recency-Filtered, Google Sheet Push)")
-st.caption(f"US/Eastern Now: {us_eastern_now().strftime('%Y-%m-%d %H:%M:%S')}")
+# ---- SENTIMENT ----
+sentiment_pct, sentiment_text = get_market_sentiment()
+st.title("AI-Powered US Stocks Screener: MACD Crosses Zero (S&P 500)")
+st.caption(f"Last run: {get_us_eastern_time().strftime('%Y-%m-%d %H:%M:%S')} US/Eastern")
+st.markdown(f"**Market Sentiment:** {sentiment_text} ({sentiment_pct:.2f}%)")
 
-results = []
-batch_rows = []
-eastern = pytz.timezone("US/Eastern")
-now_et = us_eastern_now()
+# ---- STRATEGY SUMMARY ----
+st.info("""
+**Current Screener Criteria**  
+• 1h chart (US/Eastern time, pre/post/regular)  
+• MACD crosses up zero (prev bar MACD < 0, curr MACD > 0)  
+• MACD signal line is still < 0 at cross  
+• RSI (14) below sidebar threshold (default 60)  
+• EMA10 > EMA20 (trend up confirmation)  
+• MACD histogram positive  
+• Min price and min average volume filter (adjustable)  
+• All signals in last N days (default 7), deduplicated for Google Sheets  
+""")
 
-# --- Main Loop ---
-for ticker in sp500:
+# ---- RECENT SIGNALS FROM SHEET ----
+recent_signals = load_recent_signals(GOOGLE_SHEET_NAME, days=lookback_days)
+rows_to_append = []
+kiv_results = []
+history_tbl = []
+
+# ---- MAIN SCAN ----
+for ticker in stqdm(sp500, desc="Scanning tickers..."):
     try:
-        df = yf.download(ticker, period="15d", interval="1h", progress=False, threads=False)
-        if df.empty or len(df) < 30: continue
+        df = yf.download(ticker, period=f"{lookback_days+3}d", interval="1h", progress=False, threads=False)
+        if df.empty or len(df) < 20: continue
         df = norm(df)
         df = ensure_core_cols(df)
         df = calc_indicators(df)
-        # Make sure index is US/Eastern for time filters
-        df.index = convert_to_eastern(pd.to_datetime(df.index))
-        # Filter to only last max_days
-        recent_limit = now_et - timedelta(days=int(max_days))
-        df = df[df.index >= recent_limit]
+        df = df.dropna()
+        df['us_time'] = df.index.tz_convert('US/Eastern')
+        # Min avg volume last 10 bars
+        df['avg_vol_10'] = df['volume'].rolling(10).mean()
+        # For each bar in last lookback_days, check the signal logic
         for i in range(1, len(df)):
-            row, prev = df.iloc[i], df.iloc[i-1]
-            # Criteria:
-            # MACD crosses up zero, prev < 0, curr > 0
-            cross = prev['macd'] < 0 and row['macd'] > 0
-            macdsig_below = row['macdsignal'] < 0
-            rsi_ok = row['rsi14'] < rsi_thresh
-            ema_trend = row['ema10'] > row['ema20']
-            hist_pos = row['hist'] > 0
-            price = row['close']
-            vol = row['volume']
-            if (cross and macdsig_below and rsi_ok and ema_trend and hist_pos and
-                (min_price <= price <= max_price) and (vol >= min_vol)):
-                signal_time = row.name.strftime('%Y-%m-%d %H:%M')
-                results.append({
-                    "Time (US/Eastern)": signal_time,
-                    "Ticker": ticker,
-                    "Close": formatn(price,2),
-                    "RSI": formatn(row['rsi14'],2),
-                    "MACD": formatn(row['macd'],4),
-                    "MACD Signal": formatn(row['macdsignal'],4),
-                    "Hist": formatn(row['hist'],4),
-                    "EMA10": formatn(row['ema10'],2),
-                    "EMA20": formatn(row['ema20'],2),
-                    "Vol": formatn(vol,0)
-                })
-                batch_rows.append([
-                    signal_time, ticker, formatn(price,2), formatn(row['rsi14'],2),
-                    formatn(row['macd'],4), formatn(row['macdsignal'],4), formatn(row['hist'],4),
-                    formatn(row['ema10'],2), formatn(row['ema20'],2), formatn(vol,0)
+            dt_bar = df['us_time'].iloc[i]
+            # Only keep bars in lookback period
+            if dt_bar < pd.Timestamp.now(tz=pytz.timezone("US/Eastern")) - pd.Timedelta(days=lookback_days):
+                continue
+            prev_macd = df['macd'].iloc[i-1]
+            curr_macd = df['macd'].iloc[i]
+            curr_signal = df['macdsignal'].iloc[i]
+            curr_hist = df['hist'].iloc[i]
+            curr_rsi = df['rsi14'].iloc[i]
+            curr_ema10 = df['ema10'].iloc[i]
+            curr_ema20 = df['ema20'].iloc[i]
+            price = df['close'].iloc[i]
+            avg_vol = df['avg_vol_10'].iloc[i]
+            hist_row = {
+                "Time": dt_bar.strftime("%Y-%m-%d %H:%M"),
+                "Ticker": ticker,
+                "MACD": formatn(curr_macd,4),
+                "MACD Signal": formatn(curr_signal,4),
+                "RSI": formatn(curr_rsi,2),
+                "EMA10": formatn(curr_ema10,2),
+                "EMA20": formatn(curr_ema20,2),
+                "Hist": formatn(curr_hist,4),
+                "Price": formatn(price,2),
+                "AvgVol10": formatn(avg_vol,0)
+            }
+            # History table (all MACD crosses in last lookback_days)
+            if prev_macd < 0 and curr_macd > 0 and curr_signal < 0:
+                history_tbl.append(hist_row)
+            # Screener criteria (main signal)
+            if (
+                prev_macd < 0 and curr_macd > 0 and curr_signal < 0 and
+                curr_hist > 0 and
+                curr_rsi < rsi_thresh and
+                curr_ema10 > curr_ema20 and
+                min_price <= price <= max_price and
+                avg_vol >= min_volume
+            ):
+                row_key = (dt_bar.strftime("%Y-%m-%d %H:%M"), ticker)
+                if row_key in recent_signals: continue # dedupe
+                kiv_results.append(hist_row)
+                rows_to_append.append([
+                    dt_bar.strftime("%Y-%m-%d %H:%M"), ticker,
+                    formatn(price,2), formatn(curr_rsi,2), formatn(curr_macd,4), formatn(curr_signal,4),
+                    formatn(curr_hist,4), formatn(curr_ema10,2), formatn(curr_ema20,2), formatn(avg_vol,0)
                 ])
+                recent_signals.add(row_key)
     except Exception as e:
         continue
 
-# ---- Output Table ----
-st.subheader(f"MACD Cross Up Events (Last {int(max_days)} Days)")
-if results:
-    df_out = pd.DataFrame(results)
+# ---- DISPLAY TABLES ----
+st.subheader("📈 1h MACD Cross Signals (Current Screener Criteria)")
+if kiv_results:
+    df_out = pd.DataFrame(kiv_results)
     st.dataframe(df_out, use_container_width=True)
-    # --- Push to Google Sheets (once per run) ---
-    try:
-        append_to_gsheet(batch_rows, GOOGLE_SHEET_NAME)
-    except Exception as e:
-        st.warning(f"Google Sheet batch append error: {e}")
+    if rows_to_append:
+        append_to_gsheet(rows_to_append, GOOGLE_SHEET_NAME)
 else:
-    st.info("No MACD Cross events found within the last days filter.")
+    st.info("No MACD cross signals found with all criteria.")
 
-# ---- Signal Criteria Section ----
-st.markdown("""
-### Strategy Criteria
-- **1H chart (US/Eastern)**
-- **MACD crosses up zero** (prev bar < 0, curr bar > 0)
-- **MACD signal line below zero** at cross
-- **RSI (14) < sidebar threshold** (default 60)
-- **EMA10 > EMA20** (trend confirmation)
-- **MACD histogram positive**
-- **Min price/volume filters**
-- **Results shown for last X days only (sidebar filter)**
-""")
+st.subheader("🕒 MACD Crosses Zero Events (Last 10 Bars History, No Filter)")
+if history_tbl:
+    df_hist = pd.DataFrame(history_tbl).tail(50) # show last 50 for reference
+    st.dataframe(df_hist, use_container_width=True)
+else:
+    st.info("No recent MACD cross-up events found.")
 
-st.caption("© AI Screener | S&P 500. Signals pushed to Google Sheet. Recency and volume filtering help ensure signal relevance and avoid overload.")
+# ---- END ----
+st.caption("© AI Screener | S&P 500 | 1h Chart. MACD Cross. US/Eastern time. See sidebar for settings. All results auto-deduped to Google Sheet.")
