@@ -26,7 +26,11 @@ sp500 = [
     "CTVA","CMS","SYY","CNP","GPC","RSG","WST","RF","CARR","AWK","CBOE","CMS","HOLX","GWW","SWKS","BKR","A",
     "CMS","FTNT","SJM","TSCO","ZBH","CINF","NUE","EXR","DOV","ATO","STE","MAS","TTWO","RCL","DPZ","WAB",
     "TECH","JKHY","KHC","VTRS","TYL","KIM","GL","CLX","FE","NDSN","LW","APA","BXP","EXPD","HII","FMC","FDS",
-    "IFF","WY","BALL","IPG","NWSA","NWS","CPT","K","NDAQ","NRG","BEN","NWL"
+    "IFF","WY","BALL","IPG","NWSA","NWS","CPT","K","NDAQ","NRG","BEN","NWL","AES","ANET","BR","BRO","CE","CHRW",
+    "CTLT","DLTR","DOV","EBAY","EPAM","ETSY","EXPD","FDS","FTNT","GEN","GRMN","HUBB","INVH","KEY",
+    "KDP","LDOS","MKC","MPWR","NDSN","NTRS","OGN","ON","PARA","PAYC",
+    "PAYX","PEAK","PTC","PWR","RE","RHI","RMD","SNPS","STE","TDG",
+    "TECH","TER","URI","VMC","WDC","WTW","ZBRA"
 ]  # Make sure this is up-to-date for S&P500
 
 # ---- FUNCTIONS ----
