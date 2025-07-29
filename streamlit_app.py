@@ -142,10 +142,11 @@ for n, ticker in enumerate(sp500):
         df = ensure_core_cols(df)
         df = calc_indicators(df)
 
-        # Debugging: Check if indicators are added
+        # Check if indicators are added
         st.write(f"Calculated Indicators for {ticker}:")
         st.write(df[['close', 'macd', 'macdsignal', 'rsi14', 'ema10', 'ema20', 'hist']].tail())  # Show last row
 
+        # Only drop rows where essential columns have missing values
         df = df.dropna(subset=['close', 'macd', 'macdsignal', 'rsi14', 'ema10', 'ema20', 'hist'])
         if len(df) < 1:  # In case there is no valid data after removing NaN
             st.warning(f"No valid data after cleaning for {ticker}")
