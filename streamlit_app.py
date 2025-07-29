@@ -13,7 +13,12 @@ GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "MACD Cross"
 
 sp500 = [
-    'AAPL', 'ABBV', 'ABT', 'ACN', 'ADBE'
+    'AAPL', 'ABBV', 'ABT', 'ACN', 'ADBE', 'AIG', 'AMGN', 'AMT', 'AMZN', 'AVGO', 'AXP', 'BA', 'BAC', 'BK', 'BKNG', 'BLK', 'BMY', 'BRK-B', 'C', 'CAT',
+    'CHTR', 'CL', 'CMCSA', 'COF', 'COP', 'COST', 'CRM', 'CSCO', 'CVS', 'CVX', 'DHR', 'DIS', 'DOW', 'DUK', 'EMR', 'EXC', 'F', 'FDX', 'FOX', 'FOXA',
+    'GD', 'GE', 'GILD', 'GM', 'GOOG', 'GOOGL', 'GS', 'HD', 'HON', 'IBM', 'INTC', 'JNJ', 'JPM', 'KHC', 'KMI', 'KO', 'LIN', 'LLY', 'LMT', 'LOW',
+    'MA', 'MCD', 'MDLZ', 'MDT', 'MET', 'META', 'MMM', 'MO', 'MRK', 'MS', 'MSFT', 'NEE', 'NFLX', 'NKE', 'NVDA', 'ORCL', 'PEP', 'PFE', 'PG', 'PM',
+    'PYPL', 'QCOM', 'RTX', 'SBUX', 'SCHW', 'SO', 'SPG', 'T', 'TGT', 'TMO', 'TMUS', 'TSLA', 'TXN', 'UNH', 'UNP', 'UPS', 'USB', 'V', 'VZ', 'WBA',
+    'WFC', 'WMT', 'XOM'
 ]
 
 def formatn(num, d=2):
@@ -111,4 +116,98 @@ try:
     data = sheet.get_all_values()
     if data and len(data) > 1:
         headers, rows = data[0], data[1:]
-        # Only ke
+        # Only keep signals from last 7 days for dedupe (adjust as needed)
+        for row in rows:
+            if len(row) >= 2:
+                ktime, kticker = row[0], row[1]
+                recent_signals.add((ktime, kticker))
+except Exception as e:
+    st.warning(f"Could not load recent sheet data: {e}")
+
+kiv_results, rows_to_append = [], []
+progress = st.progress(0.0)
+for n, ticker in enumerate(sp500):
+    try:
+        df = yf.download(ticker, period="2d", interval="1h", progress=False, threads=False)
+        
+        if df.empty or len(df) < 1: 
+            st.warning(f"No data for {ticker}")  # Debug: Check if data is fetched
+            continue  # Only use the most recent data
+        
+        # Debugging: Check if data is correct
+        st.write(f"Data for {ticker}:")
+        st.write(df.head())  # Display the first few rows of data
+
+        df = norm(df)
+        df = ensure_core_cols(df)
+        df = calc_indicators(df)
+
+        # Check if indicators are being calculated
+        st.write(f"Calculated Indicators for {ticker}:")
+        st.write(df[['close', 'macd', 'macdsignal', 'rsi14', 'ema10', 'ema20', 'hist']].tail())  # Show last row
+
+        df = df.dropna()
+        if len(df) < 1:  # In case there is no valid data after removing NaN
+            st.warning(f"No valid data after cleaning for {ticker}")
+            continue
+
+        df['us_time'] = df.index.tz_convert('US/Eastern')
+        df['avg_vol_10'] = df['volume'].rolling(10).mean()
+        curr = df.iloc[-1]  # Get the most recent data (current bar)
+        dt_bar = curr['us_time']
+        price = curr['close']
+        macd = curr['macd']
+        macdsignal = curr['macdsignal']
+        hist = curr['hist']
+        rsi = curr['rsi14']
+        ema10 = curr['ema10']
+        ema20 = curr['ema20']
+        avg_vol = curr['avg_vol_10']
+        
+        # --- Signal Criteria: Focus only on the current bar
+        if (
+            macd > 0 and macdsignal < 0 and
+            hist > 0 and
+            rsi < rsi_thresh and
+            ema10 > ema20 and
+            min_price <= price <= max_price and
+            avg_vol >= min_volume
+        ):
+            row_key = (dt_bar.strftime("%Y-%m-%d %H:%M"), ticker)
+            if row_key in recent_signals: continue  # Deduplicate based on the sheet
+            kiv_results.append({
+                "Time": dt_bar.strftime("%Y-%m-%d %H:%M"),
+                "Ticker": ticker,
+                "MACD": formatn(macd,4),
+                "MACD Signal": formatn(macdsignal,4),
+                "RSI": formatn(rsi,2),
+                "EMA10": formatn(ema10,2),
+                "EMA20": formatn(ema20,2),
+                "Hist": formatn(hist,4),
+                "Price": formatn(price,2),
+                "AvgVol10": formatn(avg_vol,0)
+            })
+            rows_to_append.append([
+                dt_bar.strftime("%Y-%m-%d %H:%M"), ticker,
+                formatn(price,2), formatn(rsi,2), formatn(macd,4), formatn(macdsignal,4),
+                formatn(hist,4), formatn(ema10,2), formatn(ema20,2), formatn(avg_vol,0)
+            ])
+            recent_signals.add(row_key)
+    except Exception as e:
+        st.warning(f"Error for {ticker}: {e}")  # Debugging: Show error message
+        continue
+    progress.progress((n+1)/len(sp500))
+progress.empty()
+
+# ---- Show Table ----
+if kiv_results:
+    st.subheader("⭐ 1h MACD Cross Current Signals")
+    df_out = pd.DataFrame(kiv_results)
+    st.dataframe(df_out, use_container_width=True)
+    try:
+        if rows_to_append:
+            append_to_gsheet(rows_to_append, GOOGLE_SHEET_NAME)
+    except Exception as e:
+        st.warning(f"Google Sheet update error: {e}")
+else:
+    st.info("No current 1h MACD signals found.")
