@@ -52,6 +52,7 @@ def ensure_core_cols(df):
     return df
 
 def calc_indicators(df):
+    # EMA10 and EMA20
     df['ema10'] = df['close'].ewm(span=10, min_periods=10).mean()
     df['ema20'] = df['close'].ewm(span=20, min_periods=20).mean()
     # RSI
@@ -121,6 +122,7 @@ progress = st.progress(0.0)
 for n, ticker in enumerate(sp500):
     try:
         df = yf.download(ticker, period="2d", interval="1h", progress=False, threads=False)
+        
         if df.empty or len(df) < 1: 
             st.warning(f"No data for {ticker}")  # Debug: Check if data is fetched
             continue  # Only use the most recent data
@@ -132,11 +134,15 @@ for n, ticker in enumerate(sp500):
         df = norm(df)
         df = ensure_core_cols(df)
         df = calc_indicators(df)
-        df = df.dropna()
 
-        # Debugging: Print the calculated indicators
+        # Check if indicators are being calculated
         st.write(f"Calculated Indicators for {ticker}:")
         st.write(df[['close', 'macd', 'macdsignal', 'rsi14', 'ema10', 'ema20', 'hist']].tail())  # Show last row
+
+        df = df.dropna()
+        if len(df) < 1:  # In case there is no valid data after removing NaN
+            st.warning(f"No valid data after cleaning for {ticker}")
+            continue
 
         df['us_time'] = df.index.tz_convert('US/Eastern')
         df['avg_vol_10'] = df['volume'].rolling(10).mean()
@@ -198,4 +204,3 @@ if kiv_results:
         st.warning(f"Google Sheet update error: {e}")
 else:
     st.info("No current 1h MACD signals found.")
-
