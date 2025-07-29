@@ -3,7 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import pytz
-from datetime import datetime, timedelta
+from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
@@ -96,7 +96,6 @@ min_volume = st.sidebar.number_input("Min Avg Volume (10 bars)", value=100_000)
 min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
 rsi_thresh = st.sidebar.number_input("RSI threshold (below)", value=60.0)
-lookback_days = st.sidebar.slider("Lookback (max days to load)", 2, 7, 4)
 
 # ---- Signal Table ----
 st.title("AI-Powered US Stocks Screener: 1h MACD Cross")
@@ -122,15 +121,15 @@ kiv_results, rows_to_append = [], []
 progress = st.progress(0.0)
 for n, ticker in enumerate(sp500):
     try:
-        df = yf.download(ticker, period=f"{lookback_days+3}d", interval="1h", progress=False, threads=False)
-        if df.empty or len(df) < 20: continue
+        df = yf.download(ticker, period="2d", interval="1h", progress=False, threads=False)
+        if df.empty or len(df) < 1: continue  # Only use the most recent data
         df = norm(df)
         df = ensure_core_cols(df)
         df = calc_indicators(df)
         df = df.dropna()
         df['us_time'] = df.index.tz_convert('US/Eastern')
         df['avg_vol_10'] = df['volume'].rolling(10).mean()
-        curr = df.iloc[-1]
+        curr = df.iloc[-1]  # Get the most recent data (current bar)
         dt_bar = curr['us_time']
         price = curr['close']
         macd = curr['macd']
@@ -140,7 +139,7 @@ for n, ticker in enumerate(sp500):
         ema10 = curr['ema10']
         ema20 = curr['ema20']
         avg_vol = curr['avg_vol_10']
-        # --- Signal Criteria: NO LOOKBACK
+        # --- Signal Criteria: Focus only on the current bar
         if (
             macd > 0 and macdsignal < 0 and
             hist > 0 and
@@ -150,7 +149,7 @@ for n, ticker in enumerate(sp500):
             avg_vol >= min_volume
         ):
             row_key = (dt_bar.strftime("%Y-%m-%d %H:%M"), ticker)
-            if row_key in recent_signals: continue  # dedupe against sheet
+            if row_key in recent_signals: continue  # Deduplicate based on the sheet
             kiv_results.append({
                 "Time": dt_bar.strftime("%Y-%m-%d %H:%M"),
                 "Ticker": ticker,
@@ -176,7 +175,7 @@ progress.empty()
 
 # ---- Show Table ----
 if kiv_results:
-    st.subheader("⭐ 1h MACD Cross Current Signals (No Lookback)")
+    st.subheader("⭐ 1h MACD Cross Current Signals")
     df_out = pd.DataFrame(kiv_results)
     st.dataframe(df_out, use_container_width=True)
     try:
