@@ -52,15 +52,15 @@ def ensure_core_cols(df):
     return df
 
 def calc_indicators(df):
-    # Make sure there is enough data for the indicators
+    # Ensure there is enough data to calculate MACD/EMA/RSI
     if len(df) < 26:
         return df  # Not enough data for MACD/EMA calculations
 
     # EMA10 and EMA20
     df['ema10'] = df['close'].ewm(span=10, min_periods=10).mean()
     df['ema20'] = df['close'].ewm(span=20, min_periods=20).mean()
-    
-    # RSI
+
+    # RSI (14)
     delta = df['close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
@@ -68,14 +68,14 @@ def calc_indicators(df):
     roll_down = down.rolling(window=14).mean()
     rs = roll_up / (roll_down + 1e-9)
     df['rsi14'] = 100 - (100 / (1 + rs))
-    
+
     # MACD
     ema12 = df['close'].ewm(span=12, min_periods=12).mean()
     ema26 = df['close'].ewm(span=26, min_periods=26).mean()
     df['macd'] = ema12 - ema26
     df['macdsignal'] = df['macd'].ewm(span=9, min_periods=9).mean()
     df['hist'] = df['macd'] - df['macdsignal']
-    
+
     return df
 
 def get_gspread_client_from_secrets():
@@ -142,11 +142,11 @@ for n, ticker in enumerate(sp500):
         df = ensure_core_cols(df)
         df = calc_indicators(df)
 
-        # Check if indicators are being calculated
+        # Debugging: Check if indicators are added
         st.write(f"Calculated Indicators for {ticker}:")
         st.write(df[['close', 'macd', 'macdsignal', 'rsi14', 'ema10', 'ema20', 'hist']].tail())  # Show last row
 
-        df = df.dropna()
+        df = df.dropna(subset=['close', 'macd', 'macdsignal', 'rsi14', 'ema10', 'ema20', 'hist'])
         if len(df) < 1:  # In case there is no valid data after removing NaN
             st.warning(f"No valid data after cleaning for {ticker}")
             continue
