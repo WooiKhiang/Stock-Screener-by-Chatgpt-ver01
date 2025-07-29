@@ -13,13 +13,12 @@ GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "MACD Cross"
 
 sp500 = [
-    'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO','AXP','BA','BAC','BK','BKNG','BLK','BMY','BRK-B','C','CAT',
-    'CHTR','CL','CMCSA','COF','COP','COST','CRM','CSCO','CVS','CVX','DHR','DIS','DOW','DUK','EMR','EXC','F','FDX','FOX','FOXA',
-    'GD','GE','GILD','GM','GOOG','GOOGL','GS','HD','HON','IBM','INTC','JNJ','JPM','KHC','KMI','KO','LIN','LLY','LMT','LOW',
-    'MA','MCD','MDLZ','MDT','MET','META','MMM','MO','MRK','MS','MSFT','NEE','NFLX','NKE','NVDA','ORCL','PEP','PFE','PG','PM',
-    'PYPL','QCOM','RTX','SBUX','SCHW','SO','SPG','T','TGT','TMO','TMUS','TSLA','TXN','UNH','UNP','UPS','USB','V','VZ','WBA',
-    'WFC','WMT','XOM'
-    # ... add the rest of S&P 500 tickers as you wish ...
+    'AAPL', 'ABBV', 'ABT', 'ACN', 'ADBE', 'AIG', 'AMGN', 'AMT', 'AMZN', 'AVGO', 'AXP', 'BA', 'BAC', 'BK', 'BKNG', 'BLK', 'BMY', 'BRK-B', 'C', 'CAT',
+    'CHTR', 'CL', 'CMCSA', 'COF', 'COP', 'COST', 'CRM', 'CSCO', 'CVS', 'CVX', 'DHR', 'DIS', 'DOW', 'DUK', 'EMR', 'EXC', 'F', 'FDX', 'FOX', 'FOXA',
+    'GD', 'GE', 'GILD', 'GM', 'GOOG', 'GOOGL', 'GS', 'HD', 'HON', 'IBM', 'INTC', 'JNJ', 'JPM', 'KHC', 'KMI', 'KO', 'LIN', 'LLY', 'LMT', 'LOW',
+    'MA', 'MCD', 'MDLZ', 'MDT', 'MET', 'META', 'MMM', 'MO', 'MRK', 'MS', 'MSFT', 'NEE', 'NFLX', 'NKE', 'NVDA', 'ORCL', 'PEP', 'PFE', 'PG', 'PM',
+    'PYPL', 'QCOM', 'RTX', 'SBUX', 'SCHW', 'SO', 'SPG', 'T', 'TGT', 'TMO', 'TMUS', 'TSLA', 'TXN', 'UNH', 'UNP', 'UPS', 'USB', 'V', 'VZ', 'WBA',
+    'WFC', 'WMT', 'XOM'
 ]
 
 def formatn(num, d=2):
@@ -122,11 +121,23 @@ progress = st.progress(0.0)
 for n, ticker in enumerate(sp500):
     try:
         df = yf.download(ticker, period="2d", interval="1h", progress=False, threads=False)
-        if df.empty or len(df) < 1: continue  # Only use the most recent data
+        if df.empty or len(df) < 1: 
+            st.warning(f"No data for {ticker}")  # Debug: Check if data is fetched
+            continue  # Only use the most recent data
+        
+        # Debugging: Check if data is correct
+        st.write(f"Data for {ticker}:")
+        st.write(df.head())  # Display the first few rows of data
+
         df = norm(df)
         df = ensure_core_cols(df)
         df = calc_indicators(df)
         df = df.dropna()
+
+        # Debugging: Print the calculated indicators
+        st.write(f"Calculated Indicators for {ticker}:")
+        st.write(df[['close', 'macd', 'macdsignal', 'rsi14', 'ema10', 'ema20', 'hist']].tail())  # Show last row
+
         df['us_time'] = df.index.tz_convert('US/Eastern')
         df['avg_vol_10'] = df['volume'].rolling(10).mean()
         curr = df.iloc[-1]  # Get the most recent data (current bar)
@@ -139,6 +150,7 @@ for n, ticker in enumerate(sp500):
         ema10 = curr['ema10']
         ema20 = curr['ema20']
         avg_vol = curr['avg_vol_10']
+        
         # --- Signal Criteria: Focus only on the current bar
         if (
             macd > 0 and macdsignal < 0 and
@@ -169,6 +181,7 @@ for n, ticker in enumerate(sp500):
             ])
             recent_signals.add(row_key)
     except Exception as e:
+        st.warning(f"Error for {ticker}: {e}")  # Debugging: Show error message
         continue
     progress.progress((n+1)/len(sp500))
 progress.empty()
@@ -186,18 +199,3 @@ if kiv_results:
 else:
     st.info("No current 1h MACD signals found.")
 
-# --- Criteria Recap
-with st.expander("📜 Screener Signal Criteria (Click to expand)"):
-    st.markdown("""
-    - **Chart:** 1H bar, US/Eastern time.
-    - **MACD > 0**, **MACD Signal < 0** (current bar only).
-    - **MACD Histogram > 0**
-    - **RSI(14) below threshold** (sidebar adjustable, default 60).
-    - **EMA10 > EMA20** (trend confirmation).
-    - **Min price, min avg volume (10 bars)** (sidebar).
-    - **No previous bar/cross-up logic:** Only most recent bar is used.
-    - **No duplicate alerts per ticker/time (sheet-guarded).**
-    - **Pushes new hits to Google Sheet for tracking.**
-    """)
-
-st.caption("© AI Screener | S&P 500. 1h chart. Only current-bar signals. No previous-bar lookback. Sheet push enabled.")
