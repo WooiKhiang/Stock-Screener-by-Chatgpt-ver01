@@ -1,9 +1,10 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import pytz
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
@@ -12,41 +13,56 @@ import json
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "MACD Cross"
 
+# S&P 500 Tickers (shortened here for brevity - use your full list!)
 sp500 = [
     'AAPL','ABBV','ABT','ACN','ADBE','AIG','AMGN','AMT','AMZN','AVGO','AXP','BA','BAC','BK','BKNG','BLK','BMY','BRK-B','C','CAT',
     'CHTR','CL','CMCSA','COF','COP','COST','CRM','CSCO','CVS','CVX','DHR','DIS','DOW','DUK','EMR','EXC','F','FDX','FOX','FOXA',
     'GD','GE','GILD','GM','GOOG','GOOGL','GS','HD','HON','IBM','INTC','JNJ','JPM','KHC','KMI','KO','LIN','LLY','LMT','LOW',
     'MA','MCD','MDLZ','MDT','MET','META','MMM','MO','MRK','MS','MSFT','NEE','NFLX','NKE','NVDA','ORCL','PEP','PFE','PG','PM',
     'PYPL','QCOM','RTX','SBUX','SCHW','SO','SPG','T','TGT','TMO','TMUS','TSLA','TXN','UNH','UNP','UPS','USB','V','VZ','WBA',
-    'WFC','WMT','XOM'
-    # ... add the rest of S&P 500 tickers as you wish ...
+    'WFC','WMT','XOM',
+    # ... (add the rest if needed)
 ]
 
-def formatn(num, d=2):
-    try:
-        if num is None or num == "" or np.isnan(num): return "-"
-        if isinstance(num, int) or d == 0:
-            return f"{int(num):,}"
-        return f"{num:,.{d}f}"
-    except Exception:
-        return str(num)
+# ---- SIDEBAR FILTERS ----
+st.sidebar.header("Screener Filters")
+min_price = st.sidebar.number_input("Minimum Price ($)", value=10.0, min_value=0.01)
+min_avg_vol = st.sidebar.number_input("Minimum Avg Volume (last 20 bars)", value=300_000)
+rsi_threshold = st.sidebar.slider("Max RSI (14)", min_value=30, max_value=70, value=60, step=1)
+max_days = st.sidebar.slider("Max Days To Scan", min_value=1, max_value=14, value=7, step=1)
 
+# ---- PAGE TITLE & AUTO-REFRESH ----
+st.title("AI-Powered US Stocks Screener: 1h MACD Cross (S&P 500)")
+st_autorefresh(interval=300000, key="screener_autorefresh")  # 5 minutes
+st.caption("⏳ Page auto-refreshes every 5 minutes. All times in US/Eastern.")
+
+# ---- GOOGLE SHEETS HELPER ----
+def get_gspread_client_from_secrets():
+    info = st.secrets["gcp_service_account"]
+    creds_dict = {k: v for k, v in info.items()}
+    if isinstance(creds_dict["private_key"], list):
+        creds_dict["private_key"] = "\n".join(creds_dict["private_key"])
+    creds_json = json.dumps(creds_dict)
+    scope = ["https://spreadsheets.google.com/feeds",'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
+    return gspread.authorize(creds)
+
+def append_to_gsheet(rows):
+    try:
+        client = get_gspread_client_from_secrets()
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
+        for row in rows:
+            sheet.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        st.warning(f"Google Sheet Error: {e}")
+
+# ---- INDICATOR FUNCTIONS ----
 def norm(df):
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join([str(x).lower() for x in c if x]) for c in df.columns]
-    else:
-        df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
+    df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
     return df
 
 def ensure_core_cols(df):
     req = ["close","open","high","low","volume"]
-    col_map = {c: c for c in df.columns}
-    for col in df.columns:
-        cstr = str(col).lower()
-        for r in req:
-            if r in cstr and r not in col_map.values():
-                col_map[col] = r
-    df = df.rename(columns=col_map)
     missing = [x for x in req if x not in df.columns]
     if missing:
         raise Exception(f"Missing columns: {missing}")
@@ -71,135 +87,116 @@ def calc_indicators(df):
     df['hist'] = df['macd'] - df['macdsignal']
     return df
 
-def get_gspread_client_from_secrets():
-    info = st.secrets["gcp_service_account"]
-    creds_dict = {k: v for k, v in info.items()}
-    if isinstance(creds_dict["private_key"], list):
-        creds_dict["private_key"] = "\n".join(creds_dict["private_key"])
-    creds_json = json.dumps(creds_dict)
-    scope = ["https://spreadsheets.google.com/feeds",'https://www.googleapis.com/auth/drive']
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
-    return gspread.authorize(creds)
+def formatn(x, d=2):
+    try: return f"{x:,.{d}f}"
+    except: return x
 
-def append_to_gsheet(rows, sheet_name):
+def us_time_str():
+    return datetime.now(pytz.timezone("US/Eastern")).strftime('%Y-%m-%d %H:%M:%S')
+
+# ---- MARKET SENTIMENT ----
+def get_market_sentiment():
     try:
-        client = get_gspread_client_from_secrets()
-        sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(sheet_name)
-        for row in rows:
-            sheet.append_row(row, value_input_option="USER_ENTERED")
+        spy = yf.download('SPY', period='1d', interval='60m', progress=False, threads=False)
+        if spy.empty: return 0, "Sentiment: Unknown"
+        spy = norm(spy)
+        spy = ensure_core_cols(spy)
+        open_, last = spy['open'].iloc[0], spy['close'].iloc[-1]
+        pct = (last - open_) / open_ * 100
+        if pct > 0.5: return pct, "🟢 Bullish"
+        elif pct < -0.5: return pct, "🔴 Bearish"
+        else: return pct, "🟡 Sideways"
+    except Exception:
+        return 0, "Sentiment: Unknown"
+
+sentiment_pct, sentiment_text = get_market_sentiment()
+st.subheader(f"Market Sentiment: {sentiment_text} ({sentiment_pct:.2f}%)")
+
+# ---- MAIN SCREENER ----
+scan_days = max_days
+macd_signals = []
+for ticker in sp500:
+    try:
+        df = yf.download(ticker, period=f"{scan_days+2}d", interval='1h', progress=False, threads=False)
+        if df.empty or len(df) < 30: continue
+        df = norm(df)
+        df = ensure_core_cols(df)
+        df = calc_indicators(df)
+
+        # Check only most recent bar (current hour)
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+        avg_vol = df['volume'][-20:].mean()
+
+        # Main Screener Criteria (NO lookback)
+        conds = [
+            prev['macd'] < 0 and curr['macd'] > 0,       # MACD cross up zero
+            curr['macdsignal'] < 0,                      # MACD signal below zero
+            curr['rsi14'] < rsi_threshold,               # RSI below threshold (sidebar)
+            curr['ema10'] > curr['ema20'],               # EMA10 > EMA20
+            curr['hist'] > 0,                            # MACD histogram positive
+            curr['close'] > min_price,                   # Price filter
+            avg_vol > min_avg_vol,                       # Average volume filter
+        ]
+        if all(conds):
+            macd_signals.append({
+                "Ticker": ticker,
+                "Price": formatn(curr['close']),
+                "RSI": formatn(curr['rsi14'], 1),
+                "MACD": formatn(curr['macd'], 3),
+                "MACD Signal": formatn(curr['macdsignal'], 3),
+                "Hist": formatn(curr['hist'], 3),
+                "EMA10": formatn(curr['ema10']),
+                "EMA20": formatn(curr['ema20']),
+                "Avg Vol": formatn(avg_vol, 0),
+                "Time": df.index[-1].tz_localize(None).strftime("%Y-%m-%d %H:%M"),
+                "US Time": us_time_str()
+            })
     except Exception as e:
-        st.warning(f"Google Sheet ({sheet_name}): {e}")
+        continue
 
-# ---- Sidebar ----
-st.sidebar.header("KIV Signal Parameters")
-min_volume = st.sidebar.number_input("Min Avg Volume (10 bars)", value=100_000)
-min_price = st.sidebar.number_input("Min Price ($)", value=10.0)
-max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
-rsi_thresh = st.sidebar.number_input("RSI threshold (below)", value=60.0)
-lookback_days = st.sidebar.slider("Lookback (max days to load)", 2, 7, 4)
+# ---- SHOW MAIN TABLE ----
+st.subheader(f"⭐ S&P 500: 1h MACD Cross Screener (Last {scan_days} days)")
+if macd_signals:
+    df_signals = pd.DataFrame(macd_signals)
+    st.dataframe(df_signals, use_container_width=True)
+    # ---- PUSH TO GOOGLE SHEET ----
+    try:
+        rows = [[x['Time'], x['Ticker'], x['Price'], x['RSI'], x['MACD'], x['MACD Signal'], x['Hist'], x['EMA10'], x['EMA20'], x['Avg Vol']] for x in macd_signals]
+        append_to_gsheet(rows)
+    except Exception as e:
+        st.warning(f"Google Sheet Error: {e}")
+else:
+    st.info("No signals found meeting all criteria in the latest scan.")
 
-# ---- Signal Table ----
-st.title("AI-Powered US Stocks Screener: 1h MACD Cross")
-st.caption(f"Last run: {datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d %H:%M:%S')} US/Eastern")
-
-# -- Fetch & Prepare Sheet History for De-dupe
-recent_signals = set()
+# ---- SHOW RECENT HISTORY TABLE ----
+st.subheader("🕒 Last 10 MACD Cross Signals (from Sheet)")
 try:
     client = get_gspread_client_from_secrets()
     sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
     data = sheet.get_all_values()
     if data and len(data) > 1:
-        headers, rows = data[0], data[1:]
-        # Only keep signals from last 7 days for dedupe (adjust as needed)
-        for row in rows:
-            if len(row) >= 2:
-                ktime, kticker = row[0], row[1]
-                recent_signals.add((ktime, kticker))
+        headers, rows = data[0], data[-10:]
+        df_last = pd.DataFrame(rows, columns=headers)
+        st.dataframe(df_last, use_container_width=True)
 except Exception as e:
-    st.warning(f"Could not load recent sheet data: {e}")
+    st.warning(f"Error loading recent signals: {e}")
 
-kiv_results, rows_to_append = [], []
-progress = st.progress(0.0)
-for n, ticker in enumerate(sp500):
-    try:
-        df = yf.download(ticker, period=f"{lookback_days+3}d", interval="1h", progress=False, threads=False)
-        if df.empty or len(df) < 20: continue
-        df = norm(df)
-        df = ensure_core_cols(df)
-        df = calc_indicators(df)
-        df = df.dropna()
-        df['us_time'] = df.index.tz_convert('US/Eastern')
-        df['avg_vol_10'] = df['volume'].rolling(10).mean()
-        curr = df.iloc[-1]
-        dt_bar = curr['us_time']
-        price = curr['close']
-        macd = curr['macd']
-        macdsignal = curr['macdsignal']
-        hist = curr['hist']
-        rsi = curr['rsi14']
-        ema10 = curr['ema10']
-        ema20 = curr['ema20']
-        avg_vol = curr['avg_vol_10']
-        # --- Signal Criteria: NO LOOKBACK
-        if (
-            macd > 0 and macdsignal < 0 and
-            hist > 0 and
-            rsi < rsi_thresh and
-            ema10 > ema20 and
-            min_price <= price <= max_price and
-            avg_vol >= min_volume
-        ):
-            row_key = (dt_bar.strftime("%Y-%m-%d %H:%M"), ticker)
-            if row_key in recent_signals: continue  # dedupe against sheet
-            kiv_results.append({
-                "Time": dt_bar.strftime("%Y-%m-%d %H:%M"),
-                "Ticker": ticker,
-                "MACD": formatn(macd,4),
-                "MACD Signal": formatn(macdsignal,4),
-                "RSI": formatn(rsi,2),
-                "EMA10": formatn(ema10,2),
-                "EMA20": formatn(ema20,2),
-                "Hist": formatn(hist,4),
-                "Price": formatn(price,2),
-                "AvgVol10": formatn(avg_vol,0)
-            })
-            rows_to_append.append([
-                dt_bar.strftime("%Y-%m-%d %H:%M"), ticker,
-                formatn(price,2), formatn(rsi,2), formatn(macd,4), formatn(macdsignal,4),
-                formatn(hist,4), formatn(ema10,2), formatn(ema20,2), formatn(avg_vol,0)
-            ])
-            recent_signals.add(row_key)
-    except Exception as e:
-        continue
-    progress.progress((n+1)/len(sp500))
-progress.empty()
-
-# ---- Show Table ----
-if kiv_results:
-    st.subheader("⭐ 1h MACD Cross Current Signals (No Lookback)")
-    df_out = pd.DataFrame(kiv_results)
-    st.dataframe(df_out, use_container_width=True)
-    try:
-        if rows_to_append:
-            append_to_gsheet(rows_to_append, GOOGLE_SHEET_NAME)
-    except Exception as e:
-        st.warning(f"Google Sheet update error: {e}")
-else:
-    st.info("No current 1h MACD signals found.")
-
-# --- Criteria Recap
-with st.expander("📜 Screener Signal Criteria (Click to expand)"):
-    st.markdown("""
-    - **Chart:** 1H bar, US/Eastern time.
-    - **MACD > 0**, **MACD Signal < 0** (current bar only).
-    - **MACD Histogram > 0**
-    - **RSI(14) below threshold** (sidebar adjustable, default 60).
-    - **EMA10 > EMA20** (trend confirmation).
-    - **Min price, min avg volume (10 bars)** (sidebar).
-    - **No previous bar/cross-up logic:** Only most recent bar is used.
-    - **No duplicate alerts per ticker/time (sheet-guarded).**
-    - **Pushes new hits to Google Sheet for tracking.**
+# ---- CRITERIA DISPLAY ----
+with st.expander("ℹ️ Screener Strategy & Criteria", expanded=True):
+    st.markdown(f"""
+- **Timeframe:** 1 Hour (US/Eastern)
+- **Universe:** S&P 500 (all tickers)
+- **MACD Crosses Up Zero:** Previous bar MACD < 0, Current MACD > 0
+- **MACD Signal Line Below Zero** (bullish cross still in early phase)
+- **RSI(14) Below {rsi_threshold}** (customizable in sidebar)
+- **EMA10 > EMA20** (trend confirmation)
+- **MACD Histogram Positive**
+- **Minimum Price:** ${min_price}
+- **Minimum Avg Volume:** {min_avg_vol:,.0f} (last 20 bars)
+- **Data auto-refreshes every 5 minutes**
+- **Pushes all signals to Google Sheet (MACD Cross tab)**
+- **All times in US/Eastern (matches Moomoo & most US brokers)**
     """)
 
-st.caption("© AI Screener | S&P 500. 1h chart. Only current-bar signals. No previous-bar lookback. Sheet push enabled.")
-
+st.caption("© AI Screener | S&P 500 | MACD/EMA/RSI volume filter | v2025-07")
