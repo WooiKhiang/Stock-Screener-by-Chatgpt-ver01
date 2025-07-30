@@ -1,12 +1,14 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import pytz
-from datetime import datetime, time as dt_time
+from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
+import time
 
 # ---- Config ----
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
@@ -39,7 +41,6 @@ sp500 = [
     "TECH","TER","URI","VMC","WDC","WTW","ZBRA","DASH", "TKO", "WSM", "EXE", "COIN", "TTD", "SQ"
 ]
 
-# ---- Helper Functions ----
 def formatn(num, d=2):
     try:
         if num is None or num == "" or np.isnan(num): return "-"
@@ -92,20 +93,57 @@ def calc_indicators(df):
 def us_local_time():
     return datetime.now(pytz.timezone("US/Eastern")).strftime('%Y-%m-%d %H:%M:%S')
 
-# ---- Sidebar Filters ----
+def get_gspread_client_from_secrets():
+    info = st.secrets["gcp_service_account"]
+    creds_dict = {k: v for k, v in info.items()}
+    if isinstance(creds_dict["private_key"], list):
+        creds_dict["private_key"] = "\n".join(creds_dict["private_key"])
+    creds_json = json.dumps(creds_dict)
+    scope = ["https://spreadsheets.google.com/feeds",'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
+    return gspread.authorize(creds)
+
+def append_to_gsheet(rows, sheet_name):
+    try:
+        client = get_gspread_client_from_secrets()
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(sheet_name)
+        for row in rows:
+            sheet.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        st.warning(f"Google Sheet ({sheet_name}): {e}")
+
+# --- Auto Refresh (every 5min) ---
+st_autorefresh(interval=5*60*1000, key="autorefresh")  # 5 min
+
+# --- Sidebar ---
 st.sidebar.header("MACD Cross Screener Filters")
 min_price = st.sidebar.number_input("Min Price ($)", value=5.0)
 max_price = st.sidebar.number_input("Max Price ($)", value=2000.0)
 min_vol = st.sidebar.number_input("Min Avg Volume (10 bars)", value=100_000)
 max_rsi = st.sidebar.number_input("Max RSI (14)", value=60)
-# No Lookback Days shown!
 
-# ---- Main Table ----
+# --- Strategy Explanation ---
+with st.expander("📘 Strategy: MACD Cross Screener Logic", expanded=True):
+    st.markdown("""
+**Entry Criteria:**  
+- 1H bar (US/Eastern, S&P 500 universe)
+- MACD crosses above zero (**current MACD > 0**; MACD signal < 0)
+- RSI(14) below threshold (default 60, adjustable in sidebar)
+- EMA10 > EMA20 (trend confirmation)
+- MACD histogram positive (bullish momentum)
+- Current price in your min/max range
+- 10-bar average volume above threshold
+
+**Reference table below** shows any ticker with MACD>0, Signal<0 regardless of other filters.
+""")
+
+# --- Main Table ---
 st.title("MACD Cross Zero (US S&P 500 Screener)")
 st.caption(f"Last run: {us_local_time()}")
 
 results, reference_rows = [], []
-for ticker in sp500:
+progress = st.progress(0)
+for i, ticker in enumerate(sp500):
     try:
         df = yf.download(ticker, period="10d", interval="1h", progress=False, threads=False)
         if df.empty or len(df) < 40: continue
@@ -151,18 +189,26 @@ for ticker in sp500:
             })
     except Exception as e:
         continue
+    progress.progress((i + 1) / len(sp500))
 
+# --- Display Main Screener Table ---
 if results:
     st.subheader("⭐ MACD Cross Signals (Filtered)")
-    st.dataframe(pd.DataFrame(results), use_container_width=True)
+    df_out = pd.DataFrame(results)
+    st.dataframe(df_out, use_container_width=True)
+    # ---- Google Sheet Export ----
+    try:
+        append_to_gsheet(df_out.values.tolist(), GOOGLE_SHEET_NAME)
+    except Exception as e:
+        st.warning(f"Google Sheet Export Error: {e}")
 else:
     st.info("No filtered MACD cross signals found for current bar.")
 
+# --- Reference Table (all MACD>0, Signal<0, no filters) ---
 st.subheader("🕵️ Reference: MACD Cross Up (MACD > 0, Signal < 0, All tickers, no filters)")
 if reference_rows:
     st.dataframe(pd.DataFrame(reference_rows), use_container_width=True)
 else:
     st.info("No reference MACD cross events found for current bar.")
 
-st.caption("Only latest 1H bar is screened for main table. Reference table shows all MACD>0, Signal<0 events regardless of filters. Run every hour for live results.")
-
+st.caption("Auto-refreshes every 5 min. S&P500, US/Eastern time. Main screener pushes to Google Sheet.")
