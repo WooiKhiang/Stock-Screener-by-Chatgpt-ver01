@@ -4,3 +4,4 @@ yfinance
 requests
 gspread
 oauth2client
+streamlit-autorefresh
