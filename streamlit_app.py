@@ -84,44 +84,50 @@ def append_to_gsheet(rows, sheet_name):
 # ---- Data fetch & caching ----
 @st.cache_data(ttl=300)
 def fetch_intraday(tickers, interval="5m", period="5d", prepost=True):
-    """Multi-ticker intraday fetch with caching. Returns dict[ticker]->DataFrame."""
+    """Multi-ticker intraday fetch with caching. Returns dict[ticker]->DataFrame.
+    Ensures lowercase OHLCV columns and ET timezone for both single and multi ticker paths."""
     if isinstance(tickers, str):
         tickers = [tickers]
     data = {}
-    # yfinance multi-download (chunk to avoid URL limits)
     CHUNK = 150
     for i in range(0, len(tickers), CHUNK):
         chunk = tickers[i:i+CHUNK]
         try:
-            df = yf.download(" ".join(chunk), interval=interval, period=period, prepost=prepost,
-                             group_by='ticker', auto_adjust=False, progress=False, threads=False)
+            raw = yf.download(" ".join(chunk), interval=interval, period=period, prepost=prepost,
+                              group_by='ticker', auto_adjust=False, progress=False, threads=False)
+            # Normalize to dict[ticker]->DataFrame with lowercase cols + ET tz
             if len(chunk) == 1:
-                # yfinance collapses single-ticker shape
-                df = {chunk[0]: df}
+                sub = raw.copy()
+                sub = sub.rename(columns={c: c.split(" ")[0] for c in sub.columns})
+                if sub.index.tz is None:
+                    sub.index = sub.index.tz_localize('UTC').tz_convert(ET_TZ)
+                else:
+                    sub.index = sub.index.tz_convert(ET_TZ)
+                sub = sub[['Open','High','Low','Close','Volume']].rename(columns=str.lower).dropna()
+                data[chunk[0]] = sub
             else:
-                # df is a column MultiIndex (ticker, field)
                 dd = {}
                 for t in chunk:
-                    if (t,) in df.columns:  # defensive (rare)
-                        sub = df[(t,)]
-                    else:
-                        try:
-                            sub = df[t]
-                        except Exception:
-                            continue
+                    try:
+                        sub = raw[t]
+                    except Exception:
+                        # Some tickers may be missing
+                        continue
                     sub = sub.rename(columns={c: c.split(" ")[0] for c in sub.columns})
-                    sub.index = sub.index.tz_localize('UTC').tz_convert(ET_TZ)
+                    if sub.index.tz is None:
+                        sub.index = sub.index.tz_localize('UTC').tz_convert(ET_TZ)
+                    else:
+                        sub.index = sub.index.tz_convert(ET_TZ)
                     dd[t] = sub[['Open','High','Low','Close','Volume']].rename(columns=str.lower).dropna()
-                df = dd
-            # normalize
-            for t, d in (df.items() if isinstance(df, dict) else []):
-                data[t] = d
+                for t, d in dd.items():
+                    data[t] = d
         except Exception:
             continue
     return data
 
 @st.cache_data(ttl=900)
 def fetch_daily(tickers, period="6mo"):
+    """Multi-ticker daily fetch returning dict[ticker]->DataFrame with lowercase OHLCV (ET tz)."""
     if isinstance(tickers, str):
         tickers = [tickers]
     data = {}
@@ -129,22 +135,31 @@ def fetch_daily(tickers, period="6mo"):
     for i in range(0, len(tickers), CHUNK):
         chunk = tickers[i:i+CHUNK]
         try:
-            df = yf.download(" ".join(chunk), interval="1d", period=period, group_by='ticker', auto_adjust=False, progress=False, threads=False)
+            raw = yf.download(" ".join(chunk), interval="1d", period=period, group_by='ticker', auto_adjust=False, progress=False, threads=False)
             if len(chunk) == 1:
-                df = {chunk[0]: df}
+                sub = raw.copy()
+                sub = sub.rename(columns={c: c.split(" ")[0] for c in sub.columns})
+                if sub.index.tz is None:
+                    sub.index = sub.index.tz_localize('UTC').tz_convert(ET_TZ)
+                else:
+                    sub.index = sub.index.tz_convert(ET_TZ)
+                sub = sub[['Open','High','Low','Close','Volume']].rename(columns=str.lower).dropna()
+                data[chunk[0]] = sub
             else:
                 dd = {}
                 for t in chunk:
                     try:
-                        sub = df[t]
+                        sub = raw[t]
                     except Exception:
                         continue
                     sub = sub.rename(columns={c: c.split(" ")[0] for c in sub.columns})
-                    sub.index = sub.index.tz_localize('UTC').tz_convert(ET_TZ)
+                    if sub.index.tz is None:
+                        sub.index = sub.index.tz_localize('UTC').tz_convert(ET_TZ)
+                    else:
+                        sub.index = sub.index.tz_convert(ET_TZ)
                     dd[t] = sub[['Open','High','Low','Close','Volume']].rename(columns=str.lower).dropna()
-                df = dd
-            for t, d in (df.items() if isinstance(df, dict) else []):
-                data[t] = d
+                for t, d in dd.items():
+                    data[t] = d
         except Exception:
             continue
     return data
@@ -319,7 +334,12 @@ st.success(f"Universe size: {len(base_universe)} (auto-built)")
 
 # Export universe to GSheet (optional, non-fatal)
 try:
-    append_to_gsheet([[et_now_str()] + base_universe], SHEET_UNIVERSE)
+    # Write universe vertically: Timestamp, Ticker per row
+try:
+    uni_rows = [[et_now_str(), t] for t in base_universe]
+    append_to_gsheet(uni_rows, SHEET_UNIVERSE)
+except Exception:
+    pass
 except Exception:
     pass
 
