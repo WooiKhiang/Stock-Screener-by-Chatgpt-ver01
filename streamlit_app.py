@@ -82,33 +82,43 @@ def append_to_gsheet(rows, sheet_name):
     """Append multiple rows in a single API call when possible to avoid 429s."""
     try:
         client = get_gspread_client_from_secrets()
-        sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(sheet_name)
+        ss = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            sheet = ss.worksheet(sheet_name)
+        except Exception:
+            # create if missing (Signals sheet etc.)
+            cols = "8" if sheet_name == SHEET_SIGNALS else "2"
+            sheet = ss.add_worksheet(title=sheet_name, rows="20000", cols=cols)
         if isinstance(rows, pd.DataFrame):
             rows = rows.values.tolist()
+        if not rows:
+            return
         # Prefer batch append if available
         if hasattr(sheet, "append_rows"):
             sheet.append_rows(rows, value_input_option="USER_ENTERED")
         else:
-            # Fallback to per-row append (older gspread)
             for row in rows:
                 sheet.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         st.warning(f"Google Sheet ({sheet_name}): {e}")
 
 def write_universe_sheet(tickers: list[str]):
-    """Replace the Universe sheet in ONE update: header + rows. Minimizes write calls.
-    We also gate calls at the caller to avoid frequent writes.
-    """
+    """Replace the Universe sheet in ONE update: header + rows. Creates sheet if missing."""
     try:
         client = get_gspread_client_from_secrets()
         ss = client.open_by_key(GOOGLE_SHEET_ID)
-        ws = ss.worksheet(SHEET_UNIVERSE)
+        try:
+            ws = ss.worksheet(SHEET_UNIVERSE)
+        except Exception:
+            # Create if missing
+            ws = ss.add_worksheet(title=SHEET_UNIVERSE, rows="20000", cols="2")
         rows = [["Timestamp (ET)", "Ticker"]] + [[et_now_str(), t] for t in tickers]
-        # Clear then bulk write. Two requests, but done rarely and much cheaper than N appends.
         ws.clear()
         ws.update("A1", rows, value_input_option="USER_ENTERED")
+        return True, f"Wrote {len(tickers)} rows"
     except Exception as e:
         st.warning(f"Google Sheet (Universe): {e}")
+        return False, str(e)
 
 # ---- Data fetch & caching ----
 @st.cache_data(ttl=300)
@@ -378,37 +388,47 @@ with st.sidebar:
         if st.button("Manual refresh"):
             st.experimental_rerun()
     st.header("Universe & Filters")
-min_price = st.number_input("Min Price ($)", value=5.0)
-max_price = st.number_input("Max Price ($)", value=100.0)
-# Exchange & instrument filters
-exclude_funds = st.checkbox("Exclude ETFs/ETNs/NextShares/Test Issues", value=True)
-exclude_derivs = st.checkbox("Exclude Warrants/Units/Rights/Preferred/Notes/Trusts", value=True)
-ex_opts = ["NASDAQ (Q)","NYSE (N)","NYSE Arca (P)","NYSE American (A)","Cboe BZX (Z)","Nasdaq BX (B)"]
-ex_default = ["NASDAQ (Q)","NYSE (N)"]
-ex_sel = st.multiselect("Allowed Exchanges", ex_opts, default=ex_default)
-ex_map = {"NASDAQ (Q)":"Q","NYSE (N)":"N","NYSE Arca (P)":"P","NYSE American (A)":"A","Cboe BZX (Z)":"Z","Nasdaq BX (B)":"B"}
-allowed_exchanges = {ex_map[x] for x in ex_sel}
-# Liquidity & vol filters
-min_avg_dollar_vol = st.number_input("Min Avg Dollar Volume (20d)", value=30_000_000)
-max_atr_pct = st.number_input("Max 14d ATR%", value=12.0)
-min_atr_pct = st.number_input("Min 14d ATR%", value=1.5)
-# Optional manual override
-st.markdown("Manual tickers (optional, comma/space-separated):")
-manual_syms = st.text_area("Symbols override", value="", height=60)
+    min_price = st.number_input("Min Price ($)", value=5.0)
+    max_price = st.number_input("Max Price ($)", value=100.0)
+    # Exchange & instrument filters
+    exclude_funds = st.checkbox("Exclude ETFs/ETNs/NextShares/Test Issues", value=True)
+    exclude_derivs = st.checkbox("Exclude Warrants/Units/Rights/Preferred/Notes/Trusts", value=True)
+    ex_opts = ["NASDAQ (Q)","NYSE (N)","NYSE Arca (P)","NYSE American (A)","Cboe BZX (Z)","Nasdaq BX (B)"]
+    ex_default = ["NASDAQ (Q)","NYSE (N)"]
+    ex_sel = st.multiselect("Allowed Exchanges", ex_opts, default=ex_default)
+    ex_map = {"NASDAQ (Q)":"Q","NYSE (N)":"N","NYSE Arca (P)":"P","NYSE American (A)":"A","Cboe BZX (Z)":"Z","Nasdaq BX (B)":"B"}
+    allowed_exchanges = {ex_map[x] for x in ex_sel}
+    # Liquidity & vol filters
+    min_avg_dollar_vol = st.number_input("Min Avg Dollar Volume (20d)", value=30_000_000)
+    max_atr_pct = st.number_input("Max 14d ATR%", value=12.0)
+    min_atr_pct = st.number_input("Min 14d ATR%", value=1.5)
+    # Optional manual override
+    st.markdown("Manual tickers (optional, comma/space-separated):")
+    manual_syms = st.text_area("Symbols override", value="", height=60)
 
-st.divider()
-st.subheader("Risk & PDT")
-acct_equity = st.number_input("Account Equity ($)", value=10_000)
-risk_pct = st.slider("Risk % per trade", 0.1, 1.0, 0.75, step=0.05)
-max_new_trades_today = st.number_input("Max NEW trades today", value=3, min_value=1)
-fees_per_trade = st.number_input("Fees per trade ($)", value=0.50, min_value=0.0, step=0.05)
-slip_bps = st.number_input("Slippage (bps)", value=5, min_value=0)
+    # Rebuild controls and status
+    rebuild_now = st.button("Rebuild Universe now")
+    st.caption(f"Last rebuild (ET): {st.session_state.get('universe_built_at', 'never')}")
 
-st.divider()
-st.subheader("Strategy Windows")
-rvol_threshold = st.number_input("Min 5m RVOL (signal bar)", value=1.5)
-enable_orb = st.checkbox("Enable ORB-VWAP Continuation", value=True)
-enable_snap = st.checkbox("Enable RSI(2) VWAP Snapback", value=True)
+    st.divider()
+    st.subheader("Risk & PDT")
+    acct_equity = st.number_input("Account Equity ($)", value=10_000)
+    risk_pct = st.slider("Risk % per trade", 0.1, 1.0, 0.75, step=0.05)
+    max_new_trades_today = st.number_input("Max NEW trades today", value=3, min_value=1)
+    fees_per_trade = st.number_input("Fees per trade ($)", value=0.50, min_value=0.0, step=0.05)
+    slip_bps = st.number_input("Slippage (bps)", value=5, min_value=0)
+
+    st.divider()
+    st.subheader("Strategy Windows")
+    rvol_threshold = st.number_input("Min 5m RVOL (signal bar)", value=1.5)
+    enable_orb = st.checkbox("Enable ORB-VWAP Continuation", value=True)
+    enable_snap = st.checkbox("Enable RSI(2) VWAP Snapback", value=True)
+
+    st.divider()
+    st.subheader("Output")
+    auto_write_signals = st.checkbox("Auto-write Signals to Google Sheet", value=True)
+
+
 
 # Session state buffers (incremental updates)
 if "buffers" not in st.session_state:
@@ -417,14 +437,26 @@ if "ledger" not in st.session_state:
     st.session_state.ledger = []
 if "today_trades" not in st.session_state:
     st.session_state.today_trades = 0
+if "signal_keys_written" not in st.session_state:
+    st.session_state.signal_keys_written = set()  # to avoid duplicate appends on refresh
 
 # -------------- Build Universe --------------
+et_today = et_now().date()
 if manual_syms.strip():
     base_universe = [s.strip().upper() for s in manual_syms.replace('\n',' ').replace(',', ' ').split() if s.strip()]
     source_symbols = base_universe
 else:
-    source_symbols = download_symbol_files(exclude_funds=exclude_funds, exclude_derivs=exclude_derivs, allowed_exchanges=allowed_exchanges)
-    base_universe = build_universe(min_price, max_price, min_avg_dollar_vol, min_atr_pct, max_atr_pct, raw_syms=source_symbols)
+    need_rebuild = st.session_state.get('universe_built_date') != et_today or st.session_state.get('universe_cache') is None or rebuild_now
+    if need_rebuild:
+        source_symbols = download_symbol_files(exclude_funds=exclude_funds, exclude_derivs=exclude_derivs, allowed_exchanges=allowed_exchanges)
+        base_universe = build_universe(min_price, max_price, min_avg_dollar_vol, min_atr_pct, max_atr_pct, raw_syms=source_symbols)
+        st.session_state['universe_cache'] = base_universe
+        st.session_state['source_symbols_cache'] = source_symbols
+        st.session_state['universe_built_date'] = et_today
+        st.session_state['universe_built_at'] = et_now_str()
+    else:
+        base_universe = st.session_state.get('universe_cache', [])
+        source_symbols = st.session_state.get('source_symbols_cache', [])
 
 _src_count = len(source_symbols)
 st.success(f"Universe size: {len(base_universe)} (auto-built from {_src_count} filtered source symbols)")
@@ -437,13 +469,18 @@ now_et = et_now()
 last_hash = st.session_state.get('universe_written_hash')
 last_at = st.session_state.get('universe_written_at')
 ok_to_write = (last_hash != cur_hash) and (last_at is None or (now_et - last_at).total_seconds() > 600)
-if ok_to_write and base_universe:
-    write_universe_sheet(base_universe)
-    st.session_state['universe_written_hash'] = cur_hash
-    st.session_state['universe_written_at'] = now_et
-    st.caption("Universe synced to Google Sheet just now (bulk write). Next sync ≥ 10 minutes or on changes.")
+# Manual force sync button
+force_sync = st.button("Sync Universe to Google Sheet now")
+if ((ok_to_write and base_universe) or force_sync) and not manual_syms.strip():
+    ok, msg = write_universe_sheet(base_universe)
+    if ok:
+        st.session_state['universe_written_hash'] = cur_hash
+        st.session_state['universe_written_at'] = now_et
+        st.caption(f"Universe synced to Google Sheet (bulk write). {msg}")
+    else:
+        st.caption("Universe sync attempted but failed (see warning above).")
 else:
-    st.caption("Universe not synced to Sheets (unchanged or synced within last 10 minutes).")
+    st.caption("Universe not synced (unchanged/recently synced or manual symbols mode). Use the button to force a sync.")
 
 # -------------- Regime Panel --------------
 # Use a small sample for breadth calc to reduce calls
@@ -560,19 +597,32 @@ else:
 if signals:
     st.subheader("Actionable Signals (PDT-aware)")
     rows = []
+    keys = []
     for s in signals:
         qty = position_size(acct_equity, risk_pct, s['entry'], s['stop'])
-        rows.append({
-            'Ticker': s['ticker'], 'Setup': s['setup'], 'Time (ET)': s['time'].strftime('%Y-%m-%d %H:%M'),
+        time_str = s['time'].strftime('%Y-%m-%d %H:%M')
+        row = {
+            'Ticker': s['ticker'], 'Setup': s['setup'], 'Time (ET)': time_str,
             'Price': formatn(s['price']), 'Entry': formatn(s['entry']), 'Stop': formatn(s['stop']),
             'Qty@Risk%': qty, 'Target1': formatn(s['target1'])
-        })
+        }
+        rows.append(row)
+        keys.append(f"{row['Ticker']}|{row['Setup']}|{row['Time (ET)']}")
     df_sig = pd.DataFrame(rows)
     st.dataframe(df_sig, use_container_width=True)
-    try:
-        append_to_gsheet(df_sig, SHEET_SIGNALS)
-    except Exception:
-        pass
+    # Auto-append unique rows to Sheets
+    if auto_write_signals:
+        new_rows = []
+        for r, k in zip(rows, keys):
+            if k not in st.session_state.signal_keys_written:
+                new_rows.append([r['Ticker'], r['Setup'], r['Time (ET)'], r['Price'], r['Entry'], r['Stop'], r['Qty@Risk%'], r['Target1']])
+        if new_rows:
+            try:
+                append_to_gsheet(new_rows, SHEET_SIGNALS)
+                st.session_state.signal_keys_written.update(keys)
+                st.caption(f"Signals appended to Google Sheet: {len(new_rows)} new rows")
+            except Exception as e:
+                st.warning(f"Signals write failed: {e}")
 else:
     st.info("No actionable signals (PDT slots used / outside RTH / no triggers).")
 
@@ -599,6 +649,79 @@ with colB:
 
 if st.session_state.ledger:
     st.dataframe(pd.DataFrame(st.session_state.ledger), use_container_width=True)
+
+# -------------- Preview: Last Session Signals --------------
+st.divider()
+st.subheader("Preview: Last Session Signals (no trading)")
+preview_n = st.slider("Scan top N tickers", 50, 200, 120)
+
+@st.cache_data(ttl=600)
+def last_session_date():
+    spy5 = fetch_intraday(["SPY"], interval="5m", period="7d", prepost=True).get("SPY", pd.DataFrame())
+    if spy5.empty:
+        return None
+    rth = spy5.between_time('09:30','16:00')
+    dates = sorted({ts.date() for ts in rth.index})
+    today = et_now().date()
+    prev = [d for d in dates if d < today]
+    return prev[-1] if prev else (dates[-1] if dates else None)
+
+@st.cache_data(ttl=600)
+def preview_last_session_signals(tickers, go_regime: bool, limit: int = 120):
+    tickers = list(tickers)[:limit]
+    data = fetch_intraday(tickers, interval="5m", period="7d", prepost=True)
+    day = last_session_date()
+    if day is None:
+        return pd.DataFrame()
+    out_rows = []
+    for t in tickers:
+        df = data.get(t, pd.DataFrame())
+        if df.empty:
+            continue
+        dfd = df[df.index.date == day]
+        if dfd.empty:
+            continue
+        dfd = dfd.copy()
+        dfd['ema9'] = dfd['close'].ewm(span=9, min_periods=9).mean()
+        dfd['rsi2'] = rsi(dfd['close'], 2)
+        dfd['vwap'] = vwap_session(dfd)
+        orh = dfd.between_time('09:30','10:00')['high'].max() if not dfd.empty else np.nan
+        got_orb = False; got_snap = False
+        for idx, row in dfd.iterrows():
+            if dtime(10,0) <= idx.time() <= dtime(12,0) and go_regime and not got_orb:
+                vol20 = dfd['volume'].rolling(20).mean().loc[idx]
+                rvol = row['volume']/max(1, vol20) if pd.notna(vol20) else 0
+                if (pd.notna(orh) and row['close']>orh and row['close']>row['vwap'] and rvol>=rvol_threshold):
+                    atr5 = atr(dfd, 14).loc[idx]
+                    stop = min(row['vwap'] - 0.25*atr5, dfd['low'].loc[:idx].tail(3).min())
+                    entry = row['close'] + 0.01
+                    rr = entry - stop if pd.notna(stop) else np.nan
+                    target1 = entry + 1.5*rr if pd.notna(rr) else np.nan
+                    out_rows.append({'Ticker': t, 'Setup': 'ORB_VWAP', 'Time (ET)': idx.strftime('%Y-%m-%d %H:%M'),
+                                     'Price': formatn(row['close']), 'Entry': formatn(entry), 'Stop': formatn(stop), 'Target1': formatn(target1)})
+                    got_orb = True
+            if dtime(10,0) <= idx.time() <= dtime(15,30) and (not go_regime) and not got_snap:
+                # RSI2 snapback
+                prev = dfd.shift(1).loc[idx]
+                dipped = (prev['close'] < prev['vwap']) if pd.notna(prev['vwap']) else False
+                reclaimed = (row['close'] > row['vwap']) or (row['close']>row['ema9'] and prev['close']<=prev['ema9'])
+                if (row['rsi2']<=5) and dipped and reclaimed:
+                    swing_low = dfd['low'].loc[:idx].tail(3).min()
+                    entry = row['close'] + 0.01
+                    stop = swing_low - 0.01
+                    atr5 = atr(dfd, 14).loc[idx]
+                    target1 = row['vwap'] + 0.5*atr5 if pd.notna(atr5) else np.nan
+                    out_rows.append({'Ticker': t, 'Setup': 'RSI2_VWAP', 'Time (ET)': idx.strftime('%Y-%m-%d %H:%M'),
+                                     'Price': formatn(row['close']), 'Entry': formatn(entry), 'Stop': formatn(stop), 'Target1': formatn(target1)})
+                    got_snap = True
+        # limit one signal per setup per ticker in preview
+    return pd.DataFrame(out_rows)
+
+prev_df = preview_last_session_signals(base_universe, reg['go'], preview_n)
+if not prev_df.empty:
+    st.dataframe(prev_df, use_container_width=True)
+else:
+    st.info("No preview signals for last session under current filters.")
 
 # -------------- Backtest (light) --------------
 st.divider()
