@@ -396,19 +396,19 @@ min_atr_pct = st.number_input("Min 14d ATR%", value=1.5)
 st.markdown("Manual tickers (optional, comma/space-separated):")
 manual_syms = st.text_area("Symbols override", value="", height=60)
 
-    st.divider()
-    st.subheader("Risk & PDT")
-    acct_equity = st.number_input("Account Equity ($)", value=10_000)
-    risk_pct = st.slider("Risk % per trade", 0.1, 1.0, 0.75, step=0.05)
-    max_new_trades_today = st.number_input("Max NEW trades today", value=3, min_value=1)
-    fees_per_trade = st.number_input("Fees per trade ($)", value=0.50, min_value=0.0, step=0.05)
-    slip_bps = st.number_input("Slippage (bps)", value=5, min_value=0)
+st.divider()
+st.subheader("Risk & PDT")
+acct_equity = st.number_input("Account Equity ($)", value=10_000)
+risk_pct = st.slider("Risk % per trade", 0.1, 1.0, 0.75, step=0.05)
+max_new_trades_today = st.number_input("Max NEW trades today", value=3, min_value=1)
+fees_per_trade = st.number_input("Fees per trade ($)", value=0.50, min_value=0.0, step=0.05)
+slip_bps = st.number_input("Slippage (bps)", value=5, min_value=0)
 
-    st.divider()
-    st.subheader("Strategy Windows")
-    rvol_threshold = st.number_input("Min 5m RVOL (signal bar)", value=1.5)
-    enable_orb = st.checkbox("Enable ORB-VWAP Continuation", value=True)
-    enable_snap = st.checkbox("Enable RSI(2) VWAP Snapback", value=True)
+st.divider()
+st.subheader("Strategy Windows")
+rvol_threshold = st.number_input("Min 5m RVOL (signal bar)", value=1.5)
+enable_orb = st.checkbox("Enable ORB-VWAP Continuation", value=True)
+enable_snap = st.checkbox("Enable RSI(2) VWAP Snapback", value=True)
 
 # Session state buffers (incremental updates)
 if "buffers" not in st.session_state:
@@ -420,8 +420,7 @@ if "today_trades" not in st.session_state:
 
 # -------------- Build Universe --------------
 if manual_syms.strip():
-    base_universe = [s.strip().upper() for s in manual_syms.replace('
-',' ').replace(',', ' ').split() if s.strip()]
+    base_universe = [s.strip().upper() for s in manual_syms.replace('\n',' ').replace(',', ' ').split() if s.strip()]
     source_symbols = base_universe
 else:
     source_symbols = download_symbol_files(exclude_funds=exclude_funds, exclude_derivs=exclude_derivs, allowed_exchanges=allowed_exchanges)
