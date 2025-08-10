@@ -1,5 +1,12 @@
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+# Safe import for autorefresh component (may fail on some hosts)
+try:
+    from streamlit_autorefresh import st_autorefresh as _st_autorefresh
+    _AUTOREFRESH_OK = True
+except Exception:
+    _AUTOREFRESH_OK = False
+    def _st_autorefresh(*args, **kwargs):
+        return None
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -304,7 +311,8 @@ def build_universe(min_price=5.0, max_price=100.0, min_avg_dollar_vol=20_000_000
 
 # -------------- Streamlit UI --------------
 st.set_page_config(page_title="US Screener + Auto-Trader", layout="wide")
-st_autorefresh(interval=5*60*1000, key="autorefresh")  # every 5 min
+if _AUTOREFRESH_OK:
+    _st_autorefresh(interval=5*60*1000, key="autorefresh")  # every 5 min
 
 st.title("US Intraday Screener + Auto-Trader (PDT-aware)")
 colt1, colt2 = st.columns(2)
@@ -314,6 +322,11 @@ with colt2:
     st.caption(f"Local (MYT): {my_now_str()}")
 
 with st.sidebar:
+    # Manual refresh fallback if autorefresh component is unavailable
+    if not _AUTOREFRESH_OK:
+        st.info("Auto-refresh component unavailable here. Use Manual refresh.")
+        if st.button("Manual refresh"):
+            st.experimental_rerun()
     st.header("Universe & Filters")
     min_price = st.number_input("Min Price ($)", value=5.0)
     max_price = st.number_input("Max Price ($)", value=100.0)
