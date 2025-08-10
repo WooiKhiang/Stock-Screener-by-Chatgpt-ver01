@@ -61,8 +61,7 @@ def get_gspread_client_from_secrets():
         raise RuntimeError("Missing gcp_service_account in st.secrets")
     creds_dict = {k: v for k, v in info.items()}
     if isinstance(creds_dict.get("private_key"), list):
-        creds_dict["private_key"] = "
-".join(creds_dict["private_key"])  # fix multiline key issue
+        creds_dict["private_key"] = "\n".join(creds_dict["private_key"])  # fix multiline key issue  # fix multiline key issue
     creds_json = json.dumps(creds_dict)
     scope = [
         "https://spreadsheets.google.com/feeds",
@@ -312,8 +311,7 @@ if "today_trades" not in st.session_state:
 
 # -------------- Build Universe --------------
 if manual_syms.strip():
-    base_universe = [s.strip().upper() for s in manual_syms.replace('
-',' ').replace(',', ' ').split() if s.strip()]
+    base_universe = [s.strip().upper() for s in manual_syms.replace('\n',' ').replace(',', ' ').split() if s.strip()]
 else:
     base_universe = build_universe(min_price, max_price, min_avg_dollar_vol, min_atr_pct, max_atr_pct)
 
