@@ -335,11 +335,8 @@ st.success(f"Universe size: {len(base_universe)} (auto-built)")
 # Export universe to GSheet (optional, non-fatal)
 try:
     # Write universe vertically: Timestamp, Ticker per row
-try:
     uni_rows = [[et_now_str(), t] for t in base_universe]
     append_to_gsheet(uni_rows, SHEET_UNIVERSE)
-except Exception:
-    pass
 except Exception:
     pass
 
