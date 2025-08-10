@@ -71,15 +71,36 @@ def get_gspread_client_from_secrets():
     return gspread.authorize(creds)
 
 def append_to_gsheet(rows, sheet_name):
+    """Append multiple rows in a single API call when possible to avoid 429s."""
     try:
         client = get_gspread_client_from_secrets()
         sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(sheet_name)
         if isinstance(rows, pd.DataFrame):
             rows = rows.values.tolist()
-        for row in rows:
-            sheet.append_row(row, value_input_option="USER_ENTERED")
+        # Prefer batch append if available
+        if hasattr(sheet, "append_rows"):
+            sheet.append_rows(rows, value_input_option="USER_ENTERED")
+        else:
+            # Fallback to per-row append (older gspread)
+            for row in rows:
+                sheet.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         st.warning(f"Google Sheet ({sheet_name}): {e}")
+
+def write_universe_sheet(tickers: list[str]):
+    """Replace the Universe sheet in ONE update: header + rows. Minimizes write calls.
+    We also gate calls at the caller to avoid frequent writes.
+    """
+    try:
+        client = get_gspread_client_from_secrets()
+        ss = client.open_by_key(GOOGLE_SHEET_ID)
+        ws = ss.worksheet(SHEET_UNIVERSE)
+        rows = [["Timestamp (ET)", "Ticker"]] + [[et_now_str(), t] for t in tickers]
+        # Clear then bulk write. Two requests, but done rarely and much cheaper than N appends.
+        ws.clear()
+        ws.update("A1", rows, value_input_option="USER_ENTERED")
+    except Exception as e:
+        st.warning(f"Google Sheet (Universe): {e}")
 
 # ---- Data fetch & caching ----
 @st.cache_data(ttl=300)
@@ -330,15 +351,25 @@ if manual_syms.strip():
 else:
     base_universe = build_universe(min_price, max_price, min_avg_dollar_vol, min_atr_pct, max_atr_pct)
 
-st.success(f"Universe size: {len(base_universe)} (auto-built)")
+# Show source symbol count to help diagnose tiny universes
+_src_count = len(download_symbol_files())
+st.success(f"Universe size: {len(base_universe)} (auto-built from {_src_count} source symbols)")
+if len(base_universe) < 50:
+    st.warning("Only a few tickers passed filters. Consider lowering 'Min Avg Dollar Volume' or widening ATR% bounds.")
 
-# Export universe to GSheet (optional, non-fatal)
-try:
-    # Write universe vertically: Timestamp, Ticker per row
-    uni_rows = [[et_now_str(), t] for t in base_universe]
-    append_to_gsheet(uni_rows, SHEET_UNIVERSE)
-except Exception:
-    pass
+# Export universe to GSheet (gated to avoid 429)
+cur_hash = hash(tuple(base_universe))
+now_et = et_now()
+last_hash = st.session_state.get('universe_written_hash')
+last_at = st.session_state.get('universe_written_at')
+ok_to_write = (last_hash != cur_hash) and (last_at is None or (now_et - last_at).total_seconds() > 600)
+if ok_to_write and base_universe:
+    write_universe_sheet(base_universe)
+    st.session_state['universe_written_hash'] = cur_hash
+    st.session_state['universe_written_at'] = now_et
+    st.caption("Universe synced to Google Sheet just now (bulk write). Next sync ≥ 10 minutes or on changes.")
+else:
+    st.caption("Universe not synced to Sheets (unchanged or synced within last 10 minutes).")
 
 # -------------- Regime Panel --------------
 # Use a small sample for breadth calc to reduce calls
