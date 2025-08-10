@@ -420,14 +420,15 @@ if "today_trades" not in st.session_state:
 
 # -------------- Build Universe --------------
 if manual_syms.strip():
-    base_universe = [s.strip().upper() for s in manual_syms.replace('\n',' ').replace(',', ' ').split() if s.strip()]
+    base_universe = [s.strip().upper() for s in manual_syms.replace('
+',' ').replace(',', ' ').split() if s.strip()]
     source_symbols = base_universe
 else:
     source_symbols = download_symbol_files(exclude_funds=exclude_funds, exclude_derivs=exclude_derivs, allowed_exchanges=allowed_exchanges)
     base_universe = build_universe(min_price, max_price, min_avg_dollar_vol, min_atr_pct, max_atr_pct, raw_syms=source_symbols)
 
 _src_count = len(source_symbols)
-st.success(f"Universe size: {len(base_universe)} (auto-built from {_src_count} filtered source symbols)")} (auto-built from {_src_count} source symbols)")
+st.success(f"Universe size: {len(base_universe)} (auto-built from {_src_count} filtered source symbols)")
 if len(base_universe) < 50:
     st.warning("Only a few tickers passed filters. Consider lowering 'Min Avg Dollar Volume' or widening ATR% bounds.")
 
