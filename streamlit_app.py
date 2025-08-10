@@ -17,6 +17,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json
 import math
 import io
+import re
 
 """
 US Intraday Screener + Auto-Trader (PDT-aware)
@@ -258,40 +259,89 @@ NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 
 @st.cache_data(ttl=60*60*6)
-def download_symbol_files():
-    """Download symbol tables; return list of tickers. Fallback if blocked."""
-    syms = []
+def download_symbol_files(exclude_funds: bool = True, exclude_derivs: bool = True, allowed_exchanges: set | None = None):
+    """Download and filter symbol tables; return list of tickers.
+    - exclude_funds: drop ETFs/ETNs/NextShares/Test Issues
+    - exclude_derivs: drop Warrants/Units/Rights/Preferred/Notes/Trusts/SPAC
+    - allowed_exchanges: set of codes like {"Q","N","P","A","Z","B"}
+    """
+    def clean_nasdaq(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        # Remove footer row
+        df = df[df['Symbol'].notna() & (df['Symbol'] != 'Symbol')]
+        df = df[~df['Symbol'].astype(str).str.contains(r"[\^\$~]", na=False)]
+        out = pd.DataFrame({
+            'symbol': df['Symbol'].astype(str).str.upper().str.strip(),
+            'security_name': df.get('Security Name', pd.Series([None]*len(df))),
+            'exchange': 'Q',
+            'etf': df.get('ETF', 'N'),
+            'nextshares': df.get('NextShares', 'N'),
+            'test_issue': df.get('Test Issue', 'N')
+        })
+        return out
+
+    def clean_other(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df = df[df['ACT Symbol'].notna()]
+        df = df[~df['ACT Symbol'].astype(str).str.contains(r"[\^\$~]", na=False)]
+        out = pd.DataFrame({
+            'symbol': df['ACT Symbol'].astype(str).str.upper().str.strip(),
+            'security_name': df.get('Security Name', pd.Series([None]*len(df))),
+            'exchange': df.get('Exchange', pd.Series(['']*len(df))).astype(str).str.upper(),
+            'etf': df.get('ETF', 'N'),
+            'nextshares': pd.Series(['N']*len(df)),  # not present in otherlisted
+            'test_issue': df.get('Test Issue', 'N')
+        })
+        return out
+
+    frames = []
     try:
         nasdaq = pd.read_csv(NASDAQ_URL, sep='|')
-        nasdaq = nasdaq[~nasdaq['Symbol'].str.contains("\^|\$|\.|~", na=False)]
-        syms.extend(nasdaq['Symbol'].dropna().tolist())
+        frames.append(clean_nasdaq(nasdaq))
     except Exception:
         pass
     try:
         other = pd.read_csv(OTHER_URL, sep='|')
-        other = other[~other['ACT Symbol'].str.contains("\^|\$|\.|~", na=False)]
-        syms.extend(other['ACT Symbol'].dropna().tolist())
+        frames.append(clean_other(other))
     except Exception:
         pass
-    # Fallback minimal set if both failed
-    if not syms:
-        syms = [
-            "AAPL","MSFT","AMZN","NVDA","META","GOOGL","TSLA","AMD","NFLX","QCOM","COIN","SQ","TTD","F","GM",
-            "ON","MPWR","KLAC","LRCX","MU","CRM","ORCL","INTC","CAT","MCD","CMG","ROKU","UBER","LYFT"
-        ]
-    # Deduplicate & clean
-    syms = sorted(list({s.strip().upper(): None for s in syms}.keys()))
+
+    if not frames:
+        # Fallback minimal
+        fallback = pd.DataFrame({'symbol':["AAPL","MSFT","AMZN","NVDA","META","GOOGL","TSLA","AMD","NFLX","QCOM","COIN","SQ","TTD","F","GM"],
+                                 'security_name':None,'exchange':'Q','etf':'N','nextshares':'N','test_issue':'N'})
+        frames = [fallback]
+
+    df = pd.concat(frames, ignore_index=True)
+    df.drop_duplicates(subset=['symbol'], inplace=True)
+
+    # Exchange filter
+    if allowed_exchanges:
+        df = df[df['exchange'].isin(list(allowed_exchanges))]
+
+    # Funds / tests filter
+    if exclude_funds:
+        df = df[(df['etf'].astype(str) != 'Y') & (df['test_issue'].astype(str) != 'Y')]
+        if 'nextshares' in df.columns:
+            df = df[df['nextshares'].astype(str) != 'Y']
+
+    # Derivatives/SPAC keywords
+    if exclude_derivs and 'security_name' in df.columns:
+        pat = re.compile(r"(WARRANT|RIGHTS?|UNITS?|PREF|PREFERRED|NOTE|BOND|TRUST|FUND|ETF|ETN|DEPOSITARY|SPAC)", re.IGNORECASE)
+        df = df[~df['security_name'].astype(str).str.contains(pat, na=False)]
+
+    # Return sorted symbol list
+    syms = sorted(df['symbol'].dropna().unique().tolist())
     return syms
 
 @st.cache_data(ttl=60*60)
-def build_universe(min_price=5.0, max_price=100.0, min_avg_dollar_vol=20_000_000, min_atr_pct=2.0, max_atr_pct=12.0, max_symbols=800):
-    """Return filtered tickers meeting liquidity/vol/price constraints."""
-    raw_syms = download_symbol_files()
-    # Limit the number of symbols for performance
-    raw_syms = raw_syms[:5000]
-    # Fetch daily snapshots in chunks
+def build_universe(min_price=5.0, max_price=100.0, min_avg_dollar_vol=30_000_000, min_atr_pct=1.5, max_atr_pct=12.0, max_symbols=800, raw_syms=None):
+    """Return filtered tickers meeting liquidity/vol/price constraints, ranked by 20d dollar volume."""
+    raw_syms = raw_syms or download_symbol_files()
+    # Limit for performance during daily build
+    raw_syms = raw_syms[:6000]
     daily = fetch_daily(raw_syms, period="3mo")
-    selected = []
+    scored = []
     for t, d in daily.items():
         if d.empty or len(d) < 25:
             continue
@@ -300,13 +350,13 @@ def build_universe(min_price=5.0, max_price=100.0, min_avg_dollar_vol=20_000_000
         d['atrp14'] = (atr(d, 14) / d['close']) * 100
         atrp = d['atrp14'].iloc[-1]
         atr_ok = (min_atr_pct <= atrp <= max_atr_pct)
-        # 20d avg dollar volume
         adv = (d['close'] * d['volume']).rolling(20).mean().iloc[-1]
         liquid = adv is not None and not np.isnan(adv) and (adv >= min_avg_dollar_vol)
         if price_ok and atr_ok and liquid:
-            selected.append(t)
-        if len(selected) >= max_symbols:
-            break
+            scored.append((t, float(adv)))
+    # Rank by dollar volume desc and cap
+    scored.sort(key=lambda x: x[1], reverse=True)
+    selected = [t for t, _ in scored[:max_symbols]]
     return selected
 
 # -------------- Streamlit UI --------------
@@ -328,13 +378,23 @@ with st.sidebar:
         if st.button("Manual refresh"):
             st.experimental_rerun()
     st.header("Universe & Filters")
-    min_price = st.number_input("Min Price ($)", value=5.0)
-    max_price = st.number_input("Max Price ($)", value=100.0)
-    min_avg_dollar_vol = st.number_input("Min Avg Dollar Volume (20d)", value=20_000_000)
-    max_atr_pct = st.number_input("Max 14d ATR%", value=12.0)
-    min_atr_pct = st.number_input("Min 14d ATR%", value=2.0)
-    st.markdown("Manual tickers (optional, comma/space-separated):")
-    manual_syms = st.text_area("Symbols override", value="", height=60)
+min_price = st.number_input("Min Price ($)", value=5.0)
+max_price = st.number_input("Max Price ($)", value=100.0)
+# Exchange & instrument filters
+exclude_funds = st.checkbox("Exclude ETFs/ETNs/NextShares/Test Issues", value=True)
+exclude_derivs = st.checkbox("Exclude Warrants/Units/Rights/Preferred/Notes/Trusts", value=True)
+ex_opts = ["NASDAQ (Q)","NYSE (N)","NYSE Arca (P)","NYSE American (A)","Cboe BZX (Z)","Nasdaq BX (B)"]
+ex_default = ["NASDAQ (Q)","NYSE (N)"]
+ex_sel = st.multiselect("Allowed Exchanges", ex_opts, default=ex_default)
+ex_map = {"NASDAQ (Q)":"Q","NYSE (N)":"N","NYSE Arca (P)":"P","NYSE American (A)":"A","Cboe BZX (Z)":"Z","Nasdaq BX (B)":"B"}
+allowed_exchanges = {ex_map[x] for x in ex_sel}
+# Liquidity & vol filters
+min_avg_dollar_vol = st.number_input("Min Avg Dollar Volume (20d)", value=30_000_000)
+max_atr_pct = st.number_input("Max 14d ATR%", value=12.0)
+min_atr_pct = st.number_input("Min 14d ATR%", value=1.5)
+# Optional manual override
+st.markdown("Manual tickers (optional, comma/space-separated):")
+manual_syms = st.text_area("Symbols override", value="", height=60)
 
     st.divider()
     st.subheader("Risk & PDT")
@@ -361,12 +421,13 @@ if "today_trades" not in st.session_state:
 # -------------- Build Universe --------------
 if manual_syms.strip():
     base_universe = [s.strip().upper() for s in manual_syms.replace('\n',' ').replace(',', ' ').split() if s.strip()]
+    source_symbols = base_universe
 else:
-    base_universe = build_universe(min_price, max_price, min_avg_dollar_vol, min_atr_pct, max_atr_pct)
+    source_symbols = download_symbol_files(exclude_funds=exclude_funds, exclude_derivs=exclude_derivs, allowed_exchanges=allowed_exchanges)
+    base_universe = build_universe(min_price, max_price, min_avg_dollar_vol, min_atr_pct, max_atr_pct, raw_syms=source_symbols)
 
-# Show source symbol count to help diagnose tiny universes
-_src_count = len(download_symbol_files())
-st.success(f"Universe size: {len(base_universe)} (auto-built from {_src_count} source symbols)")
+_src_count = len(source_symbols)
+st.success(f"Universe size: {len(base_universe)} (auto-built from {_src_count} filtered source symbols)")} (auto-built from {_src_count} source symbols)")
 if len(base_universe) < 50:
     st.warning("Only a few tickers passed filters. Consider lowering 'Min Avg Dollar Volume' or widening ATR% bounds.")
 
