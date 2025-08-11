@@ -396,7 +396,7 @@ except Exception:
 colA, colB, colC = st.columns(3)
 colA.metric("Now (ET)", et_now_str())
 colB.metric("Last SPY 5m bar", last_spy_bar)
-colC.metric("Last session date", str(last_sess))))
+colC.metric("Last session date", str(last_sess))
 
 with st.sidebar:
     # Manual refresh fallback if autorefresh component is unavailable
