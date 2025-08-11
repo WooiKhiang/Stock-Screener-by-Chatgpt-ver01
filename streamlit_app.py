@@ -383,14 +383,20 @@ with colt2:
 
 # Health: data freshness and session context
 try:
-    spy5 = fetch_intraday(["SPY"], interval="5m", period="2d", prepost=True).get("SPY", pd.DataFrame())
+    spy5 = fetch_intraday(["SPY"], interval="5m", period="7d", prepost=True).get("SPY", pd.DataFrame())
     last_spy_bar = spy5.index[-1].strftime('%Y-%m-%d %H:%M') if not spy5.empty else 'n/a'
+    rth = spy5.between_time('09:30','16:00') if not spy5.empty else pd.DataFrame()
+    _dates = sorted({ts.date() for ts in rth.index}) if not rth.empty else []
+    _today = et_now().date()
+    _prev = [d for d in _dates if d < _today]
+    last_sess = _prev[-1] if _prev else (_dates[-1] if _dates else None)
 except Exception:
     last_spy_bar = 'n/a'
+    last_sess = None
 colA, colB, colC = st.columns(3)
 colA.metric("Now (ET)", et_now_str())
 colB.metric("Last SPY 5m bar", last_spy_bar)
-colC.metric("Last session date", str(last_session_date()))
+colC.metric("Last session date", str(last_sess))))
 
 with st.sidebar:
     # Manual refresh fallback if autorefresh component is unavailable
@@ -432,7 +438,7 @@ with st.sidebar:
     st.divider()
     st.subheader("Strategy Windows")
     rvol_threshold = st.number_input("Min 5m RVOL (signal bar)", value=1.5)
-rsi2_threshold = st.number_input("RSI(2) max for snapback", value=5, min_value=1, max_value=30)
+    rsi2_threshold = st.number_input("RSI(2) max for snapback", value=5, min_value=1, max_value=30)
     enable_orb = st.checkbox("Enable ORB-VWAP Continuation", value=True)
     enable_snap = st.checkbox("Enable RSI(2) VWAP Snapback", value=True)
 
@@ -827,8 +833,7 @@ with st.expander("Reference: MACD Cross Zero (1H)", expanded=False):
     # Use the same auto-universe but cap to keep it light
     cap_list = base_universe[:150] if base_universe else ["AAPL","MSFT","NVDA","AMD","SPY"]
     ref_rows, filt_rows = [], []
-    # bulk fetch hourly in chunks
-    CHUNK=120
+    CHUNK = 80
     for i in range(0, len(cap_list), CHUNK):
         chunk = cap_list[i:i+CHUNK]
         try:
@@ -838,38 +843,66 @@ with st.expander("Reference: MACD Cross Zero (1H)", expanded=False):
         if len(chunk) == 1:
             hdict = {chunk[0]: hraw}
         else:
-            hdict = {t: hraw.get(t, pd.DataFrame()) for t in chunk}
+            hdict = {}
+            for t in chunk:
+                try:
+                    hdict[t] = hraw[t]
+                except Exception:
+                    continue
         for t, h in hdict.items():
             if h is None or h.empty or len(h) < 40:
                 continue
+            # Normalize timezone & columns
             try:
-                h.index = h.index.tz_localize('UTC').tz_convert(ET_TZ)
+                if h.index.tz is None:
+                    h.index = h.index.tz_localize('UTC').tz_convert(ET_TZ)
+                else:
+                    h.index = h.index.tz_convert(ET_TZ)
             except Exception:
-                h.index = pd.to_datetime(h.index).tz_convert(ET_TZ)
+                h.index = pd.to_datetime(h.index).tz_localize('UTC').tz_convert(ET_TZ)
             h = h.rename(columns={c: c.split(" ")[0] for c in h.columns})
-            h = h[['Open','High','Low','Close','Volume']].rename(columns=str.lower)
+            try:
+                h = h[['Open','High','Low','Close','Volume']].rename(columns=str.lower)
+            except Exception:
+                cols = [c for c in ['Open','High','Low','Close','Volume'] if c in h.columns]
+                if len(cols) < 5:
+                    continue
+                h = h[cols].rename(columns=str.lower)
+            # Indicators
             ema10 = h['close'].ewm(span=10, min_periods=10).mean()
             ema20 = h['close'].ewm(span=20, min_periods=20).mean()
             delta = h['close'].diff(); up = delta.clip(lower=0); down = -delta.clip(upper=0)
             rsi14 = 100 - (100 / (1 + (up.rolling(14).mean() / (down.rolling(14).mean()+1e-9))))
-            ema12 = h['close'].ewm(span=12, min_periods=12).mean(); ema26 = h['close'].ewm(span=26, min_periods=26).mean()
-            macd = ema12 - ema26; macds = macd.ewm(span=9, min_periods=9).mean(); hist = macd - macds
-            last = h.iloc[-1]
-            if (macd.iloc[-1] > 0) and (macds.iloc[-1] < 0):
-                ref_rows.append({"Ticker": t, "RSI": formatn(rsi14.iloc[-1],2), "MACD": formatn(macd.iloc[-1],4),
-                                  "Signal": formatn(macds.iloc[-1],4), "Hist": formatn(hist.iloc[-1],4), "Price": formatn(last['close'])})
-            if ((macd.iloc[-1] > 0) and (macds.iloc[-1] < 0) and (rsi14.iloc[-1] <= 60) and (ema10.iloc[-1] > ema20.iloc[-1]) and (hist.iloc[-1] > 0)):
-                filt_rows.append({"Ticker": t, "RSI": formatn(rsi14.iloc[-1],2), "MACD": formatn(macd.iloc[-1],4),
-                                  "Signal": formatn(macds.iloc[-1],4), "Hist": formatn(hist.iloc[-1],4), "Price": formatn(last['close'])})
-    st.write("Filtered:")
+            ema12 = h['close'].ewm(span=12, min_periods=12).mean()
+            ema26 = h['close'].ewm(span=26, min_periods=26).mean()
+            macd = ema12 - ema26
+            macds = macd.ewm(span=9, min_periods=9).mean()
+            hist = macd - macds
+            last = pd.DataFrame({'close': h['close'], 'ema10': ema10, 'ema20': ema20,
+                                 'rsi14': rsi14, 'macd': macd, 'macds': macds, 'hist': hist}).iloc[-1]
+            # Reference row: any MACD>0 & Signal<0
+            if (last['macd'] > 0) and (last['macds'] < 0):
+                ref_rows.append({'Ticker': t,'US Time': et_now_str(),'Price': formatn(last['close']),
+                                 'RSI14': formatn(last['rsi14'],2),'MACD': formatn(last['macd'],4),
+                                 'Signal': formatn(last['macds'],4),'Hist': formatn(last['hist'],4),
+                                 'EMA10': formatn(last['ema10'],2),'EMA20': formatn(last['ema20'],2)})
+            # Filtered row: tighter criteria
+            if ((last['macd'] > 0) and (last['macds'] < 0) and (last['rsi14'] <= 60)
+                and (last['ema10'] > last['ema20']) and (last['hist'] > 0)):
+                filt_rows.append({'Ticker': t,'US Time': et_now_str(),'Price': formatn(last['close']),
+                                  'RSI14': formatn(last['rsi14'],2),'MACD': formatn(last['macd'],4),
+                                  'Signal': formatn(last['macds'],4),'Hist': formatn(last['hist'],4),
+                                  'EMA10': formatn(last['ema10'],2),'EMA20': formatn(last['ema20'],2)})
+    # Show tables
     if filt_rows:
+        st.markdown("**⭐ MACD Cross Signals (Filtered)**")
         st.dataframe(pd.DataFrame(filt_rows), use_container_width=True)
     else:
-        st.info("No filtered 1H MACD cross signals.")
-    st.write("Reference (any cross):")
+        st.info("No filtered MACD cross signals for current hourly bar.")
+    st.markdown("**🕵️ Reference: MACD>0 & Signal<0 (no filters)**")
     if ref_rows:
         st.dataframe(pd.DataFrame(ref_rows), use_container_width=True)
     else:
-        st.info("No reference 1H crosses.")
+        st.info("No reference MACD cross events found.")
 
-st.caption("Auto-built universe in the $5–$100 range with liquidity/vol filters. Signals use US/Eastern time; MYT shown for convenience. Backtest includes fees/slippage & PDT cap.")
+st.caption("End of report · Auto-refresh every 5 min when supported · Universe rebuilds daily (ET)")
