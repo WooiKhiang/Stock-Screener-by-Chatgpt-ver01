@@ -381,6 +381,17 @@ with colt1:
 with colt2:
     st.caption(f"Local (MYT): {my_now_str()}")
 
+# Health: data freshness and session context
+try:
+    spy5 = fetch_intraday(["SPY"], interval="5m", period="2d", prepost=True).get("SPY", pd.DataFrame())
+    last_spy_bar = spy5.index[-1].strftime('%Y-%m-%d %H:%M') if not spy5.empty else 'n/a'
+except Exception:
+    last_spy_bar = 'n/a'
+colA, colB, colC = st.columns(3)
+colA.metric("Now (ET)", et_now_str())
+colB.metric("Last SPY 5m bar", last_spy_bar)
+colC.metric("Last session date", str(last_session_date()))
+
 with st.sidebar:
     # Manual refresh fallback if autorefresh component is unavailable
     if not _AUTOREFRESH_OK:
@@ -421,6 +432,7 @@ with st.sidebar:
     st.divider()
     st.subheader("Strategy Windows")
     rvol_threshold = st.number_input("Min 5m RVOL (signal bar)", value=1.5)
+rsi2_threshold = st.number_input("RSI(2) max for snapback", value=5, min_value=1, max_value=30)
     enable_orb = st.checkbox("Enable ORB-VWAP Continuation", value=True)
     enable_snap = st.checkbox("Enable RSI(2) VWAP Snapback", value=True)
 
@@ -540,7 +552,7 @@ def strategy_signals_for_df(ticker: str, df5: pd.DataFrame, go_regime: bool):
         rsi2v = last['rsi2']
         dipped = (df5['close'].iloc[-2] < df5['vwap'].iloc[-2]) or (df5['low'].iloc[-1] < last['vwap'])
         reclaimed = (last['close'] > last['vwap']) or (last['close'] > last['ema9'] and df5['close'].iloc[-2] <= df5['ema9'].iloc[-2])
-        if rsi2v <= 5 and dipped and reclaimed:
+        if rsi2v <= rsi2_threshold and dipped and reclaimed:
             swing_low = min(df5['low'].iloc[-3:-1])
             entry = last['close'] + 0.01
             stop = swing_low - 0.01
@@ -688,7 +700,7 @@ def preview_last_session_signals(tickers, go_regime: bool, limit: int = 120):
         orh = dfd.between_time('09:30','10:00')['high'].max() if not dfd.empty else np.nan
         got_orb = False; got_snap = False
         for idx, row in dfd.iterrows():
-            if dtime(10,0) <= idx.time() <= dtime(12,0) and go_regime and not got_orb:
+            if dtime(10,0) <= idx.time() <= dtime(12,0) and enable_orb and not got_orb:
                 vol20 = dfd['volume'].rolling(20).mean().loc[idx]
                 rvol = row['volume']/max(1, vol20) if pd.notna(vol20) else 0
                 if (pd.notna(orh) and row['close']>orh and row['close']>row['vwap'] and rvol>=rvol_threshold):
@@ -700,12 +712,12 @@ def preview_last_session_signals(tickers, go_regime: bool, limit: int = 120):
                     out_rows.append({'Ticker': t, 'Setup': 'ORB_VWAP', 'Time (ET)': idx.strftime('%Y-%m-%d %H:%M'),
                                      'Price': formatn(row['close']), 'Entry': formatn(entry), 'Stop': formatn(stop), 'Target1': formatn(target1)})
                     got_orb = True
-            if dtime(10,0) <= idx.time() <= dtime(15,30) and (not go_regime) and not got_snap:
+            if dtime(10,0) <= idx.time() <= dtime(15,30) and enable_snap and not got_snap:
                 # RSI2 snapback
                 prev = dfd.shift(1).loc[idx]
                 dipped = (prev['close'] < prev['vwap']) if pd.notna(prev['vwap']) else False
                 reclaimed = (row['close'] > row['vwap']) or (row['close']>row['ema9'] and prev['close']<=prev['ema9'])
-                if (row['rsi2']<=5) and dipped and reclaimed:
+                if (row['rsi2'] <= rsi2_threshold) and dipped and reclaimed:
                     swing_low = dfd['low'].loc[:idx].tail(3).min()
                     entry = row['close'] + 0.01
                     stop = swing_low - 0.01
@@ -718,6 +730,7 @@ def preview_last_session_signals(tickers, go_regime: bool, limit: int = 120):
     return pd.DataFrame(out_rows)
 
 prev_df = preview_last_session_signals(base_universe, reg['go'], preview_n)
+st.caption(f"Previewing last session: {last_session_date()} (ET). Scanned {min(len(base_universe), preview_n)} tickers.")
 if not prev_df.empty:
     st.dataframe(prev_df, use_container_width=True)
 else:
@@ -778,7 +791,7 @@ def backtest_last_sessions(tickers, sessions=5, go_regime_hint=True, fees=0.5, s
                     prev = dfd.shift(1).loc[idx]
                     dipped = (prev['close'] < prev['vwap']) if pd.notna(prev['vwap']) else False
                     reclaimed = (row['close'] > row['vwap']) or (row['close']>row['ema9'] and prev['close']<=prev['ema9'])
-                    if (row['rsi2']<=5) and dipped and reclaimed:
+                    if (row['rsi2'] <= rsi2_threshold) and dipped and reclaimed:
                         entry = row['close']*(1+slippage_bps/10000)
                         swing_low = dfd['low'].loc[:idx].tail(3).min()
                         stop = swing_low - 0.01
