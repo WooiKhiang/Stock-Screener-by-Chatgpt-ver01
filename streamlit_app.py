@@ -1,5 +1,5 @@
 import streamlit as st
-# Safe import for autorefresh component (may fail on some hosts)
+# Optional autorefresh (safe fallback if not available)
 try:
     from streamlit_autorefresh import st_autorefresh as _st_autorefresh
     _AUTOREFRESH_OK = True
@@ -7,111 +7,104 @@ except Exception:
     _AUTOREFRESH_OK = False
     def _st_autorefresh(*args, **kwargs):
         return None
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import pytz
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime
+import math, re, json, time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import json
-import math
-import io
-import re
 
-"""
-US Intraday Screener + Auto-Trader (PDT-aware)
--------------------------------------------------
-Implements your requested changes:
-1) **Auto-build universe ($5–$100) without hardcoding** using NASDAQ Trader symbol files (fallbacks included) + multi-ticker chunking.
-2) **Keeps MACD + RSI look-back** fast via caching and incremental buffers (no full re-download each refresh).
-3) **Displays US/Eastern time** consistently; optional MYT clock for reference.
-4) **Adds light backtest pane** (last N sessions) with fees/slippage + PDT cap to estimate true expectancy.
-5) Regime-gated two setups (ORB–VWAP Continuation, RSI(2) VWAP Snapback) retained, plus your 1H MACD cross as reference.
-
-Notes:
-- If external symbol files are blocked, app falls back to your prior S&P-like list and/or a manual paste box.
-- For live trading, wire your broker in `route_order()`.
-"""
-
-# -------------- Config --------------
+# =========================
+# Config & Constants
+# =========================
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
-SHEET_SIGNALS = "Signals"
-SHEET_UNIVERSE = "Universe"
+SHEET_UNIVERSE  = "Universe"
+SHEET_SIGNALS   = "Signals"
 
 ET_TZ = pytz.timezone("US/Eastern")
 MY_TZ = pytz.timezone("Asia/Kuala_Lumpur")
 
-# -------------- Utilities --------------
+st.set_page_config(page_title="Retail 1H Screener (MACD + Wife)", layout="wide")
+_st_autorefresh(interval=5*60*1000, key="autorefresh")  # every 5 min
+
+# =========================
+# Utility helpers
+# =========================
 def et_now():
     return datetime.now(ET_TZ)
 
 def et_now_str():
-    return et_now().strftime('%Y-%m-%d %H:%M:%S')
+    return et_now().strftime("%Y-%m-%d %H:%M")
 
 def my_now_str():
-    return datetime.now(MY_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    return datetime.now(MY_TZ).strftime("%Y-%m-%d %H:%M")
 
-def formatn(x, d=2):
+def formatn(num, d=2):
     try:
-        if x is None or (isinstance(x, float) and math.isnan(x)):
+        if num is None or (isinstance(num, float) and math.isnan(num)):
             return "-"
-        if isinstance(x, (int, np.integer)) or d == 0:
-            return f"{int(x):,}"
-        return f"{float(x):,.{d}f}"
+        return f"{float(num):,.{d}f}"
     except Exception:
-        return str(x)
+        return str(num)
 
-# ---- Google Sheets helpers ----
+def to_yahoo_symbol(sym: str) -> str:
+    """Convert NASDAQ dot class symbols to Yahoo dash class (e.g., BRK.B->BRK-B)."""
+    if not sym:
+        return sym
+    s = sym.strip().upper()
+    # Common fix: dot class to dash class
+    s = s.replace(".", "-")
+    return s
+
+# =========================
+# Google Sheets helpers
+# =========================
 def get_gspread_client_from_secrets():
-    info = st.secrets.get("gcp_service_account", {})
-    if not info:
-        raise RuntimeError("Missing gcp_service_account in st.secrets")
-    creds_dict = {k: v for k, v in info.items()}
+    info = st.secrets["gcp_service_account"]
+    creds_dict = dict(info)
+    # If private_key arrived as list of lines, join it
     if isinstance(creds_dict.get("private_key"), list):
-        creds_dict["private_key"] = "\n".join(creds_dict["private_key"])  # fix multiline key issue  # fix multiline key issue
-    creds_json = json.dumps(creds_dict)
+        creds_dict["private_key"] = "\n".join(creds_dict["private_key"])
     scope = [
         "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive"
     ]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     return gspread.authorize(creds)
 
-def append_to_gsheet(rows, sheet_name):
-    """Append multiple rows in a single API call when possible to avoid 429s."""
+@st.cache_data(ttl=600)
+def _get_sheet(ss_id, sheet_name):
+    client = get_gspread_client_from_secrets()
+    ss = client.open_by_key(ss_id)
     try:
-        client = get_gspread_client_from_secrets()
-        ss = client.open_by_key(GOOGLE_SHEET_ID)
-        try:
-            sheet = ss.worksheet(sheet_name)
-        except Exception:
-            # create if missing (Signals sheet etc.)
-            cols = "8" if sheet_name == SHEET_SIGNALS else "2"
-            sheet = ss.add_worksheet(title=sheet_name, rows="20000", cols=cols)
+        ws = ss.worksheet(sheet_name)
+    except Exception:
+        ws = ss.add_worksheet(title=sheet_name, rows="50000", cols="24")
+    return ws
+
+def append_to_gsheet(rows, sheet_name):
+    """Append rows (list[list]) to a sheet. Auto-create if missing."""
+    try:
+        ws = _get_sheet(GOOGLE_SHEET_ID, sheet_name)
         if isinstance(rows, pd.DataFrame):
             rows = rows.values.tolist()
         if not rows:
             return
-        # Prefer batch append if available
-        if hasattr(sheet, "append_rows"):
-            sheet.append_rows(rows, value_input_option="USER_ENTERED")
+        if hasattr(ws, "append_rows"):
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
         else:
-            for row in rows:
-                sheet.append_row(row, value_input_option="USER_ENTERED")
+            for r in rows:
+                ws.append_row(r, value_input_option="USER_ENTERED")
     except Exception as e:
         st.warning(f"Google Sheet ({sheet_name}): {e}")
 
-def write_universe_sheet(tickers: list[str]):
-    """Replace the Universe sheet in ONE update: header + rows. Creates sheet if missing."""
+def write_universe_sheet(tickers):
+    """Bulk replace Universe sheet: header + rows; write Yahoo-normalized symbols."""
     try:
-        client = get_gspread_client_from_secrets()
-        ss = client.open_by_key(GOOGLE_SHEET_ID)
-        try:
-            ws = ss.worksheet(SHEET_UNIVERSE)
-        except Exception:
-            # Create if missing
-            ws = ss.add_worksheet(title=SHEET_UNIVERSE, rows="20000", cols="2")
+        ws = _get_sheet(GOOGLE_SHEET_ID, SHEET_UNIVERSE)
         rows = [["Timestamp (ET)", "Ticker"]] + [[et_now_str(), t] for t in tickers]
         ws.clear()
         ws.update("A1", rows, value_input_option="USER_ENTERED")
@@ -120,789 +113,651 @@ def write_universe_sheet(tickers: list[str]):
         st.warning(f"Google Sheet (Universe): {e}")
         return False, str(e)
 
-# ---- Data fetch & caching ----
-@st.cache_data(ttl=300)
-def fetch_intraday(tickers, interval="5m", period="5d", prepost=True):
-    """Multi-ticker intraday fetch with caching. Returns dict[ticker]->DataFrame.
-    Ensures lowercase OHLCV columns and ET timezone for both single and multi ticker paths."""
-    if isinstance(tickers, str):
-        tickers = [tickers]
-    data = {}
-    CHUNK = 150
-    for i in range(0, len(tickers), CHUNK):
-        chunk = tickers[i:i+CHUNK]
-        try:
-            raw = yf.download(" ".join(chunk), interval=interval, period=period, prepost=prepost,
-                              group_by='ticker', auto_adjust=False, progress=False, threads=False)
-            # Normalize to dict[ticker]->DataFrame with lowercase cols + ET tz
-            if len(chunk) == 1:
-                sub = raw.copy()
-                sub = sub.rename(columns={c: c.split(" ")[0] for c in sub.columns})
-                if sub.index.tz is None:
-                    sub.index = sub.index.tz_localize('UTC').tz_convert(ET_TZ)
-                else:
-                    sub.index = sub.index.tz_convert(ET_TZ)
-                sub = sub[['Open','High','Low','Close','Volume']].rename(columns=str.lower).dropna()
-                data[chunk[0]] = sub
-            else:
-                dd = {}
-                for t in chunk:
-                    try:
-                        sub = raw[t]
-                    except Exception:
-                        # Some tickers may be missing
-                        continue
-                    sub = sub.rename(columns={c: c.split(" ")[0] for c in sub.columns})
-                    if sub.index.tz is None:
-                        sub.index = sub.index.tz_localize('UTC').tz_convert(ET_TZ)
-                    else:
-                        sub.index = sub.index.tz_convert(ET_TZ)
-                    dd[t] = sub[['Open','High','Low','Close','Volume']].rename(columns=str.lower).dropna()
-                for t, d in dd.items():
-                    data[t] = d
-        except Exception:
-            continue
-    return data
-
-@st.cache_data(ttl=900)
-def fetch_daily(tickers, period="6mo"):
-    """Multi-ticker daily fetch returning dict[ticker]->DataFrame with lowercase OHLCV (ET tz)."""
-    if isinstance(tickers, str):
-        tickers = [tickers]
-    data = {}
-    CHUNK = 200
-    for i in range(0, len(tickers), CHUNK):
-        chunk = tickers[i:i+CHUNK]
-        try:
-            raw = yf.download(" ".join(chunk), interval="1d", period=period, group_by='ticker', auto_adjust=False, progress=False, threads=False)
-            if len(chunk) == 1:
-                sub = raw.copy()
-                sub = sub.rename(columns={c: c.split(" ")[0] for c in sub.columns})
-                if sub.index.tz is None:
-                    sub.index = sub.index.tz_localize('UTC').tz_convert(ET_TZ)
-                else:
-                    sub.index = sub.index.tz_convert(ET_TZ)
-                sub = sub[['Open','High','Low','Close','Volume']].rename(columns=str.lower).dropna()
-                data[chunk[0]] = sub
-            else:
-                dd = {}
-                for t in chunk:
-                    try:
-                        sub = raw[t]
-                    except Exception:
-                        continue
-                    sub = sub.rename(columns={c: c.split(" ")[0] for c in sub.columns})
-                    if sub.index.tz is None:
-                        sub.index = sub.index.tz_localize('UTC').tz_convert(ET_TZ)
-                    else:
-                        sub.index = sub.index.tz_convert(ET_TZ)
-                    dd[t] = sub[['Open','High','Low','Close','Volume']].rename(columns=str.lower).dropna()
-                for t, d in dd.items():
-                    data[t] = d
-        except Exception:
-            continue
-    return data
-
-# ---- Indicators ----
-def rsi(series: pd.Series, length=14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.rolling(length).mean()
-    roll_down = down.rolling(length).mean()
-    rs = roll_up / (roll_down + 1e-9)
-    return 100 - (100 / (1 + rs))
-
-def atr(df: pd.DataFrame, length=14):
-    h, l, c = df['high'], df['low'], df['close']
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    return tr.rolling(length).mean()
-
-def vwap_session(df: pd.DataFrame):
-    """Session VWAP from today's first bar (04:00 ET including premarket)."""
-    if df.empty:
-        return pd.Series(dtype=float)
-    today = df.index[-1].date()
-    sess_start = datetime.combine(today, dtime(4, 0), tzinfo=ET_TZ)
-    intr = df[df.index >= sess_start]
-    tp = (intr['high'] + intr['low'] + intr['close']) / 3
-    cum_tp_vol = (tp * intr['volume']).cumsum()
-    cum_vol = intr['volume'].cumsum().replace(0, np.nan)
-    v = cum_tp_vol / cum_vol
-    out = pd.Series(index=df.index, dtype=float)
-    out.loc[intr.index] = v
-    return out
-
-# ---- Opening Range ----
-def opening_range(df: pd.DataFrame, start=dtime(9,30), end=dtime(10,0)):
-    if df.empty: return np.nan, np.nan
-    dti = df.between_time(start_time=start, end_time=end)
-    if dti.empty: return np.nan, np.nan
-    return float(dti['high'].max()), float(dti['low'].min())
-
-# ---- Regime ----
-@st.cache_data(ttl=600)
-def market_regime(sample_tickers):
-    spy = fetch_daily(["SPY"], period="12mo").get("SPY", pd.DataFrame())
-    if spy.empty:
-        return {"go": False, "why": "SPY data unavailable", "trend": False, "vol_ok": False, "breadth_ok": False, "atrp5": None}
-    spy['sma50'] = spy['close'].rolling(50).mean()
-    spy['sma200'] = spy['close'].rolling(200).mean()
-    spy['atrp5'] = (atr(spy, 5) / spy['close']) * 100
-    last = spy.iloc[-1]
-    trend = (last['close'] > last['sma50']) and (last['sma50'] > last['sma200'])
-    vol_ok = last['atrp5'] < 2.2
-    # Breadth proxy: % of sample above 20SMA
-    daily = fetch_daily(sample_tickers, period="3mo")
-    up = 0; n = 0
-    for t, d in daily.items():
-        if d.empty or len(d) < 25: continue
-        n += 1
-        if d['close'].iloc[-1] > d['close'].rolling(20).mean().iloc[-1]:
-            up += 1
-    breadth_ok = (n > 0) and ((up / n) > 0.55)
-    go = bool(trend and vol_ok and breadth_ok)
-    return {"go": go, "trend": trend, "vol_ok": vol_ok, "breadth_ok": breadth_ok, "atrp5": float(last['atrp5'])}
-
-# ---- Universe Builder ----
+# =========================
+# Symbol universe (NASDAQ files → Q/N only)
+# =========================
 NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-OTHER_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+OTHER_URL  = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 
 @st.cache_data(ttl=60*60*6)
-def download_symbol_files(exclude_funds: bool = True, exclude_derivs: bool = True, allowed_exchanges: set | None = None):
-    """Download and filter symbol tables; return list of tickers.
-    - exclude_funds: drop ETFs/ETNs/NextShares/Test Issues
-    - exclude_derivs: drop Warrants/Units/Rights/Preferred/Notes/Trusts/SPAC
-    - allowed_exchanges: set of codes like {"Q","N","P","A","Z","B"}
-    """
-    def clean_nasdaq(df: pd.DataFrame) -> pd.DataFrame:
+def download_symbol_files_qn_only(exclude_funds=True, exclude_derivs=True):
+    def clean_nasdaq(df):
         df = df.copy()
-        # Remove footer row
-        df = df[df['Symbol'].notna() & (df['Symbol'] != 'Symbol')]
-        df = df[~df['Symbol'].astype(str).str.contains(r"[\^\$~]", na=False)]
-        out = pd.DataFrame({
-            'symbol': df['Symbol'].astype(str).str.upper().str.strip(),
-            'security_name': df.get('Security Name', pd.Series([None]*len(df))),
-            'exchange': 'Q',
-            'etf': df.get('ETF', 'N'),
-            'nextshares': df.get('NextShares', 'N'),
-            'test_issue': df.get('Test Issue', 'N')
+        df = df[df["Symbol"].notna() & (df["Symbol"] != "Symbol")]
+        return pd.DataFrame({
+            "symbol": df["Symbol"].astype(str).str.upper().str.strip(),
+            "security_name": df.get("Security Name", pd.Series([None]*len(df))),
+            "exchange": "Q",
+            "etf": df.get("ETF", "N"),
+            "nextshares": df.get("NextShares", "N"),
+            "test_issue": df.get("Test Issue", "N"),
         })
-        return out
 
-    def clean_other(df: pd.DataFrame) -> pd.DataFrame:
+    def clean_other(df):
         df = df.copy()
-        df = df[df['ACT Symbol'].notna()]
-        df = df[~df['ACT Symbol'].astype(str).str.contains(r"[\^\$~]", na=False)]
-        out = pd.DataFrame({
-            'symbol': df['ACT Symbol'].astype(str).str.upper().str.strip(),
-            'security_name': df.get('Security Name', pd.Series([None]*len(df))),
-            'exchange': df.get('Exchange', pd.Series(['']*len(df))).astype(str).str.upper(),
-            'etf': df.get('ETF', 'N'),
-            'nextshares': pd.Series(['N']*len(df)),  # not present in otherlisted
-            'test_issue': df.get('Test Issue', 'N')
+        df = df[df["ACT Symbol"].notna()]
+        # Keep only NYSE (N)
+        df = df[df.get("Exchange", "").astype(str).str.upper().eq("N")]
+        return pd.DataFrame({
+            "symbol": df["ACT Symbol"].astype(str).str.upper().str.strip(),
+            "security_name": df.get("Security Name", pd.Series([None]*len(df))),
+            "exchange": "N",
+            "etf": df.get("ETF", "N"),
+            "nextshares": pd.Series(["N"]*len(df)),
+            "test_issue": df.get("Test Issue", "N"),
         })
-        return out
 
     frames = []
     try:
-        nasdaq = pd.read_csv(NASDAQ_URL, sep='|')
+        nasdaq = pd.read_csv(NASDAQ_URL, sep="|")
         frames.append(clean_nasdaq(nasdaq))
     except Exception:
         pass
     try:
-        other = pd.read_csv(OTHER_URL, sep='|')
+        other = pd.read_csv(OTHER_URL, sep="|")
         frames.append(clean_other(other))
     except Exception:
         pass
 
     if not frames:
-        # Fallback minimal
-        fallback = pd.DataFrame({'symbol':["AAPL","MSFT","AMZN","NVDA","META","GOOGL","TSLA","AMD","NFLX","QCOM","COIN","SQ","TTD","F","GM"],
-                                 'security_name':None,'exchange':'Q','etf':'N','nextshares':'N','test_issue':'N'})
-        frames = [fallback]
-
+        # Fallback minimal list
+        frames = [pd.DataFrame({"symbol": ["AAPL","MSFT","AMZN","NVDA","META","GOOGL","TSLA","AMD","NFLX","QCOM"],
+                                "security_name": None, "exchange": "Q",
+                                "etf":"N","nextshares":"N","test_issue":"N"})]
     df = pd.concat(frames, ignore_index=True)
-    df.drop_duplicates(subset=['symbol'], inplace=True)
+    df.drop_duplicates(subset=["symbol"], inplace=True)
 
-    # Exchange filter
-    if allowed_exchanges:
-        df = df[df['exchange'].isin(list(allowed_exchanges))]
-
-    # Funds / tests filter
     if exclude_funds:
-        df = df[(df['etf'].astype(str) != 'Y') & (df['test_issue'].astype(str) != 'Y')]
-        if 'nextshares' in df.columns:
-            df = df[df['nextshares'].astype(str) != 'Y']
+        df = df[(df["etf"].astype(str) != "Y") & (df["test_issue"].astype(str) != "Y")]
+        if "nextshares" in df.columns:
+            df = df[df["nextshares"].astype(str) != "Y"]
 
-    # Derivatives/SPAC keywords
-    if exclude_derivs and 'security_name' in df.columns:
+    if exclude_derivs and "security_name" in df.columns:
         pat = re.compile(r"(WARRANT|RIGHTS?|UNITS?|PREF|PREFERRED|NOTE|BOND|TRUST|FUND|ETF|ETN|DEPOSITARY|SPAC)", re.IGNORECASE)
-        df = df[~df['security_name'].astype(str).str.contains(pat, na=False)]
+        df = df[~df["security_name"].astype(str).str.contains(pat, na=False)]
 
-    # Return sorted symbol list
-    syms = sorted(df['symbol'].dropna().unique().tolist())
+    # Return Yahoo-normalized unique symbols
+    syms = sorted({to_yahoo_symbol(s) for s in df["symbol"].dropna().unique().tolist()})
     return syms
 
+# =========================
+# Data fetchers (Daily / 1H)
+# =========================
+@st.cache_data(ttl=900)
+def fetch_daily(tickers, period="6mo"):
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    tickers = [to_yahoo_symbol(t) for t in tickers]
+    data = {}
+    CHUNK = 200
+    for i in range(0, len(tickers), CHUNK):
+        chunk = tickers[i:i+CHUNK]
+        try:
+            raw = yf.download(" ".join(chunk), interval="1d", period=period,
+                              group_by="ticker", auto_adjust=False, progress=False, threads=False)
+        except Exception:
+            continue
+        if len(chunk) == 1:
+            sub = raw.rename(columns={c: c.split(" ")[0] for c in raw.columns})
+            if sub.index.tz is None:
+                sub.index = sub.index.tz_localize("UTC").tz_convert(ET_TZ)
+            else:
+                sub.index = sub.index.tz_convert(ET_TZ)
+            sub = sub[["Open","High","Low","Close","Volume"]].rename(columns=str.lower).dropna()
+            data[chunk[0]] = sub
+        else:
+            for t in chunk:
+                try:
+                    sub = raw[t]
+                except Exception:
+                    continue
+                sub = sub.rename(columns={c: c.split(" ")[0] for c in sub.columns})
+                if sub.index.tz is None:
+                    sub.index = sub.index.tz_localize("UTC").tz_convert(ET_TZ)
+                else:
+                    sub.index = sub.index.tz_convert(ET_TZ)
+                sub = sub[["Open","High","Low","Close","Volume"]].rename(columns=str.lower).dropna()
+                data[t] = sub
+    return data
+
+@st.cache_data(ttl=300)
+def fetch_1h_chunks(tickers, period="60d"):
+    tickers = [to_yahoo_symbol(t) for t in tickers]
+    out = {}
+    CHUNK = 60
+    for i in range(0, len(tickers), CHUNK):
+        chunk = tickers[i:i+CHUNK]
+        try:
+            raw = yf.download(" ".join(chunk), interval="1h", period=period, prepost=False,
+                              progress=False, threads=False, group_by="ticker")
+        except Exception:
+            continue
+        if len(chunk) == 1:
+            dd = {chunk[0]: raw}
+        else:
+            dd = {}
+            for t in chunk:
+                try:
+                    dd[t] = raw[t]
+                except Exception:
+                    continue
+        for t, h in dd.items():
+            if h is None or h.empty or len(h) < 40:
+                continue
+            h = h.rename(columns={c: c.split(" ")[0] for c in h.columns})
+            try:
+                h = h[["Open","High","Low","Close","Volume"]].rename(columns=str.lower)
+            except Exception:
+                cols = [c for c in ["Open","High","Low","Close","Volume"] if c in h.columns]
+                if len(cols) < 5:
+                    continue
+                h = h[cols].rename(columns=str.lower)
+            try:
+                if h.index.tz is None:
+                    h.index = h.index.tz_localize("UTC").tz_convert(ET_TZ)
+                else:
+                    h.index = h.index.tz_convert(ET_TZ)
+            except Exception:
+                h.index = pd.to_datetime(h.index).tz_localize("UTC").tz_convert(ET_TZ)
+            h = h.between_time("09:30", "16:00")  # RTH only
+            out[t] = h
+    return out
+
+# =========================
+# Indicators
+# =========================
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    tr1 = (high - low).abs()
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr1 = (high - low)
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr_n = tr.rolling(n).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(n).mean() / (atr_n + 1e-9)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(n).mean() / (atr_n + 1e-9)
+    dx = 100 * (plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-9)
+    return dx.rolling(n).mean()
+
+def same_hour_rvol(df: pd.DataFrame) -> float:
+    if df is None or df.empty:
+        return np.nan
+    last_ts = df.index[-1]
+    hr = last_ts.hour
+    prev = df.iloc[:-1]
+    prev_same_hr = prev[prev.index.hour == hr].tail(20)
+    if prev_same_hr.empty:
+        return np.nan
+    return float(df["volume"].iloc[-1] / max(1.0, prev_same_hr["volume"].median()))
+
+def ema(series: pd.Series, span: int, minp: int = None) -> pd.Series:
+    return series.ewm(span=span, min_periods=minp or span).mean()
+
+def kdj(df: pd.DataFrame, n: int = 9, k_smooth: int = 3, d_smooth: int = 3):
+    """KDJ (stochastic variant): returns K, D, J."""
+    high, low, close = df["high"], df["low"], df["close"]
+    low_n = low.rolling(n).min()
+    high_n = high.rolling(n).max()
+    rsv = (close - low_n) / (high_n - low_n + 1e-9) * 100.0
+    K = rsv.ewm(alpha=1.0/k_smooth, adjust=False).mean()
+    D = K.ewm(alpha=1.0/d_smooth, adjust=False).mean()
+    J = 3 * K - 2 * D
+    return K, D, J
+
+# =========================
+# Universe Builder
+# =========================
 @st.cache_data(ttl=60*60)
-def build_universe(min_price=5.0, max_price=100.0, min_avg_dollar_vol=30_000_000, min_atr_pct=1.5, max_atr_pct=12.0, max_symbols=800, raw_syms=None):
-    """Return filtered tickers meeting liquidity/vol/price constraints, ranked by 20d dollar volume."""
-    raw_syms = raw_syms or download_symbol_files()
-    # Limit for performance during daily build
-    raw_syms = raw_syms[:6000]
+def build_universe(min_price=5.0, max_price=100.0, min_avg_dollar_vol=30_000_000,
+                   min_atr_pct=1.5, max_atr_pct=12.0, max_symbols=800,
+                   return_stats=False):
+    raw_syms = download_symbol_files_qn_only()
+    raw_syms = raw_syms[:6000]  # safety cap
     daily = fetch_daily(raw_syms, period="3mo")
-    scored = []
+    evaluated = 0
+    picked = []
     for t, d in daily.items():
         if d.empty or len(d) < 25:
             continue
+        evaluated += 1
         last = d.iloc[-1]
-        price_ok = (min_price <= last['close'] <= max_price)
-        d['atrp14'] = (atr(d, 14) / d['close']) * 100
-        atrp = d['atrp14'].iloc[-1]
-        atr_ok = (min_atr_pct <= atrp <= max_atr_pct)
-        adv = (d['close'] * d['volume']).rolling(20).mean().iloc[-1]
-        liquid = adv is not None and not np.isnan(adv) and (adv >= min_avg_dollar_vol)
+        price_ok = (min_price <= last["close"] <= max_price)
+        atrp14 = (atr(d, 14) / d["close"] * 100).iloc[-1]
+        atr_ok = (atrp14 >= min_atr_pct) and (atrp14 <= max_atr_pct)
+        adv = (d["close"] * d["volume"]).rolling(20).mean().iloc[-1]
+        liquid = adv is not None and not math.isnan(float(adv)) and adv >= min_avg_dollar_vol
         if price_ok and atr_ok and liquid:
-            scored.append((t, float(adv)))
-    # Rank by dollar volume desc and cap
-    scored.sort(key=lambda x: x[1], reverse=True)
-    selected = [t for t, _ in scored[:max_symbols]]
+            picked.append((t, float(adv)))
+    picked.sort(key=lambda x: x[1], reverse=True)
+    selected = [t for t, _ in picked[:max_symbols]]
+    if return_stats:
+        return selected, {
+            "evaluated": evaluated,
+            "selected": len(selected),
+            "adv_threshold": int(min_avg_dollar_vol),
+            "atr_band": (min_atr_pct, max_atr_pct),
+        }
     return selected
 
-# -------------- Streamlit UI --------------
-st.set_page_config(page_title="US Screener + Auto-Trader", layout="wide")
-if _AUTOREFRESH_OK:
-    _st_autorefresh(interval=5*60*1000, key="autorefresh")  # every 5 min
+# =========================
+# Strategy A: MACD_1H (filtered)
+# =========================
+def macd_1h_screener(tickers: list[str],
+                     rsi_max: float = 60.0,
+                     adx_min: float = 20.0,
+                     require_ema_trend: bool = True,
+                     rvol_min: float = 1.2,
+                     daily_bias: bool = False) -> pd.DataFrame:
+    data = fetch_1h_chunks(tickers, period="60d")
+    out = []
 
-st.title("US Intraday Screener + Auto-Trader (PDT-aware)")
-colt1, colt2 = st.columns(2)
-with colt1:
-    st.caption(f"Last run (US/Eastern): {et_now_str()}")
-with colt2:
-    st.caption(f"Local (MYT): {my_now_str()}")
+    # Optional daily bias: EMA20 > EMA50
+    daily_ok = set()
+    if daily_bias and data:
+        daily_data = fetch_daily(list(data.keys()), period="6mo")
+        for t, d in daily_data.items():
+            if d is None or d.empty or len(d) < 50: 
+                continue
+            if ema(d["close"], 20).iloc[-1] > ema(d["close"], 50).iloc[-1]:
+                daily_ok.add(t)
 
-# Health: data freshness and session context
+    for t, h in data.items():
+        if h is None or h.empty or len(h) < 40:
+            continue
+        ema10 = ema(h["close"], 10)
+        ema20 = ema(h["close"], 20)
+        delta = h["close"].diff(); up = delta.clip(lower=0); down = -delta.clip(upper=0)
+        rsi14 = 100 - (100 / (1 + (up.rolling(14).mean() / (down.rolling(14).mean() + 1e-9))))
+        ema12 = ema(h["close"], 12)
+        ema26 = ema(h["close"], 26)
+        macd = ema12 - ema26
+        macds = ema(macd, 9)
+        hist = macd - macds
+        adx14 = adx(h, 14)
+        rvol = same_hour_rvol(h)
+
+        last = pd.DataFrame({
+            "close": h["close"], "ema10": ema10, "ema20": ema20,
+            "rsi14": rsi14, "macd": macd, "macds": macds, "hist": hist, "adx14": adx14
+        }).iloc[-1]
+
+        ok = (
+            (last["macd"] > 0) and (last["macds"] < 0) and (last["hist"] > 0) and
+            (last["rsi14"] <= rsi_max) and (rvol >= rvol_min) and (last["adx14"] >= adx_min)
+        )
+        if require_ema_trend:
+            ok = ok and (last["ema10"] > last["ema20"])
+        if daily_bias:
+            ok = ok and (t in daily_ok)
+        if not ok:
+            continue
+
+        out.append({
+            "Strategy": "MACD_1H",
+            "BarTime (ET)": h.index[-1].strftime("%Y-%m-%d %H:%M"),
+            "Ticker": t,
+            "Price": float(last["close"]),
+            "RSI14": float(last["rsi14"]),
+            "MACD": float(last["macd"]),
+            "Signal": float(last["macds"]),
+            "Hist": float(last["hist"]),
+            "EMA10": float(last["ema10"]),
+            "EMA20": float(last["ema20"]),
+            "ADX14": float(last["adx14"]),
+            "RVOL_same_hour": float(rvol),
+            "DailyBias": bool(t in daily_ok) if daily_bias else None,
+        })
+    return pd.DataFrame(out)
+
+# =========================
+# Strategy B: WIFE_1H (EMA5/20/50 + MACD leadership + KDJ + vol + mcap)
+# =========================
+@st.cache_data(ttl=60*60)
+def get_market_caps(tickers: list[str]) -> dict:
+    """Fast market caps via yfinance fast_info; fallback to info."""
+    caps = {}
+    for t in tickers:
+        try:
+            tk = yf.Ticker(t)
+            cap = None
+            # fast_info (newer yfinance) may be faster
+            fi = getattr(tk, "fast_info", None)
+            if fi and "market_cap" in fi and fi["market_cap"]:
+                cap = fi["market_cap"]
+            if cap is None:
+                info = tk.info or {}
+                cap = info.get("marketCap")
+            caps[t] = cap if cap is not None else np.nan
+        except Exception:
+            caps[t] = np.nan
+    return caps
+
+def consec_green_count(close: pd.Series) -> int:
+    """Consecutive green bars (close > prev close) ending at last bar."""
+    if len(close) < 2:
+        return 0
+    up = (close > close.shift(1)).astype(int)
+    # count run-length at the end
+    cnt = 0
+    for val in reversed(up.tolist()):
+        if val == 1:
+            cnt += 1
+        else:
+            break
+    return cnt
+
+def wife_1h_screener(tickers: list[str],
+                     min_1h_volume: int = 1_000_000,
+                     max_rvol_after_cross: float = 2.0,
+                     min_market_cap: float = 1_000_000_000.0) -> pd.DataFrame:
+    """
+    Implements wife's rules on 1H:
+      ⿡ EMA5 > EMA20 > EMA50 and each rising
+      ⿢ MACD leadership: 
+          (Hist<0 and Hist_t>Hist_{t-1}) OR (Hist>0 with <=2 consecutive green bars and RVOL<=cap)
+          AND MACD>Signal AND MACD_t>MACD_{t-1}
+      ⿣ KDJ bullish not overheated: K>D, K↑, D↑, J↑, J<80
+      ⿤ Volume filter: 1H Volume >= min_1h_volume
+      ⿥ Market Cap >= min_market_cap
+    """
+    data = fetch_1h_chunks(tickers, period="60d")
+    out = []
+
+    # Precompute market caps only for candidates later (to save bandwidth)
+    # We'll gather tickers that pass all OHLCV rules first, then filter by mcap.
+
+    proto_rows = []
+    for t, h in data.items():
+        if h is None or h.empty or len(h) < 60:
+            continue
+
+        # EMAs
+        ema5  = ema(h["close"], 5)
+        ema20 = ema(h["close"], 20)
+        ema50 = ema(h["close"], 50)
+
+        last = h.index[-1]
+        # Short EMAs rising condition
+        short_ok = (
+            ema5.iloc[-1] > ema20.iloc[-1] > ema50.iloc[-1] and
+            ema5.iloc[-1]  > ema5.iloc[-2]  and
+            ema20.iloc[-1] > ema20.iloc[-2] and
+            ema50.iloc[-1] > ema50.iloc[-2]
+        )
+
+        # MACD leadership
+        macd_line = ema(h["close"], 12) - ema(h["close"], 26)
+        signal    = ema(macd_line, 9)
+        hist      = macd_line - signal
+
+        macd_lead = (macd_line.iloc[-1] > signal.iloc[-1]) and (macd_line.iloc[-1] > macd_line.iloc[-2])
+
+        # Hist patterns
+        hist_neg_shrinking = (hist.iloc[-1] < 0) and (hist.iloc[-1] > hist.iloc[-2])
+        hist_pos_early = False
+        if hist.iloc[-1] > 0:
+            cg = consec_green_count(h["close"])
+            rvol = same_hour_rvol(h)
+            hist_pos_early = (cg <= 2) and (rvol <= max_rvol_after_cross)
+
+        macd_ok = macd_lead and (hist_neg_shrinking or hist_pos_early)
+
+        # KDJ bullish not overheated
+        K, D, J = kdj(h, n=9, k_smooth=3, d_smooth=3)
+        kdj_ok = (
+            (K.iloc[-1] > D.iloc[-1]) and
+            (K.iloc[-1] > K.iloc[-2]) and (D.iloc[-1] > D.iloc[-2]) and
+            (J.iloc[-1] > J.iloc[-2]) and (J.iloc[-1] < 80)
+        )
+
+        # Volume rule (1H)
+        vol_ok = (h["volume"].iloc[-1] >= min_1h_volume)
+
+        if short_ok and macd_ok and kdj_ok and vol_ok:
+            rvol = same_hour_rvol(h)
+            proto_rows.append({
+                "Strategy": "WIFE_1H",
+                "BarTime (ET)": last.strftime("%Y-%m-%d %H:%M"),
+                "Ticker": t,
+                "Price": float(h["close"].iloc[-1]),
+                "EMA5":  float(ema5.iloc[-1]),
+                "EMA20": float(ema20.iloc[-1]),
+                "EMA50": float(ema50.iloc[-1]),
+                "MACD":  float(macd_line.iloc[-1]),
+                "Signal": float(signal.iloc[-1]),
+                "Hist":  float(hist.iloc[-1]),
+                "K": float(K.iloc[-1]),
+                "D": float(D.iloc[-1]),
+                "J": float(J.iloc[-1]),
+                "RVOL_same_hour": float(rvol) if rvol is not None else np.nan,
+                "Volume": int(h["volume"].iloc[-1]),
+            })
+
+    # Market cap filter (only on candidates)
+    if proto_rows:
+        caps = get_market_caps([r["Ticker"] for r in proto_rows])
+        for r in proto_rows:
+            cap = caps.get(r["Ticker"], np.nan)
+            if pd.notna(cap) and cap >= min_market_cap:
+                r["MarketCap"] = float(cap)
+                out.append(r)
+
+    return pd.DataFrame(out)
+
+# =========================
+# UI — Header / Health
+# =========================
+st.title("Retail 1H Screener — MACD + Wife Strategy")
+c0, c1 = st.columns(2)
+with c0: st.caption(f"Local (MYT): {my_now_str()}")
+with c1: st.caption(f"US/Eastern: {et_now_str()}")
+
+# Quick health proxy for last 1H bar time
+last_bar_str, last_bar_sym = "n/a", None
 try:
-    spy5 = fetch_intraday(["SPY"], interval="5m", period="7d", prepost=True).get("SPY", pd.DataFrame())
-    last_spy_bar = spy5.index[-1].strftime('%Y-%m-%d %H:%M') if not spy5.empty else 'n/a'
-    rth = spy5.between_time('09:30','16:00') if not spy5.empty else pd.DataFrame()
-    _dates = sorted({ts.date() for ts in rth.index}) if not rth.empty else []
-    _today = et_now().date()
-    _prev = [d for d in _dates if d < _today]
-    last_sess = _prev[-1] if _prev else (_dates[-1] if _dates else None)
+    for sym in ["SPY","QQQ","AAPL","MSFT"]:
+        dfp = fetch_1h_chunks([sym], period="5d").get(sym, pd.DataFrame())
+        if dfp is not None and not dfp.empty:
+            last_bar_str = dfp.index[-1].strftime("%Y-%m-%d %H:%M")
+            last_bar_sym = sym
+            break
 except Exception:
-    last_spy_bar = 'n/a'
-    last_sess = None
-colA, colB, colC = st.columns(3)
-colA.metric("Now (ET)", et_now_str())
-colB.metric("Last SPY 5m bar", last_spy_bar)
-colC.metric("Last session date", str(last_sess))
+    pass
+hA, hB = st.columns(2)
+hA.metric("Last 1H bar", last_bar_str)
+if last_bar_sym: hA.caption(f"from {last_bar_sym}")
 
+# =========================
+# Sidebar — Universe & Strategy Filters
+# =========================
 with st.sidebar:
-    # Manual refresh fallback if autorefresh component is unavailable
     if not _AUTOREFRESH_OK:
-        st.info("Auto-refresh component unavailable here. Use Manual refresh.")
+        st.info("Auto-refresh module unavailable. Use Manual refresh.")
         if st.button("Manual refresh"):
             st.experimental_rerun()
-    st.header("Universe & Filters")
+
+    st.header("Universe (NASDAQ + NYSE only)")
     min_price = st.number_input("Min Price ($)", value=5.0)
     max_price = st.number_input("Max Price ($)", value=100.0)
-    # Exchange & instrument filters
-    exclude_funds = st.checkbox("Exclude ETFs/ETNs/NextShares/Test Issues", value=True)
-    exclude_derivs = st.checkbox("Exclude Warrants/Units/Rights/Preferred/Notes/Trusts", value=True)
-    ex_opts = ["NASDAQ (Q)","NYSE (N)","NYSE Arca (P)","NYSE American (A)","Cboe BZX (Z)","Nasdaq BX (B)"]
-    ex_default = ["NASDAQ (Q)","NYSE (N)"]
-    ex_sel = st.multiselect("Allowed Exchanges", ex_opts, default=ex_default)
-    ex_map = {"NASDAQ (Q)":"Q","NYSE (N)":"N","NYSE Arca (P)":"P","NYSE American (A)":"A","Cboe BZX (Z)":"Z","Nasdaq BX (B)":"B"}
-    allowed_exchanges = {ex_map[x] for x in ex_sel}
-    # Liquidity & vol filters
     min_avg_dollar_vol = st.number_input("Min Avg Dollar Volume (20d)", value=30_000_000)
     max_atr_pct = st.number_input("Max 14d ATR%", value=12.0)
     min_atr_pct = st.number_input("Min 14d ATR%", value=1.5)
-    # Optional manual override
-    st.markdown("Manual tickers (optional, comma/space-separated):")
+    max_symbols = st.slider("Max Universe Size", 200, 1200, 800, step=50)
+
+    st.markdown("Manual tickers (optional, comma/space):")
     manual_syms = st.text_area("Symbols override", value="", height=60)
 
-    # Rebuild controls and status
     rebuild_now = st.button("Rebuild Universe now")
     st.caption(f"Last rebuild (ET): {st.session_state.get('universe_built_at', 'never')}")
 
     st.divider()
-    st.subheader("Risk & PDT")
-    acct_equity = st.number_input("Account Equity ($)", value=10_000)
-    risk_pct = st.slider("Risk % per trade", 0.1, 1.0, 0.75, step=0.05)
-    max_new_trades_today = st.number_input("Max NEW trades today", value=3, min_value=1)
-    fees_per_trade = st.number_input("Fees per trade ($)", value=0.50, min_value=0.0, step=0.05)
-    slip_bps = st.number_input("Slippage (bps)", value=5, min_value=0)
+    st.subheader("Strategy A — MACD 1H")
+    rsi_max = st.number_input("RSI(14) max", value=60.0)
+    adx_min = st.number_input("ADX(14) min", value=20.0)
+    rvol_min = st.number_input("Same-hour RVOL min", value=1.2)
+    require_ema_trend = st.checkbox("Require EMA10 > EMA20", value=True)
+    daily_bias = st.checkbox("Require Daily EMA20 > EMA50", value=False)
 
     st.divider()
-    st.subheader("Strategy Windows")
-    rvol_threshold = st.number_input("Min 5m RVOL (signal bar)", value=1.5)
-    rsi2_threshold = st.number_input("RSI(2) max for snapback", value=5, min_value=1, max_value=30)
-    enable_orb = st.checkbox("Enable ORB-VWAP Continuation", value=True)
-    enable_snap = st.checkbox("Enable RSI(2) VWAP Snapback", value=True)
+    st.subheader("Strategy B — Wife 1H")
+    min_1h_volume = st.number_input("Min 1H Volume (shares)", value=1_000_000, step=50_000)
+    max_rvol_after_cross = st.number_input("Max RVOL after Hist>0", value=2.0, step=0.1)
+    min_market_cap = st.number_input("Min Market Cap ($)", value=1_000_000_000)
+
+    st.divider()
+    scan_top_n = st.slider("Scan top N by ADV", 50, 800, 400, step=50)
 
     st.divider()
     st.subheader("Output")
     auto_write_signals = st.checkbox("Auto-write Signals to Google Sheet", value=True)
+    force_universe_sync = st.button("Sync Universe to Google Sheet now")
 
-
-
-# Session state buffers (incremental updates)
-if "buffers" not in st.session_state:
-    st.session_state.buffers = {}  # ticker -> DataFrame (5m intraday)
-if "ledger" not in st.session_state:
-    st.session_state.ledger = []
-if "today_trades" not in st.session_state:
-    st.session_state.today_trades = 0
-if "signal_keys_written" not in st.session_state:
-    st.session_state.signal_keys_written = set()  # to avoid duplicate appends on refresh
-
-# -------------- Build Universe --------------
+# =========================
+# Build Universe (daily)
+# =========================
 et_today = et_now().date()
 if manual_syms.strip():
-    base_universe = [s.strip().upper() for s in manual_syms.replace('\n',' ').replace(',', ' ').split() if s.strip()]
+    base_universe = [to_yahoo_symbol(s) for s in manual_syms.replace("\n"," ").replace(","," ").split() if s.strip()]
     source_symbols = base_universe
 else:
-    need_rebuild = st.session_state.get('universe_built_date') != et_today or st.session_state.get('universe_cache') is None or rebuild_now
+    need_rebuild = (
+        st.session_state.get("universe_built_date") != et_today
+        or st.session_state.get("universe_cache") is None
+        or rebuild_now
+    )
     if need_rebuild:
-        source_symbols = download_symbol_files(exclude_funds=exclude_funds, exclude_derivs=exclude_derivs, allowed_exchanges=allowed_exchanges)
-        base_universe = build_universe(min_price, max_price, min_avg_dollar_vol, min_atr_pct, max_atr_pct, raw_syms=source_symbols)
-        st.session_state['universe_cache'] = base_universe
-        st.session_state['source_symbols_cache'] = source_symbols
-        st.session_state['universe_built_date'] = et_today
-        st.session_state['universe_built_at'] = et_now_str()
+        source_symbols = download_symbol_files_qn_only()
+        try:
+            base_universe, uni_stats = build_universe(
+                min_price, max_price, min_avg_dollar_vol, min_atr_pct, max_atr_pct,
+                max_symbols=max_symbols, return_stats=True
+            )
+        except TypeError:
+            base_universe = build_universe(
+                min_price, max_price, min_avg_dollar_vol, min_atr_pct, max_atr_pct,
+                max_symbols=max_symbols, return_stats=False
+            )
+            uni_stats = None
+        st.session_state["universe_cache"] = base_universe
+        st.session_state["source_symbols_cache"] = source_symbols
+        st.session_state["universe_built_date"] = et_today
+        st.session_state["universe_built_at"] = et_now_str()
     else:
-        base_universe = st.session_state.get('universe_cache', [])
-        source_symbols = st.session_state.get('source_symbols_cache', [])
+        base_universe = st.session_state.get("universe_cache", [])
+        source_symbols = st.session_state.get("source_symbols_cache", [])
 
 _src_count = len(source_symbols)
-st.success(f"Universe size: {len(base_universe)} (auto-built from {_src_count} filtered source symbols)")
-if len(base_universe) < 50:
-    st.warning("Only a few tickers passed filters. Consider lowering 'Min Avg Dollar Volume' or widening ATR% bounds.")
+st.success(f"Universe size: {len(base_universe)} (from {_src_count} filtered Q/N symbols)")
+if "uni_stats" in locals() and uni_stats:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Evaluated", uni_stats.get("evaluated", 0))
+    sel = uni_stats.get("selected", 0); ev = max(1, uni_stats.get("evaluated", 1))
+    c2.metric("Selected", f"{sel} ({100*sel/ev:.1f}%)")
+    c3.metric("ADV ≥", f"${uni_stats.get('adv_threshold', 0):,}")
+    lo, hi = uni_stats.get("atr_band", (min_atr_pct, max_atr_pct))
+    c4.metric("ATR% band", f"{lo}–{hi}")
 
-# Export universe to GSheet (gated to avoid 429)
+# Sync Universe (bulk, gated)
 cur_hash = hash(tuple(base_universe))
 now_et = et_now()
-last_hash = st.session_state.get('universe_written_hash')
-last_at = st.session_state.get('universe_written_at')
-ok_to_write = (last_hash != cur_hash) and (last_at is None or (now_et - last_at).total_seconds() > 600)
-# Manual force sync button
-force_sync = st.button("Sync Universe to Google Sheet now")
-if ((ok_to_write and base_universe) or force_sync) and not manual_syms.strip():
+last_hash = st.session_state.get("universe_written_hash")
+last_at   = st.session_state.get("universe_written_at")
+ok_to_write_uni = (last_hash != cur_hash) and (last_at is None or (now_et - last_at).total_seconds() > 600)
+if ((ok_to_write_uni and base_universe) or force_universe_sync) and not manual_syms.strip():
     ok, msg = write_universe_sheet(base_universe)
     if ok:
-        st.session_state['universe_written_hash'] = cur_hash
-        st.session_state['universe_written_at'] = now_et
-        st.caption(f"Universe synced to Google Sheet (bulk write). {msg}")
-    else:
-        st.caption("Universe sync attempted but failed (see warning above).")
+        st.session_state["universe_written_hash"] = cur_hash
+        st.session_state["universe_written_at"]   = now_et
+        st.caption(f"Universe synced to Google Sheet (bulk). {msg}")
 else:
-    st.caption("Universe not synced (unchanged/recently synced or manual symbols mode). Use the button to force a sync.")
+    st.caption("Universe not synced (unchanged/recently synced or manual symbols mode).")
 
-# -------------- Regime Panel --------------
-# Use a small sample for breadth calc to reduce calls
-sample_for_regime = base_universe[:120] if base_universe else ["AAPL","MSFT","NVDA","SPY"]
-reg = market_regime(sample_for_regime)
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Regime", "GO" if reg["go"] else "CHOP", help=f"Trend={reg['trend']} / VolOK={reg['vol_ok']} / BreadthOK={reg['breadth_ok']}")
-col2.metric("Trend", "OK" if reg["trend"] else "Weak")
-col3.metric("Vol Proxy (SPY ATR% 5d)", formatn(reg.get("atrp5"),2))
-col4.metric("Breadth>20SMA", "OK" if reg["breadth_ok"] else "Weak")
-
+# =========================
+# Run Strategies
+# =========================
 st.divider()
+st.subheader("Signals — latest 1H bar")
 
-# -------------- Strategy Logic --------------
-def position_size(equity, risk_pct, entry, stop):
-    risk_amt = equity * (risk_pct/100)
-    per_sh = max(0.01, abs(entry - stop))
-    qty = math.floor(risk_amt / per_sh)
-    return max(0, qty)
+scan_list = base_universe[:scan_top_n] if base_universe else ["AAPL","MSFT","NVDA","AMD","SPY"]
 
-
-def within_regular_hours(ts):
-    t = ts.tz_convert(ET_TZ).time()
-    return dtime(9,30) <= t <= dtime(16,0)
-
-
-def strategy_signals_for_df(ticker: str, df5: pd.DataFrame, go_regime: bool):
-    if df5.empty or len(df5) < 60:
-        return []
-    # indicators
-    df5 = df5.copy()
-    df5['ema9'] = df5['close'].ewm(span=9, min_periods=9).mean()
-    df5['rsi2'] = rsi(df5['close'], 2)
-    df5['vwap'] = vwap_session(df5)
-    orh, orl = opening_range(df5)
-    last = df5.iloc[-1]
-    if not within_regular_hours(df5.index[-1]):
-        return []
-    out = []
-    # ORB-VWAP (10:00–12:00)
-    if go_regime and enable_orb and dtime(10,0) <= df5.index[-1].time() <= dtime(12,0):
-        vol20 = df5['volume'].rolling(20).mean().iloc[-1]
-        rvol = last['volume'] / max(1, vol20)
-        trigger = (not np.isnan(orh)) and (last['close'] > orh) and (last['close'] > last['vwap']) and (rvol >= rvol_threshold)
-        if trigger:
-            atr5 = atr(df5, 14).iloc[-1]
-            stop = min(last['vwap'] - 0.25*atr5, df5['low'].iloc[-3:-1].min())
-            entry = last['close'] + 0.01
-            rr = (entry - stop)
-            out.append({
-                'ticker': ticker, 'setup': 'ORB_VWAP', 'time': df5.index[-1], 'price': float(last['close']),
-                'entry': float(entry), 'stop': float(stop), 'target1': float(entry + 1.5*rr), 'rvol': float(rvol),
-                'orh': float(orh), 'orl': float(orl)
-            })
-    # RSI(2) VWAP Snapback (10:00–15:30)
-    if (not go_regime) and enable_snap and dtime(10,0) <= df5.index[-1].time() <= dtime(15,30):
-        rsi2v = last['rsi2']
-        dipped = (df5['close'].iloc[-2] < df5['vwap'].iloc[-2]) or (df5['low'].iloc[-1] < last['vwap'])
-        reclaimed = (last['close'] > last['vwap']) or (last['close'] > last['ema9'] and df5['close'].iloc[-2] <= df5['ema9'].iloc[-2])
-        if rsi2v <= rsi2_threshold and dipped and reclaimed:
-            swing_low = min(df5['low'].iloc[-3:-1])
-            entry = last['close'] + 0.01
-            stop = swing_low - 0.01
-            atr5 = atr(df5, 14).iloc[-1]
-            out.append({
-                'ticker': ticker, 'setup': 'RSI2_VWAP', 'time': df5.index[-1], 'price': float(last['close']),
-                'entry': float(entry), 'stop': float(stop), 'target1': float(last['vwap'] + 0.5*atr5), 'rsi2': float(rsi2v)
-            })
-    return out
-
-# -------------- Incremental Buffers & Scan --------------
-# Load latest 5m for universe (buffers updated incrementally)
-existing = list(st.session_state.buffers.keys())
-# First pass: for tickers we don't have, fetch 5d; for existing, fetch 1d and append
-new_needed = [t for t in base_universe if t not in st.session_state.buffers]
-if new_needed:
-    intraday_new = fetch_intraday(new_needed, interval="5m", period="5d", prepost=True)
-    for t, df in intraday_new.items():
-        st.session_state.buffers[t] = df
-# Update existing with just recent bars
-intraday_recent = fetch_intraday(base_universe, interval="5m", period="1d", prepost=True)
-for t, df in intraday_recent.items():
-    if t not in st.session_state.buffers:
-        st.session_state.buffers[t] = df
-    else:
-        old = st.session_state.buffers[t]
-        # append rows newer than last index in old
-        newer = df[df.index > (old.index.max() if not old.empty else df.index.min())]
-        if not newer.empty:
-            st.session_state.buffers[t] = pd.concat([old, newer]).drop_duplicates().sort_index()
-
-progress = st.progress(0.0)
-signals = []
-for i, t in enumerate(base_universe[:400]):  # safety cap for UI perf
-    try:
-        df5 = st.session_state.buffers.get(t, pd.DataFrame())
-        sigs = strategy_signals_for_df(t, df5, reg['go'])
-        signals.extend(sigs)
-    except Exception:
-        pass
-    progress.progress((i+1)/max(1, len(base_universe[:400])))
-
-# PDT-aware throttle
-remaining = max(0, max_new_trades_today - st.session_state.today_trades)
-if remaining and signals:
-    def score(s):
-        base = 100 if (s['setup'] == 'ORB_VWAP' and reg['go']) else 80
-        dist = abs(s['entry'] - s['stop'])
-        return base - (dist * 1000)
-    signals = sorted(signals, key=score, reverse=True)[:remaining]
+# MACD_1H
+with st.spinner("Scanning MACD 1H…"):
+    macd_df = macd_1h_screener(
+        scan_list, rsi_max=float(rsi_max), adx_min=float(adx_min),
+        require_ema_trend=bool(require_ema_trend), rvol_min=float(rvol_min),
+        daily_bias=bool(daily_bias)
+    )
+if not macd_df.empty:
+    show = macd_df.copy()
+    for col, d in [("Price",2),("RSI14",1),("MACD",4),("Signal",4),("Hist",4),("EMA10",2),("EMA20",2),("ADX14",1),("RVOL_same_hour",2)]:
+        show[col] = show[col].apply(lambda x: formatn(x, d))
+    st.markdown("**Strategy A — MACD_1H**")
+    st.dataframe(show, use_container_width=True)
 else:
-    signals = []
+    st.info("Strategy A — No MACD_1H signals on the latest bar.")
 
-if signals:
-    st.subheader("Actionable Signals (PDT-aware)")
-    rows = []
-    keys = []
-    for s in signals:
-        qty = position_size(acct_equity, risk_pct, s['entry'], s['stop'])
-        time_str = s['time'].strftime('%Y-%m-%d %H:%M')
-        row = {
-            'Ticker': s['ticker'], 'Setup': s['setup'], 'Time (ET)': time_str,
-            'Price': formatn(s['price']), 'Entry': formatn(s['entry']), 'Stop': formatn(s['stop']),
-            'Qty@Risk%': qty, 'Target1': formatn(s['target1'])
-        }
-        rows.append(row)
-        keys.append(f"{row['Ticker']}|{row['Setup']}|{row['Time (ET)']}")
-    df_sig = pd.DataFrame(rows)
-    st.dataframe(df_sig, use_container_width=True)
-    # Auto-append unique rows to Sheets
-    if auto_write_signals:
-        new_rows = []
-        for r, k in zip(rows, keys):
-            if k not in st.session_state.signal_keys_written:
-                new_rows.append([r['Ticker'], r['Setup'], r['Time (ET)'], r['Price'], r['Entry'], r['Stop'], r['Qty@Risk%'], r['Target1']])
-        if new_rows:
+# Wife_1H
+with st.spinner("Scanning Wife 1H…"):
+    wife_df = wife_1h_screener(
+        scan_list,
+        min_1h_volume=int(min_1h_volume),
+        max_rvol_after_cross=float(max_rvol_after_cross),
+        min_market_cap=float(min_market_cap)
+    )
+if not wife_df.empty:
+    show2 = wife_df.copy()
+    for col, d in [("Price",2),("EMA5",2),("EMA20",2),("EMA50",2),("MACD",4),("Signal",4),("Hist",4),("K",1),("D",1),("J",1),("RVOL_same_hour",2)]:
+        show2[col] = show2[col].apply(lambda x: formatn(x, d))
+    st.markdown("**Strategy B — WIFE_1H**")
+    st.dataframe(show2, use_container_width=True)
+else:
+    st.info("Strategy B — No WIFE_1H signals on the latest bar.")
+
+# =========================
+# Auto-write Signals (de-dup per bar)
+# =========================
+if auto_write_signals:
+    # Determine last bar time string from header health probe (or any df)
+    bar_time_str = last_bar_str if last_bar_str != "n/a" else (
+        (macd_df["BarTime (ET)"].iloc[0] if not macd_df.empty else (wife_df["BarTime (ET)"].iloc[0] if not wife_df.empty else None))
+    )
+    combined = pd.concat([macd_df, wife_df], ignore_index=True) if not macd_df.empty or not wife_df.empty else pd.DataFrame()
+    if bar_time_str and not combined.empty:
+        last_written_bar = st.session_state.get("signals_last_bar_time")
+        last_written_count = st.session_state.get("signals_last_count", 0)
+        # Only write once per bar time and only if count changed
+        if (bar_time_str != last_written_bar) or (len(combined) != last_written_count):
+            # Order columns for sheet
+            cols = [
+                "BarTime (ET)", "Strategy", "Ticker", "Price",
+                "RSI14", "MACD", "Signal", "Hist", "EMA10", "EMA20", "ADX14", "RVOL_same_hour", "DailyBias",
+                "EMA5","EMA20","EMA50","K","D","J","Volume","MarketCap"
+            ]
+            for c in cols:
+                if c not in combined.columns:
+                    combined[c] = None
+            combined = combined[cols]
+
+            rows = combined.values.tolist()
             try:
-                append_to_gsheet(new_rows, SHEET_SIGNALS)
-                st.session_state.signal_keys_written.update(keys)
-                st.caption(f"Signals appended to Google Sheet: {len(new_rows)} new rows")
+                append_to_gsheet(rows, SHEET_SIGNALS)
+                st.caption(f"Wrote {len(rows)} signal rows to Google Sheet for bar {bar_time_str}.")
+                st.session_state["signals_last_bar_time"] = bar_time_str
+                st.session_state["signals_last_count"] = len(rows)
             except Exception as e:
                 st.warning(f"Signals write failed: {e}")
-else:
-    st.info("No actionable signals (PDT slots used / outside RTH / no triggers).")
-
-# -------------- Paper Trade Controls --------------
-st.divider()
-st.subheader("Paper Trades")
-colA, colB = st.columns(2)
-with colA:
-    if st.button("Record above signals as paper trades") and signals:
-        for s in signals:
-            qty = position_size(acct_equity, risk_pct, s['entry'], s['stop'])
-            st.session_state.ledger.append({
-                'time': et_now_str(), 'ticker': s['ticker'], 'setup': s['setup'],
-                'entry': s['entry'], 'stop': s['stop'], 'qty': qty, 'status': 'OPEN'
-            })
-        st.session_state.today_trades += len(signals)
-        st.success(f"Recorded {len(signals)} paper trades. Today trades = {st.session_state.today_trades}")
-with colB:
-    if st.button("Flatten All (paper)"):
-        for tr in st.session_state.ledger:
-            if tr['status'] == 'OPEN':
-                tr['status'] = 'CLOSED'
-        st.success("All paper trades marked CLOSED.")
-
-if st.session_state.ledger:
-    st.dataframe(pd.DataFrame(st.session_state.ledger), use_container_width=True)
-
-# -------------- Preview: Last Session Signals --------------
-st.divider()
-st.subheader("Preview: Last Session Signals (no trading)")
-preview_n = st.slider("Scan top N tickers", 50, 200, 120)
-
-@st.cache_data(ttl=600)
-def last_session_date():
-    spy5 = fetch_intraday(["SPY"], interval="5m", period="7d", prepost=True).get("SPY", pd.DataFrame())
-    if spy5.empty:
-        return None
-    rth = spy5.between_time('09:30','16:00')
-    dates = sorted({ts.date() for ts in rth.index})
-    today = et_now().date()
-    prev = [d for d in dates if d < today]
-    return prev[-1] if prev else (dates[-1] if dates else None)
-
-@st.cache_data(ttl=600)
-def preview_last_session_signals(tickers, go_regime: bool, limit: int = 120):
-    tickers = list(tickers)[:limit]
-    data = fetch_intraday(tickers, interval="5m", period="7d", prepost=True)
-    day = last_session_date()
-    if day is None:
-        return pd.DataFrame()
-    out_rows = []
-    for t in tickers:
-        df = data.get(t, pd.DataFrame())
-        if df.empty:
-            continue
-        dfd = df[df.index.date == day]
-        if dfd.empty:
-            continue
-        dfd = dfd.copy()
-        dfd['ema9'] = dfd['close'].ewm(span=9, min_periods=9).mean()
-        dfd['rsi2'] = rsi(dfd['close'], 2)
-        dfd['vwap'] = vwap_session(dfd)
-        orh = dfd.between_time('09:30','10:00')['high'].max() if not dfd.empty else np.nan
-        got_orb = False; got_snap = False
-        for idx, row in dfd.iterrows():
-            if dtime(10,0) <= idx.time() <= dtime(12,0) and enable_orb and not got_orb:
-                vol20 = dfd['volume'].rolling(20).mean().loc[idx]
-                rvol = row['volume']/max(1, vol20) if pd.notna(vol20) else 0
-                if (pd.notna(orh) and row['close']>orh and row['close']>row['vwap'] and rvol>=rvol_threshold):
-                    atr5 = atr(dfd, 14).loc[idx]
-                    stop = min(row['vwap'] - 0.25*atr5, dfd['low'].loc[:idx].tail(3).min())
-                    entry = row['close'] + 0.01
-                    rr = entry - stop if pd.notna(stop) else np.nan
-                    target1 = entry + 1.5*rr if pd.notna(rr) else np.nan
-                    out_rows.append({'Ticker': t, 'Setup': 'ORB_VWAP', 'Time (ET)': idx.strftime('%Y-%m-%d %H:%M'),
-                                     'Price': formatn(row['close']), 'Entry': formatn(entry), 'Stop': formatn(stop), 'Target1': formatn(target1)})
-                    got_orb = True
-            if dtime(10,0) <= idx.time() <= dtime(15,30) and enable_snap and not got_snap:
-                # RSI2 snapback
-                prev = dfd.shift(1).loc[idx]
-                dipped = (prev['close'] < prev['vwap']) if pd.notna(prev['vwap']) else False
-                reclaimed = (row['close'] > row['vwap']) or (row['close']>row['ema9'] and prev['close']<=prev['ema9'])
-                if (row['rsi2'] <= rsi2_threshold) and dipped and reclaimed:
-                    swing_low = dfd['low'].loc[:idx].tail(3).min()
-                    entry = row['close'] + 0.01
-                    stop = swing_low - 0.01
-                    atr5 = atr(dfd, 14).loc[idx]
-                    target1 = row['vwap'] + 0.5*atr5 if pd.notna(atr5) else np.nan
-                    out_rows.append({'Ticker': t, 'Setup': 'RSI2_VWAP', 'Time (ET)': idx.strftime('%Y-%m-%d %H:%M'),
-                                     'Price': formatn(row['close']), 'Entry': formatn(entry), 'Stop': formatn(stop), 'Target1': formatn(target1)})
-                    got_snap = True
-        # limit one signal per setup per ticker in preview
-    return pd.DataFrame(out_rows)
-
-prev_df = preview_last_session_signals(base_universe, reg['go'], preview_n)
-st.caption(f"Previewing last session: {last_session_date()} (ET). Scanned {min(len(base_universe), preview_n)} tickers.")
-if not prev_df.empty:
-    st.dataframe(prev_df, use_container_width=True)
-else:
-    st.info("No preview signals for last session under current filters.")
-
-# -------------- Backtest (light) --------------
-st.divider()
-st.subheader("Light Backtest: last N sessions, with fees & slippage & PDT")
-N_sessions = st.slider("Sessions (days)", 3, 15, 5)
-
-@st.cache_data(ttl=900)
-def backtest_last_sessions(tickers, sessions=5, go_regime_hint=True, fees=0.5, slippage_bps=5, risk_pct=0.75, pdt_cap=3):
-    # Use last `sessions` days of 5m data; simulate entries at signal close + slippage; exits at target1 or EOD
-    res = []
-    # Fetch 5d+ data once
-    all_data = fetch_intraday(tickers, interval="5m", period=f"{max(5, sessions*2)}d", prepost=True)
-    days = sorted({d.index[-1].date() for d in all_data.values() if not d.empty})[-sessions:]
-    trades_count = 0
-    for t in tickers:
-        df = all_data.get(t, pd.DataFrame())
-        if df.empty: continue
-        df['ema9'] = df['close'].ewm(span=9, min_periods=9).mean()
-        df['rsi2'] = rsi(df['close'], 2)
-        df['vwap'] = vwap_session(df)
-        atr5 = atr(df, 14)
-        for day in days:
-            dfd = df[df.index.date == day]
-            if dfd.empty: continue
-            # opening range for the day
-            orh = dfd.between_time('09:30','10:00')['high'].max() if not dfd.empty else np.nan
-            # simple PDT cap per day
-            used_today = 0
-            for idx in dfd.index:
-                if used_today >= pdt_cap:
-                    break
-                if not (dtime(10,0) <= idx.time() <= dtime(15,30)):
-                    continue
-                row = dfd.loc[idx]
-                # Decide which setup based on go_regime_hint
-                if go_regime_hint and enable_orb and (dtime(10,0) <= idx.time() <= dtime(12,0)):
-                    vol20 = dfd['volume'].rolling(20).mean().loc[idx]
-                    rvol = row['volume']/max(1, vol20) if pd.notna(vol20) else 0
-                    if (pd.notna(orh) and row['close']>orh and row['close']>row['vwap'] and rvol>=rvol_threshold):
-                        entry = row['close']*(1+slippage_bps/10000)
-                        stop = min(row['vwap'] - 0.25*atr5.loc[idx], dfd['low'].loc[:idx].tail(3).min())
-                        if pd.isna(stop) or stop>=entry: continue
-                        rr = entry - stop
-                        target = entry + 1.5*rr
-                        # simulate forward until hit target or 15:55
-                        fwd = dfd[(dfd.index>idx) & (dfd.index.time <= dtime(15,55))]
-                        hit = fwd[fwd['high']>=target]
-                        exit_price = (target if not hit.empty else fwd['close'].iloc[-1])
-                        pnl = (exit_price - entry) - fees
-                        res.append({"ticker":t,"day":str(day),"setup":"ORB_VWAP","pnl":pnl,"R":(exit_price-entry)/rr if rr>0 else 0})
-                        used_today += 1; trades_count += 1
-                if (not go_regime_hint) and enable_snap:
-                    # RSI2 <=5 dip + reclaim
-                    prev = dfd.shift(1).loc[idx]
-                    dipped = (prev['close'] < prev['vwap']) if pd.notna(prev['vwap']) else False
-                    reclaimed = (row['close'] > row['vwap']) or (row['close']>row['ema9'] and prev['close']<=prev['ema9'])
-                    if (row['rsi2'] <= rsi2_threshold) and dipped and reclaimed:
-                        entry = row['close']*(1+slippage_bps/10000)
-                        swing_low = dfd['low'].loc[:idx].tail(3).min()
-                        stop = swing_low - 0.01
-                        target = row['vwap'] + 0.5*atr5.loc[idx]
-                        if pd.isna(stop) or pd.isna(target) or stop>=entry: continue
-                        fwd = dfd[(dfd.index>idx) & (dfd.index.time <= dtime(15,55))]
-                        hit = fwd[fwd['high']>=target]
-                        exit_price = (target if not hit.empty else fwd['close'].iloc[-1])
-                        pnl = (exit_price - entry) - fees
-                        rr = entry - stop
-                        res.append({"ticker":t,"day":str(day),"setup":"RSI2_VWAP","pnl":pnl,"R":(exit_price-entry)/rr if rr>0 else 0})
-                        used_today += 1; trades_count += 1
-    if not res:
-        return pd.DataFrame(), {"trades":0, "win%":None, "avg_pnl":None, "sum_pnl":0}
-    dfres = pd.DataFrame(res)
-    win = (dfres['pnl']>0).mean()*100
-    return dfres, {"trades":len(dfres), "win%":round(win,1), "avg_pnl":round(dfres['pnl'].mean(),2), "sum_pnl":round(dfres['pnl'].sum(),2)}
-
-bt_df, bt_stats = backtest_last_sessions(base_universe[:120], sessions=N_sessions, go_regime_hint=reg['go'], fees=fees_per_trade, slippage_bps=slip_bps, risk_pct=risk_pct, pdt_cap=max_new_trades_today)
-if not bt_df.empty:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Backtest Trades", bt_stats['trades'])
-    c2.metric("Win %", f"{formatn(bt_stats['win%'],1)}%")
-    c3.metric("Avg PnL ($)", formatn(bt_stats['avg_pnl'],2))
-    c4.metric("Total PnL ($)", formatn(bt_stats['sum_pnl'],2))
-    st.dataframe(bt_df.tail(200), use_container_width=True)
-else:
-    st.info("Backtest: no trades generated under current filters/period.")
-
-# -------------- Reference: MACD Cross (1H) --------------
-st.divider()
-with st.expander("Reference: MACD Cross Zero (1H)", expanded=False):
-    # Use the same auto-universe but cap to keep it light
-    cap_list = base_universe[:150] if base_universe else ["AAPL","MSFT","NVDA","AMD","SPY"]
-    ref_rows, filt_rows = [], []
-    CHUNK = 80
-    for i in range(0, len(cap_list), CHUNK):
-        chunk = cap_list[i:i+CHUNK]
-        try:
-            hraw = yf.download(" ".join(chunk), period="10d", interval="1h", progress=False, threads=False, group_by='ticker')
-        except Exception:
-            continue
-        if len(chunk) == 1:
-            hdict = {chunk[0]: hraw}
-        else:
-            hdict = {}
-            for t in chunk:
-                try:
-                    hdict[t] = hraw[t]
-                except Exception:
-                    continue
-        for t, h in hdict.items():
-            if h is None or h.empty or len(h) < 40:
-                continue
-            # Normalize timezone & columns
-            try:
-                if h.index.tz is None:
-                    h.index = h.index.tz_localize('UTC').tz_convert(ET_TZ)
-                else:
-                    h.index = h.index.tz_convert(ET_TZ)
-            except Exception:
-                h.index = pd.to_datetime(h.index).tz_localize('UTC').tz_convert(ET_TZ)
-            h = h.rename(columns={c: c.split(" ")[0] for c in h.columns})
-            try:
-                h = h[['Open','High','Low','Close','Volume']].rename(columns=str.lower)
-            except Exception:
-                cols = [c for c in ['Open','High','Low','Close','Volume'] if c in h.columns]
-                if len(cols) < 5:
-                    continue
-                h = h[cols].rename(columns=str.lower)
-            # Indicators
-            ema10 = h['close'].ewm(span=10, min_periods=10).mean()
-            ema20 = h['close'].ewm(span=20, min_periods=20).mean()
-            delta = h['close'].diff(); up = delta.clip(lower=0); down = -delta.clip(upper=0)
-            rsi14 = 100 - (100 / (1 + (up.rolling(14).mean() / (down.rolling(14).mean()+1e-9))))
-            ema12 = h['close'].ewm(span=12, min_periods=12).mean()
-            ema26 = h['close'].ewm(span=26, min_periods=26).mean()
-            macd = ema12 - ema26
-            macds = macd.ewm(span=9, min_periods=9).mean()
-            hist = macd - macds
-            last = pd.DataFrame({'close': h['close'], 'ema10': ema10, 'ema20': ema20,
-                                 'rsi14': rsi14, 'macd': macd, 'macds': macds, 'hist': hist}).iloc[-1]
-            # Reference row: any MACD>0 & Signal<0
-            if (last['macd'] > 0) and (last['macds'] < 0):
-                ref_rows.append({'Ticker': t,'US Time': et_now_str(),'Price': formatn(last['close']),
-                                 'RSI14': formatn(last['rsi14'],2),'MACD': formatn(last['macd'],4),
-                                 'Signal': formatn(last['macds'],4),'Hist': formatn(last['hist'],4),
-                                 'EMA10': formatn(last['ema10'],2),'EMA20': formatn(last['ema20'],2)})
-            # Filtered row: tighter criteria
-            if ((last['macd'] > 0) and (last['macds'] < 0) and (last['rsi14'] <= 60)
-                and (last['ema10'] > last['ema20']) and (last['hist'] > 0)):
-                filt_rows.append({'Ticker': t,'US Time': et_now_str(),'Price': formatn(last['close']),
-                                  'RSI14': formatn(last['rsi14'],2),'MACD': formatn(last['macd'],4),
-                                  'Signal': formatn(last['macds'],4),'Hist': formatn(last['hist'],4),
-                                  'EMA10': formatn(last['ema10'],2),'EMA20': formatn(last['ema20'],2)})
-    # Show tables
-    if filt_rows:
-        st.markdown("**⭐ MACD Cross Signals (Filtered)**")
-        st.dataframe(pd.DataFrame(filt_rows), use_container_width=True)
     else:
-        st.info("No filtered MACD cross signals for current hourly bar.")
-    st.markdown("**🕵️ Reference: MACD>0 & Signal<0 (no filters)**")
-    if ref_rows:
-        st.dataframe(pd.DataFrame(ref_rows), use_container_width=True)
-    else:
-        st.info("No reference MACD cross events found.")
+        st.caption("No signals to write for this bar.")
 
-st.caption("End of report · Auto-refresh every 5 min when supported · Universe rebuilds daily (ET)")
+st.caption("End · 1H bars · Universe rebuilt daily (ET) · NASDAQ+NYSE only · Dot→Dash symbol fix for Yahoo")
