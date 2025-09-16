@@ -1,4 +1,4 @@
-# streamlit_app.py  — Alpaca-only screener/trader (1h swing-friendly)
+# streamlit_app.py — Alpaca-only screener/trader with clearer panels and results
 
 import os
 import time
@@ -18,7 +18,7 @@ ALPACA_KEY = st.secrets.get("ALPACA_KEY") or os.getenv("ALPACA_KEY", "")
 ALPACA_SECRET = st.secrets.get("ALPACA_SECRET") or os.getenv("ALPACA_SECRET", "")
 ALPACA_BASE = st.secrets.get("ALPACA_BASE") or os.getenv("ALPACA_BASE", "https://paper-api.alpaca.markets")
 ALPACA_HEADERS = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
-ALPACA_DATA_BASE = "https://data.alpaca.markets"  # market data host
+ALPACA_DATA_BASE = "https://data.alpaca.markets"  # market data host (separate from trading host)
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -123,11 +123,21 @@ class Rules:
     rsi_max: float = 60.0
 
 def apply_rules(df: pd.DataFrame, rules: Rules) -> Dict[str, any]:
-    out = {"passes": False, "why": []}
+    # Return detailed booleans + reasons so the table is readable
+    result = {
+        "passes": False,
+        "vol_ok": False,
+        "ema_bullish": False,
+        "ema_rising": False,
+        "macd_ok": False,
+        "kdj_ok": False,
+        "rsi_ok": False,
+        "why": [],
+    }
     need = max(rules.ema_slow, rules.kdj_period, rules.macd_slow) + 5
     if df.empty or len(df) < need:
-        out["why"].append("insufficient data")
-        return out
+        result["why"].append("insufficient data")
+        return result
 
     df = df.copy()
     df["ema_fast"] = ema(df["close"], rules.ema_fast)
@@ -145,30 +155,45 @@ def apply_rules(df: pd.DataFrame, rules: Rules) -> Dict[str, any]:
 
     last, prev = df.iloc[-1], df.iloc[-2]
 
-    if last["volume"] < rules.min_volume:
-        out["why"].append(f"volume {int(last['volume'])} < {rules.min_volume}")
+    # Volume
+    result["vol_ok"] = bool(last["volume"] >= rules.min_volume)
+    if not result["vol_ok"]:
+        result["why"].append(f"volume {int(last['volume'])} < {rules.min_volume}")
 
-    if not (last["ema_fast"] > last["ema_mid"] > last["ema_slow"]):
-        out["why"].append("EMA order not bullish (fast>mid>slow)")
+    # EMA stack + rising
+    result["ema_bullish"] = bool(last["ema_fast"] > last["ema_mid"] > last["ema_slow"])
+    if not result["ema_bullish"]:
+        result["why"].append("EMA order not bullish (fast>mid>slow)")
     if rules.require_ema_rising:
-        if not (last["ema_fast"] > prev["ema_fast"] and last["ema_mid"] > prev["ema_mid"] and last["ema_slow"] > prev["ema_slow"]):
-            out["why"].append("EMAs not rising vs previous bar")
+        result["ema_rising"] = bool(last["ema_fast"] > prev["ema_fast"] and
+                                    last["ema_mid"]  > prev["ema_mid"]  and
+                                    last["ema_slow"] > prev["ema_slow"])
+        if not result["ema_rising"]:
+            result["why"].append("EMAs not rising vs previous bar")
+    else:
+        result["ema_rising"] = True
 
-    if rules.macd_hist_must_shrink_neg:
-        if not (last["macd_hist"] > prev["macd_hist"] and last["macd_hist"] < 0):
-            out["why"].append("MACD hist not negative-shrinking")
-    if rules.macd_line_gt_signal and not (last["macd_line"] > last["macd_signal"] and last["macd_line"] > prev["macd_line"]):
-        out["why"].append("MACD line not > signal & rising")
+    # MACD
+    macd_hist_shrinking_neg = (last["macd_hist"] > prev["macd_hist"] and last["macd_hist"] < 0) if rules.macd_hist_must_shrink_neg else True
+    macd_line_rising_gt_sig = (last["macd_line"] > last["macd_signal"] and last["macd_line"] > prev["macd_line"]) if rules.macd_line_gt_signal else True
+    result["macd_ok"] = bool(macd_hist_shrinking_neg and macd_line_rising_gt_sig)
+    if not result["macd_ok"]:
+        result["why"].append("MACD not in desired state")
 
-    if not (last["K"] > last["D"] and last["K"] > prev["K"] and last["D"] > prev["D"] and j.iloc[-1] > j.iloc[-2] and last["J"] < rules.kdj_j_max):
-        out["why"].append("KDJ not bullish-but-not-hot")
+    # KDJ
+    kdj_bullish_not_hot = (last["K"] > last["D"] and last["K"] > prev["K"] and last["D"] > prev["D"] and j.iloc[-1] > j.iloc[-2] and last["J"] < rules.kdj_j_max)
+    result["kdj_ok"] = bool(kdj_bullish_not_hot)
+    if not result["kdj_ok"]:
+        result["why"].append("KDJ not bullish-but-not-hot")
 
-    if not (rules.rsi_min <= last["rsi14"] <= rules.rsi_max):
-        out["why"].append(f"RSI {last['rsi14']:.1f} outside [{rules.rsi_min},{rules.rsi_max}]")
+    # RSI
+    result["rsi_ok"] = bool(rules.rsi_min <= last["rsi14"] <= rules.rsi_max)
+    if not result["rsi_ok"]:
+        result["why"].append(f"RSI {last['rsi14']:.1f} outside [{rules.rsi_min},{rules.rsi_max}]")
 
-    out["passes"] = (len(out["why"]) == 0)
-    out["last_row"] = last
-    return out
+    result["passes"] = all([result["vol_ok"], result["ema_bullish"], result["ema_rising"], result["macd_ok"], result["kdj_ok"], result["rsi_ok"]])
+    result["last_close"] = float(last["close"])
+    return result
 
 
 # =========================
@@ -208,7 +233,7 @@ st.caption("Retail-friendly swing setup (1h bars). Build: 2025-09-16")
 
 # BIG run button in main area (always visible)
 run_scan_main = st.button("🔍 Run Screener Now", type="primary")
-run_scan = run_scan_main  # single source of truth
+run_scan = run_scan_main
 
 with st.sidebar:
     st.header("Settings")
@@ -242,26 +267,53 @@ with st.sidebar:
     risk_pct = st.slider("Dollars per trade (% of equity)", 0.0, 5.0, 1.0, 0.25) / 100.0
     max_positions = st.number_input("Max concurrent positions", 1, 50, 5)
 
-# Broker panels (informational)
+# Broker panels (as metrics/tables)
 colA, colB, colC = st.columns(3)
 with colA:
     st.subheader("Account")
     if (ALPACA_KEY and ALPACA_SECRET):
         acct = alpaca_get_account()
-        st.json({k: acct.get(k) for k in ["status","cash","portfolio_value","equity","buying_power"] if k in acct})
+        if "error" in acct:
+            st.error(acct["error"])
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Status", acct.get("status", "-"))
+            c2.metric("Cash", acct.get("cash", "-"))
+            c3.metric("Equity", acct.get("equity", "-"))
+            st.caption(f"Buying power: {acct.get('buying_power','-')}")
     else:
         acct = {"status": "no-keys"}
         st.info("Add Alpaca keys to view account.")
+
 with colB:
     st.subheader("Clock")
     if (ALPACA_KEY and ALPACA_SECRET):
-        st.json(alpaca_get_clock())
+        clk = alpaca_get_clock()
+        is_open = clk.get("is_open", False)
+        next_open = clk.get("next_open", "-")
+        next_close = clk.get("next_close", "-")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Market open?", "Yes" if is_open else "No")
+        c2.metric("Next open", str(next_open))
+        c3.metric("Next close", str(next_close))
     else:
         st.info("Add Alpaca keys to view market clock.")
+
 with colC:
     st.subheader("Open Positions")
     if (ALPACA_KEY and ALPACA_SECRET):
-        st.json(alpaca_list_positions())
+        pos = alpaca_list_positions()
+        if isinstance(pos, list) and pos:
+            pos_df = pd.DataFrame([{
+                "symbol": p.get("symbol"),
+                "qty": float(p.get("qty", 0)),
+                "avg_price": float(p.get("avg_entry_price", 0)),
+                "market_value": float(p.get("market_value", 0)),
+                "unrealized_pl": float(p.get("unrealized_pl", 0)),
+            } for p in pos])
+            st.dataframe(pos_df, use_container_width=True)
+        else:
+            st.info("No open positions.")
     else:
         st.info("Add Alpaca keys to view positions.")
 
@@ -282,7 +334,7 @@ if run_scan:
         st.error("Alpaca keys missing; set ALPACA_KEY/ALPACA_SECRET/ALPACA_BASE in Secrets."); st.stop()
 
     tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-    results = []
+    results_rows = []
     buys: List[Tuple[str, float]] = []
 
     progress = st.progress(0.0)
@@ -290,17 +342,33 @@ if run_scan:
         try:
             df = get_candles_alpaca(sym, resolution=resolution, lookback_days=lookback_days)
             res = apply_rules(df, rules)
-            last_close = float(df["close"].iloc[-1]) if not df.empty else float("nan")
-            reasons = "; ".join(res.get("why", []))
-            results.append({"symbol": sym, "passes": res["passes"], "last_close": last_close, "reasons": reasons})
+            rows = {
+                "symbol": sym,
+                "passes": res["passes"],
+                "last_close": res.get("last_close", float("nan")),
+                "vol_ok": res["vol_ok"],
+                "ema_bullish": res["ema_bullish"],
+                "ema_rising": res["ema_rising"],
+                "macd_ok": res["macd_ok"],
+                "kdj_ok": res["kdj_ok"],
+                "rsi_ok": res["rsi_ok"],
+                "reasons": "; ".join(res["why"]),
+            }
+            results_rows.append(rows)
             if res["passes"]:
-                buys.append((sym, last_close))
-            time.sleep(0.12)
+                buys.append((sym, rows["last_close"]))
+            time.sleep(0.12)   # be gentle on APIs
         except Exception as e:
-            results.append({"symbol": sym, "passes": False, "last_close": float("nan"), "reasons": f"error: {e}"})
+            results_rows.append({
+                "symbol": sym, "passes": False, "last_close": float("nan"),
+                "vol_ok": False, "ema_bullish": False, "ema_rising": False,
+                "macd_ok": False, "kdj_ok": False, "rsi_ok": False,
+                "reasons": f"error: {e}"
+            })
         progress.progress(i / max(len(tickers), 1))
 
-    df_res = pd.DataFrame(results).sort_values(["passes","symbol"], ascending=[False, True])
+    df_res = pd.DataFrame(results_rows).sort_values(["passes","symbol"], ascending=[False, True])
+
     st.subheader("Scan Results")
     st.dataframe(df_res, use_container_width=True)
 
@@ -316,7 +384,7 @@ if run_scan:
     if buys:
         st.markdown("### Trade Plan")
         held = {p.get("symbol"): float(p.get("qty", 0)) for p in alpaca_list_positions()} if not scanner_only else {}
-        acct_equity = float(acct.get("equity", 0)) if isinstance(acct, dict) else 0.0
+        acct_equity = float(acct.get("equity", 0)) if 'acct' in locals() and isinstance(acct, dict) else 0.0
         open_slots = max_positions - len(held)
         planned = []
         for sym, px in buys:
