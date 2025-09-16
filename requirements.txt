@@ -1,8 +1,7 @@
 streamlit
-streamlit-autorefresh
-yfinance
+requests
 pandas
 numpy
 pytz
-gspread
-oauth2client
+pydantic
+alpaca-trade-api
