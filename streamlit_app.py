@@ -403,39 +403,39 @@ st.dataframe(df_res, use_container_width=True)
 csv_bytes = df_res.to_csv(index=False).encode("utf-8")
 st.download_button("Download results as CSV", data=csv_bytes, file_name=f"scan_results_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
 
-    # Trading logic: buy passed names until max_positions is reached; skip if already have position
-    if buys:
-        st.markdown("### Trade Plan")
-        # Determine positions held
-        held = {p.get("symbol"): float(p.get("qty", 0)) for p in alpaca_list_positions()} if (ALPACA_KEY and ALPACA_SECRET) else {}
-        acct_equity = float(acct.get("equity", 0)) if isinstance(acct, dict) else 0.0
-        open_slots = max_positions - len(held)
-        planned = []
-        for sym, px in buys:
-            if open_slots <= 0:
-                break
-            if sym in held:
-                continue
-            qty = calc_order_size(acct_equity, risk_pct, px)
-            if qty > 0:
-                planned.append({"symbol": sym, "price": px, "qty": qty})
-                open_slots -= 1
+# Trading logic: buy passed names until max_positions is reached; skip if already have position
+if buys:
+    st.markdown("### Trade Plan")
+    # Determine positions held
+    held = {p.get("symbol"): float(p.get("qty", 0)) for p in alpaca_list_positions()} if (ALPACA_KEY and ALPACA_SECRET) else {}
+    acct_equity = float(acct.get("equity", 0)) if isinstance(acct, dict) else 0.0
+    open_slots = max_positions - len(held)
+    planned = []
+    for sym, px in buys:
+        if open_slots <= 0:
+            break
+        if sym in held:
+            continue
+        qty = calc_order_size(acct_equity, risk_pct, px)
+        if qty > 0:
+            planned.append({"symbol": sym, "price": px, "qty": qty})
+            open_slots -= 1
 
-        st.json({"planned_orders": planned})
+    st.json({"planned_orders": planned})
 
-        if planned and (not scanner_only) and live_trading and (ALPACA_KEY and ALPACA_SECRET):
-            st.warning("Placing MARKET orders (PAPER)")
-            placed = []
-            for od in planned:
-                resp = alpaca_place_order(od["symbol"], od["qty"], side="buy")
-                placed.append({"symbol": od["symbol"], "qty": od["qty"], "resp": resp})
-                time.sleep(0.25)
-            st.subheader("Order Responses")
-            st.json(placed)
-        elif planned and not live_trading:
-            st.info("Trading disabled. Enable toggle to place PAPER orders.")
-        elif not planned:
-            st.info("No eligible buys after risk/slots checks.")
+    if planned and (not scanner_only) and live_trading and (ALPACA_KEY and ALPACA_SECRET):
+        st.warning("Placing MARKET orders (PAPER)")
+        placed = []
+        for od in planned:
+            resp = alpaca_place_order(od["symbol"], od["qty"], side="buy")
+            placed.append({"symbol": od["symbol"], "qty": od["qty"], "resp": resp})
+            time.sleep(0.25)
+        st.subheader("Order Responses")
+        st.json(placed)
+    elif planned and not live_trading:
+        st.info("Trading disabled. Enable toggle to place PAPER orders.")
+    elif not planned:
+        st.info("No eligible buys after risk/slots checks.")
 
 st.markdown("---")
 st.caption(f"Build finished at {utcnow_iso()} — Remember to keep this on PAPER trading while testing.")
