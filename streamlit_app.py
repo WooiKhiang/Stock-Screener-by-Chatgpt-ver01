@@ -216,4 +216,4 @@ with st.sidebar:
     min_volume = st.number_input("Min Volume (last bar)", 0, 50_000_000, 1_000_000, step=100_000)
 
     st.subheader("Risk & Trading")
-    scanner_only = st.checkbox("Scanner-only mode (no order placement)",
+    scanner_only = st.checkbox("Scanner-only mode (no order placement)", value=True)
