@@ -348,7 +348,7 @@ with colC:
     if not scanner_only and (ALPACA_KEY and ALPACA_SECRET):
         st.json(alpaca_list_positions())
     else:
-        st.info("Scanner-only: skipping positions call"))
+        st.info("Scanner-only: skipping positions call")
 
 # Build rules
 rules = Rules(
