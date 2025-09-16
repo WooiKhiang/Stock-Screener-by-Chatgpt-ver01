@@ -1,8 +1,7 @@
-# streamlit_app.py — Dynamic Universe (Yahoo-based) → Google Sheet
-# Purpose: build Top-N universe by $-flow share and write to Sheet (replace old).
+# streamlit_app.py — Dynamic Universe (Yahoo) → Google Sheet (hardcoded sheet info)
 # Sheet schema: 2 columns — "Timestamp (ET)" and "Ticker", one ticker per row.
 
-import os, json, time, re
+import os, json, re
 from datetime import datetime, timezone
 from typing import List, Dict, Tuple
 
@@ -16,55 +15,55 @@ st.set_page_config(page_title="Dynamic Tickers — Universe Builder", layout="ce
 st.title("🗂️ Dynamic Tickers — Universe Builder")
 
 # -----------------------
-# Config / Secrets
+# HARD-CODED SHEET INFO  ✅ (fast; no secrets parsing for these)
 # -----------------------
-GOOGLE_SHEET_ID = st.secrets.get("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_SHEET_ID", "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4")
-GOOGLE_SHEET_NAME = st.secrets.get("GOOGLE_SHEET_NAME") or os.getenv("GOOGLE_SHEET_NAME", "Universe")
+GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
+GOOGLE_SHEET_NAME = "Universe"
+
+# Optional: allow overrides via env/secrets (but not required)
+GOOGLE_SHEET_ID = st.secrets.get("GOOGLE_SHEET_ID", GOOGLE_SHEET_ID)
+GOOGLE_SHEET_NAME = st.secrets.get("GOOGLE_SHEET_NAME", GOOGLE_SHEET_NAME)
 
 ET_TZ = pytz.timezone("US/Eastern")
 
-# Support BOTH secret styles:
-# 1) st.secrets["gcp_service_account"] as a dict (Streamlit recommended)
-# 2) st.secrets["GCP_SERVICE_ACCOUNT"] / env as a JSON string
+def _now_et_str() -> str:
+    return datetime.now(timezone.utc).astimezone(ET_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+# -----------------------
+# Service account (credentials ONLY come from secrets/env)
+# -----------------------
 def _load_sa_dict():
-    # style 1: dict already parsed
+    # Preferred: Streamlit's structured dict secrets: [gcp_service_account]
     if "gcp_service_account" in st.secrets:
         sa = dict(st.secrets["gcp_service_account"])
-        # If private_key accidentally stored as array of lines, join
-        if isinstance(sa.get("private_key"), list):
+        if isinstance(sa.get("private_key"), list):  # if pasted as lines
             sa["private_key"] = "\n".join(sa["private_key"])
         return sa
-    # style 2: JSON string
+    # Fallback: single-line JSON in GCP_SERVICE_ACCOUNT (secrets or env)
     raw = st.secrets.get("GCP_SERVICE_ACCOUNT") or os.getenv("GCP_SERVICE_ACCOUNT")
     if not raw:
         return None
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Repair case: raw newlines inside private key
+        # Auto-repair if private_key has raw newlines
         if "-----BEGIN PRIVATE KEY-----" in raw and "\\n" not in raw:
-            block_start = raw.find("-----BEGIN PRIVATE KEY-----")
-            block_end = raw.find("-----END PRIVATE KEY-----", block_start)
-            if block_start != -1 and block_end != -1:
-                block_end += len("-----END PRIVATE KEY-----")
-                block = raw[block_start:block_end]
+            s = raw.find("-----BEGIN PRIVATE KEY-----")
+            e = raw.find("-----END PRIVATE KEY-----", s)
+            if s != -1 and e != -1:
+                e += len("-----END PRIVATE KEY-----")
+                block = raw[s:e]
                 fixed = block.replace("\r\n", "\n").replace("\n", "\\n")
                 raw = raw.replace(block, fixed)
         return json.loads(raw)
 
-def _now_et_str() -> str:
-    return datetime.now(timezone.utc).astimezone(ET_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-
-# -----------------------
-# Google Sheets (gspread)
-# -----------------------
 @st.cache_resource(show_spinner=False)
 def _gs_client():
     import gspread
     from google.oauth2.service_account import Credentials
     sa = _load_sa_dict()
     if not sa:
-        raise RuntimeError("Missing Google service account secrets. Add either `gcp_service_account` (dict) or `GCP_SERVICE_ACCOUNT` (JSON).")
+        raise RuntimeError("Missing Google credentials. Add [gcp_service_account] or GCP_SERVICE_ACCOUNT in secrets.")
     creds = Credentials.from_service_account_info(
         sa,
         scopes=["https://www.googleapis.com/auth/spreadsheets",
@@ -74,7 +73,7 @@ def _gs_client():
 
 def replace_universe_sheet(tickers: List[str]) -> Tuple[bool, str]:
     """Replace entire Universe sheet with header + rows of [Timestamp (ET), Ticker]."""
-    import gspread
+    import gspread  # lazy import to keep boot fast
     client = _gs_client()
     sh = client.open_by_key(GOOGLE_SHEET_ID)
     try:
@@ -84,18 +83,16 @@ def replace_universe_sheet(tickers: List[str]) -> Tuple[bool, str]:
 
     rows = [["Timestamp (ET)", "Ticker"]] + [[_now_et_str(), t] for t in tickers]
     ws.clear()
-    # Use batch update to minimize API calls
     ws.update("A1", rows, value_input_option="USER_ENTERED")
     return True, f"Wrote {len(tickers)} tickers."
 
 # -----------------------
-# Symbol directory (NASDAQ + NYSE)
+# Symbol directory (NASDAQ + NYSE only; funds/derivs filtered)
 # -----------------------
 NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_URL  = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 
 def _to_yahoo_symbol(sym: str) -> str:
-    # Yahoo usually uses dash class (BRK.B -> BRK-B)
     return sym.replace(".", "-").upper()
 
 @st.cache_data(ttl=60*60*6, show_spinner=False)
@@ -116,8 +113,7 @@ def download_symbol_files_qn_only(exclude_funds: bool = True, exclude_derivs: bo
     try:
         other = pd.read_csv(OTHER_URL, sep="|")
         other = other[other["ACT Symbol"].notna()]
-        # Keep NYSE only
-        other = other[other.get("Exchange", "").astype(str).str.upper().eq("N")]
+        other = other[other.get("Exchange", "").astype(str).str.upper().eq("N")]  # NYSE only
         dfn = pd.DataFrame({"symbol": other["ACT Symbol"].astype(str).str.upper().str.strip(),
                             "security_name": other.get("Security Name"),
                             "exchange": "N",
@@ -165,7 +161,6 @@ def fetch_daily(tickers: List[str], period: str = "2mo") -> Dict[str, pd.DataFra
                 continue
             sub = raw.rename(columns={c: c.split(" ")[0] for c in raw.columns})
             sub = sub[["Open","High","Low","Close","Volume"]].rename(columns=str.lower).dropna()
-            # yfinance daily index is date; treat as ET midnight (good enough for averages)
             data[chunk[0]] = sub
         else:
             for t in chunk:
@@ -317,4 +312,4 @@ if run_it:
         except Exception as e:
             st.error(f"Google Sheet write error: {e}")
 
-st.caption("Writes to Google Sheet → Universe (replaces content). Data: Yahoo Finance daily bars.")
+st.caption("Hardcoded Sheet ID/Name. Credentials stay in secrets. Data via Yahoo Finance daily bars.")
