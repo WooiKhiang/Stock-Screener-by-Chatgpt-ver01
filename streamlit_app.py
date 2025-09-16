@@ -1,4 +1,4 @@
-# streamlit_app.py — Alpaca-only screener/trader with clearer panels and results
+# streamlit_app.py — Alpaca-only screener/trader with dynamic universe (Top N by $ volume)
 
 import os
 import time
@@ -17,18 +17,20 @@ import streamlit as st
 ALPACA_KEY = st.secrets.get("ALPACA_KEY") or os.getenv("ALPACA_KEY", "")
 ALPACA_SECRET = st.secrets.get("ALPACA_SECRET") or os.getenv("ALPACA_SECRET", "")
 ALPACA_BASE = st.secrets.get("ALPACA_BASE") or os.getenv("ALPACA_BASE", "https://paper-api.alpaca.markets")
+
 ALPACA_HEADERS = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
-ALPACA_DATA_BASE = "https://data.alpaca.markets"  # market data host (separate from trading host)
+ALPACA_DATA_BASE = "https://data.alpaca.markets"  # market data host
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 # =========================
-# Universe helper
+# Universe helpers
 # =========================
 @st.cache_data(show_spinner=False)
 def default_universe() -> List[str]:
+    # small, liquid default set
     return [
         "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK.B","LLY","JPM",
         "V","XOM","AVGO","UNH","TSLA","WMT","MA","PG","COST","JNJ",
@@ -37,13 +39,101 @@ def default_universe() -> List[str]:
         "INTU","TXN","DIS","NKE","PM","IBM","RTX","ISRG","UPS","CAT"
     ]
 
-
-# =========================
-# Alpaca Market Data (v2)
-# =========================
 def _alpaca_tf(resolution: str) -> str:
     return {"5":"5Min","15":"15Min","30":"30Min","60":"1Hour","D":"1Day"}.get(resolution, "1Hour")
 
+@st.cache_data(show_spinner=True)
+def list_active_us_equities(limit_to:int=1500, require_tradable:bool=True, require_etb:bool=False) -> List[str]:
+    """
+    Pull active US equities from Alpaca /v2/assets and return a symbol list.
+    limit_to: take first N to keep things snappy (the list can be large).
+    """
+    params = {"status": "active", "asset_class": "us_equity"}
+    r = requests.get(f"{ALPACA_BASE}/v2/assets", headers=ALPACA_HEADERS, params=params, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Assets error {r.status_code}: {r.text}")
+    assets = r.json()
+    syms = []
+    for a in assets:
+        if require_tradable and not a.get("tradable", False):
+            continue
+        if require_etb and not a.get("easy_to_borrow", False):
+            continue
+        sym = a.get("symbol")
+        if sym and "." not in sym:  # skip weird share classes like BRK.A (Alpaca uses BRK.A/BRK.B, keep .B only)
+            syms.append(sym)
+        elif sym and sym.endswith(".B"):
+            syms.append(sym)
+        if len(syms) >= limit_to:
+            break
+    return syms
+
+def _chunk(lst: List[str], size: int) -> List[List[str]]:
+    for i in range(0, len(lst), size):
+        yield lst[i:i+size]
+
+@st.cache_data(show_spinner=True)
+def top_n_by_dollar_volume(n:int=100, min_price:float=5.0, start_days:int=5, use_intraday:bool=False) -> List[str]:
+    """
+    Rank symbols by dollar volume using recent bars and return the Top N.
+    - If use_intraday=True: 1Hour bars over last 3 days (fresher, but more API work).
+    - Else: last 5 x 1Day bars (fast + stable).
+    """
+    symbols = list_active_us_equities()
+    if not symbols:
+        return []
+
+    tf = "1Hour" if use_intraday else "1Day"
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=(3 if use_intraday else start_days))
+
+    # Alpaca batch bars: up to ~200 symbols per request
+    ranked: List[Tuple[str, float]] = []
+    for batch in _chunk(symbols, 200):
+        params = {
+            "timeframe": tf,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "limit": 1000,
+            "feed": "iex",
+            "adjustment": "all",
+            "symbols": ",".join(batch),
+        }
+        r = requests.get(f"{ALPACA_DATA_BASE}/v2/stocks/bars", headers=ALPACA_HEADERS, params=params, timeout=40)
+        if r.status_code != 200:
+            # Skip the batch but keep going
+            continue
+        payload = r.json()  # {"bars": {"AAPL":[...], "MSFT":[...]}, "next_page_token":...}
+        bars_by_sym = payload.get("bars", {})
+        for sym, bars in bars_by_sym.items():
+            if not bars:
+                continue
+            df = pd.DataFrame(bars)
+            df["t"] = pd.to_datetime(df["t"], utc=True)
+            df = df.sort_values("t")
+            # filters
+            if "c" not in df or "v" not in df:
+                continue
+            # average of close*volume over period (dollar volume)
+            adv = float((df["c"] * df["v"]).mean())
+            last_price = float(df["c"].iloc[-1])
+            if last_price >= min_price:
+                ranked.append((sym, adv))
+
+        # be polite to API
+        time.sleep(0.25)
+
+        if len(ranked) > 6000:  # safety cap to keep compute light
+            break
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    top_syms = [s for s, _ in ranked[:n]]
+    return top_syms
+
+
+# =========================
+# Market data (bars)
+# =========================
 def get_candles_alpaca(symbol: str, resolution: str = "60", lookback_days: int = 60) -> pd.DataFrame:
     if not (ALPACA_KEY and ALPACA_SECRET):
         raise RuntimeError("Alpaca keys missing; cannot fetch Alpaca data.")
@@ -56,7 +146,7 @@ def get_candles_alpaca(symbol: str, resolution: str = "60", lookback_days: int =
         "start": start.isoformat(),
         "end": end.isoformat(),
         "limit": 10000,
-        "feed": "iex",          # free on paper accounts
+        "feed": "iex",
         "adjustment": "all",
     }
     r = requests.get(url, headers=ALPACA_HEADERS, params=params, timeout=20)
@@ -123,7 +213,6 @@ class Rules:
     rsi_max: float = 60.0
 
 def apply_rules(df: pd.DataFrame, rules: Rules) -> Dict[str, any]:
-    # Return detailed booleans + reasons so the table is readable
     result = {
         "passes": False,
         "vol_ok": False,
@@ -229,19 +318,45 @@ def calc_order_size(equity: float, risk_pct: float, price: float) -> int:
 # =========================
 st.set_page_config(page_title="Auto Screener + Trader (Alpaca)", layout="wide")
 st.title("⚡ Auto Screener + Trader — Alpaca only")
-st.caption("Retail-friendly swing setup (1h bars). Build: 2025-09-16")
+st.caption("Retail-friendly swing setup (1h bars) • Dynamic universe supported • Build: 2025-09-16")
 
 # BIG run button in main area (always visible)
 run_scan_main = st.button("🔍 Run Screener Now", type="primary")
 run_scan = run_scan_main
 
 with st.sidebar:
-    st.header("Settings")
-    tickers_input = st.text_area("Universe (comma-separated)", ",".join(default_universe()), height=120)
+    st.header("Universe")
+    # Source selector
+    universe_source = st.selectbox("Universe source", ["Static list", "Top N by $ volume (recent)"], index=0)
+    if "universe_cache" not in st.session_state:
+        st.session_state.universe_cache = ",".join(default_universe())
+
+    if universe_source == "Static list":
+        tickers_input = st.text_area("Universe (comma-separated)", st.session_state.universe_cache, height=120)
+        st.session_state.universe_cache = tickers_input
+    else:
+        n_top = st.slider("Top N (by dollar volume)", 20, 300, 100, step=10)
+        min_px = st.number_input("Min last price ($)", 0.0, 1000.0, 5.0)
+        intraday_rank = st.checkbox("Use intraday bars (1h) for ranking (slower)", value=False,
+                                    help="If off, uses last ~5 daily bars (faster).")
+        if st.button("⚡ Load dynamic universe"):
+            with st.spinner("Building universe from Alpaca…"):
+                try:
+                    syms = top_n_by_dollar_volume(n=n_top, min_price=min_px, use_intraday=intraday_rank)
+                    if syms:
+                        st.session_state.universe_cache = ",".join(syms)
+                        st.success(f"Loaded {len(syms)} symbols.")
+                    else:
+                        st.warning("No symbols returned. Try different filters.")
+                except Exception as e:
+                    st.error(str(e))
+        tickers_input = st.text_area("Universe (comma-separated)", st.session_state.universe_cache, height=120)
+
+    st.header("Bars & Lookback")
     resolution = st.selectbox("Bar timeframe", ["60","30","15","5","D"], index=0)
     lookback_days = st.slider("Lookback days", 20, 180, 60)
 
-    st.subheader("Rules")
+    st.header("Rules")
     ema_fast = st.number_input("EMA fast", 3, 50, 5)
     ema_mid  = st.number_input("EMA mid", 5, 100, 20)
     ema_slow = st.number_input("EMA slow", 10, 200, 50)
@@ -260,7 +375,7 @@ with st.sidebar:
 
     min_volume = st.number_input("Min Volume (last bar)", 0, 50_000_000, 1_000_000, step=100_000)
 
-    st.subheader("Risk & Trading")
+    st.header("Risk & Trading")
     scanner_only = st.checkbox("Scanner-only mode (no order placement)", value=True)
     place_orders_checkbox = st.checkbox("Enable ORDER placement (Alpaca PAPER)", value=False, disabled=scanner_only)
     live_trading = bool(place_orders_checkbox) and (not scanner_only)
@@ -333,7 +448,7 @@ if run_scan:
     if not (ALPACA_KEY and ALPACA_SECRET):
         st.error("Alpaca keys missing; set ALPACA_KEY/ALPACA_SECRET/ALPACA_BASE in Secrets."); st.stop()
 
-    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    tickers = [t.strip().upper() for t in st.session_state.universe_cache.split(",") if t.strip()]
     results_rows = []
     buys: List[Tuple[str, float]] = []
 
@@ -357,7 +472,7 @@ if run_scan:
             results_rows.append(rows)
             if res["passes"]:
                 buys.append((sym, rows["last_close"]))
-            time.sleep(0.12)   # be gentle on APIs
+            time.sleep(0.12)
         except Exception as e:
             results_rows.append({
                 "symbol": sym, "passes": False, "last_close": float("nan"),
@@ -384,14 +499,15 @@ if run_scan:
     if buys:
         st.markdown("### Trade Plan")
         held = {p.get("symbol"): float(p.get("qty", 0)) for p in alpaca_list_positions()} if not scanner_only else {}
-        acct_equity = float(acct.get("equity", 0)) if 'acct' in locals() and isinstance(acct, dict) else 0.0
+        acct_equity = 0.0
+        if 'acct' in locals() and isinstance(acct, dict):
+            try: acct_equity = float(acct.get("equity", 0))
+            except: acct_equity = 0.0
         open_slots = max_positions - len(held)
         planned = []
         for sym, px in buys:
-            if open_slots <= 0:
-                break
-            if sym in held:
-                continue
+            if open_slots <= 0: break
+            if sym in held: continue
             qty = calc_order_size(acct_equity, risk_pct, px)
             if qty > 0:
                 planned.append({"symbol": sym, "price": px, "qty": qty})
@@ -413,7 +529,7 @@ if run_scan:
         elif not planned:
             st.info("No eligible buys after risk/slots checks.")
 else:
-    st.info("Click **Run Screener Now** to scan your universe.")
+    st.info("Pick your universe (static or dynamic) and click **Run Screener Now**.")
 
 st.markdown("---")
 st.caption(f"Build finished at {utcnow_iso()} — PAPER mode recommended while testing.")
