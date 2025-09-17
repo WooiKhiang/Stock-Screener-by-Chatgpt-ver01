@@ -1,16 +1,17 @@
 # streamlit_app.py — Alpaca-only SCREEN • Universe from Google Sheet • Ranked + Push back to Sheet
 import os
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-# === New: Google Sheets ===
+# === Google Sheets ===
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -35,35 +36,83 @@ def _alpaca_tf(resolution: str) -> str:
     return {"5":"5Min","15":"15Min","30":"30Min","60":"1Hour","D":"1Day"}.get(resolution, "1Hour")
 
 # =========================
-# Google Sheets helpers
+# Google Sheets helpers (hardened)
 # =========================
+def _normalize_service_account_info(info_obj):
+    """
+    Accepts either a dict or JSON string. Normalizes private_key newlines.
+    Raises a descriptive RuntimeError on common formatting problems.
+    """
+    # Convert JSON string to dict if needed
+    if isinstance(info_obj, str):
+        try:
+            info = json.loads(info_obj)
+        except Exception as e:
+            raise RuntimeError(f"Service account JSON is not valid JSON. ({e})")
+    else:
+        info = dict(info_obj)  # shallow copy
+
+    if "private_key" not in info or not info["private_key"]:
+        raise RuntimeError("Service account is missing 'private_key'.")
+
+    pk = info["private_key"]
+
+    # If the key contains literal backslash-n (\\n), convert to real newlines
+    if "\\n" in pk and "\n" not in pk:
+        pk = pk.replace("\\n", "\n")
+
+    # Ensure it has proper header/footer and trailing newline
+    if "BEGIN PRIVATE KEY" not in pk or "END PRIVATE KEY" not in pk:
+        raise RuntimeError(
+            "private_key appears truncated or missing BEGIN/END lines. "
+            "Please copy it exactly from Google Cloud without extra escaping."
+        )
+    if not pk.endswith("\n"):
+        pk += "\n"
+
+    info["private_key"] = pk
+    return info
+
 def _get_gspread_client():
     """
-    Expects a service account JSON in st.secrets["gcp_service_account"] (recommended)
-    or environment variable GOOGLE_APPLICATION_CREDENTIALS_JSON (fallback).
+    Expects service account in either:
+      - st.secrets['gcp_service_account'] (preferred; dict-like section in secrets.toml)
+      - env var GOOGLE_APPLICATION_CREDENTIALS_JSON (full JSON string)
+    Normalizes newlines and builds Credentials.
     """
-    info = st.secrets.get("gcp_service_account")
-    if not info:
-        # Optional fallback to env JSON string (not recommended, but useful locally)
-        env_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
-        if not env_json:
-            raise RuntimeError("Missing gcp_service_account in secrets (or GOOGLE_APPLICATION_CREDENTIALS_JSON env).")
-        import json
-        info = json.loads(env_json)
+    raw = st.secrets.get("gcp_service_account")
+    if not raw:
+        raw = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
+        if not raw:
+            raise RuntimeError(
+                "Missing Google credentials. Add [gcp_service_account] in .streamlit/secrets.toml "
+                "or set GOOGLE_APPLICATION_CREDENTIALS_JSON env var."
+            )
+
+    info = _normalize_service_account_info(raw)
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    credentials = Credentials.from_service_account_info(info, scopes=scopes)
-    gc = gspread.authorize(credentials)
+    try:
+        credentials = Credentials.from_service_account_info(info, scopes=scopes)
+        gc = gspread.authorize(credentials)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to build Google credentials. Root cause: {e}\n"
+            "Fix tips:\n"
+            "- Ensure secrets.toml uses escaped newlines: private_key = \"-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n\"\n"
+            "- Or paste exact JSON into GOOGLE_APPLICATION_CREDENTIALS_JSON env var.\n"
+            "- Share the Sheet with the service account email."
+        )
     return gc
 
 @st.cache_data(show_spinner=False)
 def load_universe_from_sheet(sheet_id: str, tab_name: str) -> List[str]:
     """
-    Reads the universe tickers from the given Google Sheet tab.
-    Accepts either a single column or a grid; collects all non-empty cells as tickers.
+    Reads tickers from the given Google Sheet tab.
+    Collects all non-empty cells, uppercases, filters to ASCII+[-._].
     """
     gc = _get_gspread_client()
     ws = gc.open_by_key(sheet_id).worksheet(tab_name)
@@ -73,12 +122,10 @@ def load_universe_from_sheet(sheet_id: str, tab_name: str) -> List[str]:
         for cell in row:
             sym = cell.strip().upper()
             if sym and sym.isascii():
-                # Filter obviously invalids; keep A–Z, digits, ., - (for U.S. tickers)
                 if all(ch.isalnum() or ch in (".", "-", "_") for ch in sym):
                     tickers.append(sym)
-    # De-dup, keep order
-    seen = set()
-    uniq = []
+    # Deduplicate preserving order
+    seen, uniq = set(), []
     for t in tickers:
         if t not in seen:
             uniq.append(t); seen.add(t)
@@ -93,22 +140,19 @@ def write_results_to_sheet(sheet_id: str, tab_name: str, df: pd.DataFrame):
     sh = gc.open_by_key(sheet_id)
     try:
         ws = sh.worksheet(tab_name)
-        # clear before update to avoid leftover rows
         ws.clear()
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=tab_name, rows=str(len(df) + 10), cols=str(len(df.columns) + 5))
 
-    # Add timestamp col A
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     df_out = df.copy()
     df_out.insert(0, "timestamp", timestamp)
 
-    # gspread expects list of lists
     sheet_values = [list(df_out.columns)] + df_out.astype(object).where(pd.notnull(df_out), "").values.tolist()
     ws.update("A1", sheet_values, value_input_option="RAW")
 
 # =========================
-# Market data (bars)
+# Alpaca market data (bars)
 # =========================
 def get_candles_alpaca(symbol: str, resolution: str = "60", lookback_days: int = 60) -> pd.DataFrame:
     if not (ALPACA_KEY and ALPACA_SECRET):
@@ -138,7 +182,7 @@ def get_candles_alpaca(symbol: str, resolution: str = "60", lookback_days: int =
     return df.set_index("t").sort_index()
 
 # =========================
-# Indicators & rules (unchanged core logic)
+# Indicators & rules (same as before)
 # =========================
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
@@ -245,7 +289,7 @@ def apply_rules(df: pd.DataFrame, rules: Rules) -> Dict[str, any]:
         result["why"].append("MACD not in desired state")
 
     # KDJ
-    kdj_bullish_not_hot = (last["K"] > last["D"] and last["K"] > prev["K"] and last["D"] > prev["D"] and j.iloc[-1] > j.iloc[-2] and last["J"] < rules.kdj_j_max)
+    kdj_bullish_not_hot = (last["K"] > last["D"] and last["K"] > prev["K"] and last["D"] > prev["D"] and (3*last["K"]-2*last["D"]) > (3*prev["K"]-2*prev["D"]) and last["J"] < rules.kdj_j_max)
     result["kdj_ok"] = bool(kdj_bullish_not_hot)
     if not result["kdj_ok"]:
         result["why"].append("KDJ not bullish-but-not-hot")
@@ -263,38 +307,23 @@ def apply_rules(df: pd.DataFrame, rules: Rules) -> Dict[str, any]:
     result["volume"] = int(last["volume"])
     return result
 
-# === Simple confidence scoring ===
 def confidence_score(res: Dict[str, any], rules: Rules) -> float:
-    """
-    Transparent, reproducible score:
-    - Base (binary) points:
-      vol_ok=1, ema_bullish=2, ema_rising=1, macd_ok=2, kdj_ok=2, rsi_ok=1  => max 9
-    - Tie-break continuous bonuses (each up to ~1):
-      + RSI centered: 1 - min(|RSI-50|, 50)/50  (0..1)
-      + MACD hist improving: sigmoid on macd_hist_delta
-      + Headroom before J hits cap: (kdj_j_max - J)/kdj_j_max  clipped [0..1]
-    Total nominal range ≈ 9..12 (we keep it around 0..12).
-    """
     base = (1*res["vol_ok"] + 2*res["ema_bullish"] + 1*res["ema_rising"] +
             2*res["macd_ok"] + 2*res["kdj_ok"] + 1*res["rsi_ok"])
-
     rsi = res.get("last_rsi", 50.0)
-    rsi_bonus = 1.0 - min(abs(rsi - 50.0), 50.0)/50.0  # 0..1, best at 50
-
+    rsi_bonus = 1.0 - min(abs(rsi - 50.0), 50.0)/50.0  # 0..1
     delta = res.get("macd_hist_delta", 0.0)
-    macd_bonus = 1.0/(1.0 + np.exp(-10.0*delta))  # logistic, ~0..1
-
+    macd_bonus = 1.0/(1.0 + np.exp(-10.0*delta))       # 0..1
     j = res.get("last_j", rules.kdj_j_max)
-    j_bonus = max(0.0, min(1.0, (rules.kdj_j_max - j)/rules.kdj_j_max))  # more headroom => better
-
+    j_bonus = max(0.0, min(1.0, (rules.kdj_j_max - j)/rules.kdj_j_max))
     return float(base + 0.6*rsi_bonus + 0.3*macd_bonus + 0.1*j_bonus)
 
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="Screener — Universe from Google Sheet", layout="wide")
+st.set_page_config(page_title="Screener — Google Sheet Universe", layout="wide")
 st.title("📈 Screener — Google Sheet Universe (Alpaca data)")
-st.caption("This branch reads tickers from Google Sheets → applies EMA/MACD/KDJ/RSI+Volume → ranks by confidence → writes results back to Sheets.")
+st.caption("Reads tickers from Google Sheets → applies EMA/MACD/KDJ/RSI+Volume → ranks by confidence → writes results back to Sheets.")
 
 with st.sidebar:
     st.header("Bars & Lookback")
@@ -333,7 +362,6 @@ st.markdown("""
 - **RSI(14)**: within **[RSI min, RSI max]** (default **40–60**)
 """)
 
-# Build rules object
 rules = Rules(
     ema_fast=ema_fast, ema_mid=ema_mid, ema_slow=ema_slow, require_ema_rising=require_rising,
     macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal,
@@ -345,7 +373,27 @@ rules = Rules(
 st.markdown("---")
 
 if run_scan:
-    # Preconditions
+    # Quick diagnostics to help with auth issues
+    with st.expander("Diagnostics (auth)"):
+        svc = st.secrets.get("gcp_service_account")
+        email = None
+        try:
+            if svc:
+                if isinstance(svc, str):
+                    svc_obj = json.loads(svc)
+                else:
+                    svc_obj = dict(svc)
+                email = svc_obj.get("client_email")
+            else:
+                env_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
+                if env_json:
+                    svc_obj = json.loads(env_json)
+                    email = svc_obj.get("client_email")
+            st.write({"service_account_email": email or "(not found)"})
+            st.caption("Make sure this email has at least Viewer access to the Sheet.")
+        except Exception as e:
+            st.write({"diagnostic_error": str(e)})
+
     if not (ALPACA_KEY and ALPACA_SECRET):
         st.error("Alpaca keys missing; set ALPACA_KEY/ALPACA_SECRET/ALPACA_BASE in Secrets."); st.stop()
 
@@ -392,13 +440,11 @@ if run_scan:
             progress.progress(i / max(len(tickers), 1))
 
         df_res = pd.DataFrame(results_rows)
-        # Sort: passes desc, confidence desc, then symbol asc
         df_res = df_res.sort_values(by=["passes", "confidence", "symbol"], ascending=[False, False, True]).reset_index(drop=True)
 
         st.subheader("Ranked Results (highest confidence first)")
         st.dataframe(df_res, use_container_width=True)
 
-        # CSV download
         csv_bytes = df_res.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download results as CSV",
@@ -407,7 +453,6 @@ if run_scan:
             mime="text/csv",
         )
 
-        # Push to Google Sheet (overwrite)
         with st.spinner("Writing results to Google Sheet…"):
             write_results_to_sheet(GOOGLE_SHEET_ID, RESULT_SHEET_NAME, df_res)
         st.success(f"Results written to sheet '{RESULT_SHEET_NAME}' with timestamp.")
