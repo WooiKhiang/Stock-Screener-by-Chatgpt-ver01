@@ -1,14 +1,7 @@
-# core
 streamlit==1.37.0
-
-# data stack (py311 wheels available; fast builds)
 pandas==2.2.2
 numpy==1.26.4
-pytz==2024.1
-
-# market data
 yfinance==0.2.40
-
-# google sheets
+pytz==2024.1
 gspread==6.1.2
 google-auth==2.33.0
