@@ -1,7 +1,7 @@
-streamlit==1.37.0
-pandas==2.2.2
-numpy==1.26.4
-requests==2.32.3
-pytz==2024.1
-gspread==6.1.2
-google-auth==2.33.0
+streamlit
+pandas
+numpy
+requests
+pytz
+gspread
+google-auth
