@@ -1,5 +1,5 @@
-# streamlit_app.py — Alpaca scan → rank → write to Google Sheets → display latest
-import os, io, json, datetime as dt
+# streamlit_app.py — Alpaca scan → rank → write to Google Sheets (VERTICAL) → display latest
+import os, json, datetime as dt
 import numpy as np
 import pandas as pd
 import requests
@@ -16,9 +16,9 @@ ALPACA_KEY    = "PKIG445MPT704CN8P0R8"
 ALPACA_SECRET = "3GQdWcnbMo6V8uvhVa6BK6EbvnH4EHinlsU6uvj4"
 ALPACA_BASE   = "https://paper-api.alpaca.markets/v2"   # assets endpoint
 ALPACA_DATA   = "https://data.alpaca.markets"           # data endpoint
-FEED          = "iex"  # REQUIRED for paper keys / free tier
+FEED          = "iex"  # REQUIRED for paper/free keys
 
-# Service account JSON now comes from Streamlit secrets or env
+# Service account JSON from Streamlit secrets or env (DO NOT hard-code in repo)
 SA_RAW = st.secrets.get("GCP_SERVICE_ACCOUNT") or os.getenv("GCP_SERVICE_ACCOUNT")
 
 # =========================
@@ -56,7 +56,6 @@ def ema(series, span):
     return series.ewm(span=span, adjust=False).mean()
 
 def parse_sa(raw_json: str) -> dict:
-    """Accepts either valid JSON with '\\n' escapes or JSON with literal newlines in private_key."""
     if not raw_json:
         raise RuntimeError("Missing GCP service account JSON in secrets/env (GCP_SERVICE_ACCOUNT).")
     try:
@@ -110,7 +109,7 @@ def fetch_daily_bars_multi(symbols, start_iso, end_iso, timeframe="1Day", limit=
             "end": end_iso,
             "limit": limit,
             "adjustment": "raw",
-            "feed": FEED,
+            "feed": "iex",
         }
         page = None
         while True:
@@ -147,7 +146,6 @@ def fetch_daily_bars_multi(symbols, start_iso, end_iso, timeframe="1Day", limit=
             if not page:
                 break
 
-    # tidy
     for s, df in list(result.items()):
         df = df.drop_duplicates(subset=["t"]).sort_values("t").reset_index(drop=True)
         result[s] = df
@@ -177,8 +175,7 @@ def screen_and_rank(symbols, price_min, price_max, win_d=5, noise=True):
             continue
 
         ema20 = ema(close, 20).iloc[-1]
-        # Gentle momentum
-        if not ((last >= prev) or (last >= ema20)):
+        if not ((last >= prev) or (last >= ema20)):  # Gentle momentum
             continue
 
         cl = close.tail(win_d)
@@ -196,19 +193,17 @@ def screen_and_rank(symbols, price_min, price_max, win_d=5, noise=True):
     df = pd.DataFrame(rows, columns=["symbol", "avg_flow", "avg_vol"])
 
     if noise and len(df) > 50:
-        # Exclude top ~1.5% by avg volume to reduce mega-liquids
-        cutoff = np.percentile(df["avg_vol"], 98.5)
+        cutoff = np.percentile(df["avg_vol"], 98.5)  # exclude ~top 1.5% by volume
         df = df[df["avg_vol"] < cutoff]
 
     pool = df["avg_flow"].sum()
     df["flow_share"] = df["avg_flow"] / pool if pool > 0 else 0.0
-    df = df.sort_values("flow_share", ascending=False).reset_index(drop=True)
-    return df
+    return df.sort_values("flow_share", ascending=False).reset_index(drop=True)
 
 # ======================
-# Sheet writer / reader
+# Sheet writer / reader (VERTICAL layout)
 # ======================
-def write_to_sheet(tickers, params):
+def write_to_sheet_vertical(tickers, params):
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -222,10 +217,18 @@ def write_to_sheet(tickers, params):
     )
     gc = gspread.authorize(creds)
     ws = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
-    ts = now_et_str()
-    ws.append_row([ts, ", ".join(tickers), json.dumps(params)], value_input_option="RAW")
 
-def read_latest_from_sheet():
+    ts = now_et_str()
+    rows = [[ts, t] for t in tickers]  # A: timestamp, B: ticker (one per row)
+
+    # Batch-append for speed; fallback to per-row if needed
+    try:
+        ws.append_rows(rows, value_input_option="RAW")
+    except Exception:
+        for r in rows:
+            ws.append_row(r, value_input_option="RAW")
+
+def read_latest_from_sheet_vertical():
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -239,20 +242,22 @@ def read_latest_from_sheet():
     )
     gc = gspread.authorize(creds)
     ws = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(GOOGLE_SHEET_NAME)
-    rows = ws.get("A:C")
-    ts, csv_line = None, ""
-    for r in reversed(rows):
-        if len(r) >= 2 and r[1].strip() and r[1].strip().upper() != "TICKER":
-            ts = r[0].strip() if r[0].strip() else None
-            csv_line = r[1].strip()
-            break
-    tickers = [t.strip().upper() for t in csv_line.split(",") if t.strip()]
-    return ts, tickers
+
+    rows = ws.get("A:B")
+    # Filter out headers/blank lines
+    data = [r for r in rows if len(r) >= 2 and r[0].strip() and r[1].strip() and r[0].strip().upper() not in ("TIMESTAMP","TIME","TS")]
+    if not data:
+        return None, []
+
+    # Most recent timestamp is in the last non-empty row's A
+    last_ts = data[-1][0].strip()
+    tickers = [r[1].strip().upper() for r in data if r[0].strip() == last_ts]
+    return last_ts, tickers
 
 # ======================
 # Actions
 # ======================
-if st.button("Run scan now (fetch from Alpaca, rank, write to Sheet)"):
+if st.button("Run scan now (fetch from Alpaca, rank, write vertical to Sheet)"):
     try:
         with st.spinner("Fetching symbols from Alpaca…"):
             symbols = fetch_active_symbols()
@@ -270,17 +275,10 @@ if st.button("Run scan now (fetch from Alpaca, rank, write to Sheet)"):
         if ranked.empty:
             st.error("No candidates matched the rules.")
         else:
-            top = ranked.head(int(TOP_N)).copy()
-            tickers = top["symbol"].tolist()
-
+            tickers = ranked.head(int(TOP_N))["symbol"].tolist()
             st.success(f"Selected **{len(tickers)}** tickers.")
             st.code(", ".join(tickers[:100]), language="text")
-            st.download_button(
-                "Download tickers (CSV row)",
-                data=",".join(tickers),
-                file_name="tickers.csv",
-                mime="text/csv",
-            )
+            st.download_button("Download tickers (CSV row)", data=",".join(tickers), file_name="tickers.csv", mime="text/csv")
 
             params = {
                 "TOP_N": int(TOP_N),
@@ -288,31 +286,27 @@ if st.button("Run scan now (fetch from Alpaca, rank, write to Sheet)"):
                 "PRICE_MAX": float(PRICE_MAX),
                 "RANKING_WINDOW_D": int(RANKING_WINDOW_D),
                 "NOISE_CONTROL": bool(NOISE),
+                "LAYOUT": "vertical",
             }
-            with st.spinner("Appending to Google Sheet…"):
-                write_to_sheet(tickers, params)
-            st.info(f"Appended to sheet `{GOOGLE_SHEET_NAME}` in doc `{GOOGLE_SHEET_ID}` at {now_et_str()} ET.")
+            with st.spinner("Appending vertical rows to Google Sheet…"):
+                write_to_sheet_vertical(tickers, params)
+            st.info(f"Wrote {len(tickers)} rows to `{GOOGLE_SHEET_NAME}` at {now_et_str()} ET.")
 
     except requests.HTTPError as e:
         st.error(str(e))
     except Exception as e:
         st.error(f"Scan failed: {e}")
 
-# Always show latest row from the Sheet
-st.markdown("### Latest Universe (from Google Sheet)")
+# Always show latest run (vertical)
+st.markdown("### Latest Universe (from Google Sheet — vertical)")
 try:
-    ts, tickers = read_latest_from_sheet()
+    ts, tickers = read_latest_from_sheet_vertical()
     st.write(f"**Last run (ET):** {ts or '—'}")
     st.write(f"**Tickers selected:** {len(tickers)}")
     if tickers:
         st.code(", ".join(tickers[:100]), language="text")
-        st.download_button(
-            "Download tickers (CSV row, latest)",
-            data=",".join(tickers),
-            file_name="tickers_latest.csv",
-            mime="text/csv",
-        )
+        st.download_button("Download tickers (CSV row, latest)", data=",".join(tickers), file_name="tickers_latest.csv", mime="text/csv")
 except Exception as e:
     st.warning(f"Could not read back from Sheet yet: {e}")
 
-st.caption("This page builds the Top-N candidates from Alpaca, appends a timestamped row to Google Sheets, and shows the latest result.")
+st.caption("Writes one row per ticker: Column A = timestamp (ET), Column B = ticker. Reader aggregates the most recent timestamp’s block.")
