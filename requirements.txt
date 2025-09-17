@@ -1,5 +1,6 @@
-streamlit==1.38.0
+streamlit
 requests
 pandas
 numpy
-pydantic
+gspread
+google-auth
