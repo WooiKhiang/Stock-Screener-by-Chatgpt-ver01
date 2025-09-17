@@ -1,7 +1,7 @@
-# streamlit_app.py — Dynamic Universe (Yahoo) → Google Sheet (self-healing yfinance)
-# Replaces Google Sheet "Universe" with two columns: [Timestamp (ET), Ticker]
+# streamlit_app.py — Dynamic Universe (scan-on-click; fast boot)
+# Writes 2 columns to Google Sheet "Universe": [Timestamp (ET), Ticker]
 
-import os, json, re, time, sys, subprocess
+import os, json, re, time
 from datetime import datetime, timezone
 from typing import List, Dict, Tuple
 
@@ -10,30 +10,14 @@ import pandas as pd
 import pytz
 import streamlit as st
 
+# ----------------------------------------
+# Fast page load: no heavy imports here.
+# ----------------------------------------
+
 st.set_page_config(page_title="Dynamic Tickers — Universe Builder", layout="centered")
 st.title("🗂️ Dynamic Tickers — Universe Builder")
 
-# --- Ensure yfinance is available (self-healing) ------------------------------
-def _ensure_pkg(import_name: str, pip_name: str, version: str | None = None):
-    try:
-        return __import__(import_name)
-    except ModuleNotFoundError:
-        with st.spinner(f"Installing {pip_name}{'=='+version if version else ''} …"):
-            cmd = [sys.executable, "-m", "pip", "install", f"{pip_name}=={version}" if version else pip_name]
-            subprocess.check_call(cmd)
-        return __import__(import_name)
-
-yf = None
-try:
-    import yfinance as _yf  # try normal import first
-    yf = _yf
-except ModuleNotFoundError:
-    # Fallback: install a known-good version that has wheels for py311
-    yf = _ensure_pkg("yfinance", "yfinance", "0.2.40")
-
-# -----------------------
-# Hardcoded Sheet info  ✅ (fast). Only credentials live in secrets.
-# -----------------------
+# --- Sheet config (hardcoded for speed; creds still via secrets)
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "Universe"
 GOOGLE_SHEET_ID = st.secrets.get("GOOGLE_SHEET_ID", GOOGLE_SHEET_ID)
@@ -43,35 +27,52 @@ ET_TZ = pytz.timezone("US/Eastern")
 def now_et_str() -> str:
     return datetime.now(timezone.utc).astimezone(ET_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# -----------------------
-# Google auth (lazy import on write)
-# -----------------------
-def load_sa_dict():
+# --- Tiny helpers (no heavy deps)
+NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+OTHER_URL  = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+
+def to_yahoo_symbol(sym: str) -> str:
+    return sym.replace(".", "-").upper()
+
+def require_yfinance():
+    # Import yfinance only when scanning is requested
+    try:
+        import yfinance as yf  # noqa
+        return yf
+    except Exception:
+        st.error("`yfinance` is not installed. Ensure your branch has a `requirements.txt` at repo root with `yfinance==0.2.40`, then redeploy.")
+        return None
+
+def require_gspread_client():
+    # Import google libs only when writing is requested
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except Exception:
+        st.error("Google libs missing. Ensure `gspread==6.1.2` and `google-auth==2.33.0` are in requirements.txt, then redeploy.")
+        return None, None
+
+    # Load service account from secrets (dict or one-line JSON)
     if "gcp_service_account" in st.secrets:
         sa = dict(st.secrets["gcp_service_account"])
         if isinstance(sa.get("private_key"), list):
             sa["private_key"] = "\n".join(sa["private_key"])
-        return sa
-    raw = st.secrets.get("GCP_SERVICE_ACCOUNT") or os.getenv("GCP_SERVICE_ACCOUNT")
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        if "-----BEGIN PRIVATE KEY-----" in raw and "\\n" not in raw:
-            s = raw.find("-----BEGIN PRIVATE KEY-----"); e = raw.find("-----END PRIVATE KEY-----", s)
-            if s != -1 and e != -1:
-                e += len("-----END PRIVATE KEY-----")
-                raw = raw.replace(raw[s:e], raw[s:e].replace("\r\n","\n").replace("\n","\\n"))
-        return json.loads(raw)
+    else:
+        raw = st.secrets.get("GCP_SERVICE_ACCOUNT") or os.getenv("GCP_SERVICE_ACCOUNT")
+        if not raw:
+            st.error("Missing Google credentials in secrets. Add [gcp_service_account] or GCP_SERVICE_ACCOUNT.")
+            return None, None
+        try:
+            sa = json.loads(raw)
+        except json.JSONDecodeError:
+            # self-heal stray newlines in private_key
+            if "-----BEGIN PRIVATE KEY-----" in raw and "\\n" not in raw:
+                s = raw.find("-----BEGIN PRIVATE KEY-----"); e = raw.find("-----END PRIVATE KEY-----", s)
+                if s != -1 and e != -1:
+                    e += len("-----END PRIVATE KEY-----")
+                    raw = raw.replace(raw[s:e], raw[s:e].replace("\r\n","\n").replace("\n","\\n"))
+            sa = json.loads(raw)
 
-@st.cache_resource(show_spinner=False)
-def gs_client():
-    import gspread
-    from google.oauth2.service_account import Credentials
-    sa = load_sa_dict()
-    if not sa:
-        raise RuntimeError("Missing Google credentials. Add [gcp_service_account] (dict) or GCP_SERVICE_ACCOUNT (JSON) in secrets.")
     creds = Credentials.from_service_account_info(
         sa,
         scopes=[
@@ -79,33 +80,12 @@ def gs_client():
             "https://www.googleapis.com/auth/drive",
         ],
     )
-    return gspread.authorize(creds)
-
-def replace_universe_sheet(tickers: List[str]) -> Tuple[bool, str]:
-    import gspread
-    client = gs_client()
-    sh = client.open_by_key(GOOGLE_SHEET_ID)
-    try:
-        ws = sh.worksheet(GOOGLE_SHEET_NAME)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=GOOGLE_SHEET_NAME, rows=1, cols=2)
-    rows = [["Timestamp (ET)", "Ticker"]] + [[now_et_str(), t] for t in tickers]
-    ws.clear()
-    ws.update("A1", rows, value_input_option="USER_ENTERED")
-    return True, f"Wrote {len(tickers)} tickers."
-
-# -----------------------
-# Symbol directory (NASDAQ + NYSE), filter funds/derivs
-# -----------------------
-NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-OTHER_URL  = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
-
-def to_yahoo_symbol(sym: str) -> str:
-    return sym.replace(".", "-").upper()
+    return gspread.authorize(creds), gspread
 
 @st.cache_data(ttl=60*60*6, show_spinner=False)
 def download_symbol_files_qn_only(exclude_funds=True, exclude_derivs=True) -> List[str]:
     frames = []
+    # NASDAQ
     try:
         nasdaq = pd.read_csv(NASDAQ_URL, sep="|")
         nasdaq = nasdaq[nasdaq["Symbol"].notna() & (nasdaq["Symbol"] != "Symbol")]
@@ -120,10 +100,11 @@ def download_symbol_files_qn_only(exclude_funds=True, exclude_derivs=True) -> Li
         frames.append(dfq)
     except Exception:
         pass
+    # NYSE-only from otherlisted
     try:
         other = pd.read_csv(OTHER_URL, sep="|")
         other = other[other["ACT Symbol"].notna()]
-        other = other[other.get("Exchange","").astype(str).str.upper().eq("N")]  # NYSE only
+        other = other[other.get("Exchange","").astype(str).str.upper().eq("N")]
         dfn = pd.DataFrame({
             "symbol": other["ACT Symbol"].astype(str).str.upper().str.strip(),
             "security_name": other.get("Security Name"),
@@ -151,11 +132,12 @@ def download_symbol_files_qn_only(exclude_funds=True, exclude_derivs=True) -> Li
 
     return sorted({to_yahoo_symbol(s) for s in df["symbol"].dropna().unique().tolist()})
 
-# -----------------------
-# Yahoo daily bars (batched)
-# -----------------------
 @st.cache_data(ttl=60*30, show_spinner=True)
-def fetch_daily(tickers: List[str], period: str = "6w", chunk: int = 300, threads_on: bool = True) -> Dict[str, pd.DataFrame]:
+def fetch_daily_yahoo(tickers: List[str], period: str = "6w", chunk: int = 300, threads_on: bool = True) -> Dict[str, pd.DataFrame]:
+    yf = require_yfinance()
+    if yf is None:
+        return {}
+
     if isinstance(tickers, str):
         tickers = [tickers]
     tickers = [to_yahoo_symbol(t) for t in tickers]
@@ -199,9 +181,6 @@ def fetch_daily(tickers: List[str], period: str = "6w", chunk: int = 300, thread
 
     return data
 
-# -----------------------
-# Universe builder ($-flow share + price band + gentle momentum + noisy-volume exclusion)
-# -----------------------
 @st.cache_data(ttl=60*60, show_spinner=True)
 def build_universe_flow_rank(
     n_top:int = 800,
@@ -217,11 +196,11 @@ def build_universe_flow_rank(
     t0 = time.perf_counter()
     pool = download_symbol_files_qn_only()[:max_pool]
     t1 = time.perf_counter()
-    daily = fetch_daily(pool, period="6w", chunk=yf_chunk, threads_on=yf_threads)
+    daily = fetch_daily_yahoo(pool, period="6w", chunk=yf_chunk, threads_on=yf_threads)
     t2 = time.perf_counter()
 
     candidates: List[Tuple[str, float, float, float]] = []  # (sym, adv, last_vol, last_close)
-    need_bars = max(daily_bars + 1, 21)  # yesterday + EMA20 horizon
+    need_bars = max(daily_bars + 1, 21)
 
     for sym, df in daily.items():
         if df is None or df.empty or len(df) < need_bars:
@@ -232,7 +211,6 @@ def build_universe_flow_rank(
         if not (min_price <= last_close <= max_price):
             continue
 
-        # avg $ flow over last N daily bars
         recent = df.tail(daily_bars)
         adv = float((recent["close"] * recent["volume"]).mean())
         if not np.isfinite(adv) or adv <= 0:
@@ -261,7 +239,7 @@ def build_universe_flow_rank(
     scored = [(sym, adv / total_adv, adv) for (sym, adv, _lv, _px) in candidates]
     scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
 
-    # Fail-soft: relax momentum once if too few
+    # Fail-soft: relax momentum if too few
     if len(scored) < max(100, int(0.5 * n_top)) and gentle_momentum:
         candidates2 = []
         for sym, df in daily.items():
@@ -293,9 +271,23 @@ def build_universe_flow_rank(
         "t_dl": t2 - t1,
     }
 
-# -----------------------
-# UI — simple controls + fast mode + cache reset
-# -----------------------
+def replace_universe_sheet(tickers: List[str]) -> Tuple[bool, str]:
+    client, gspread = require_gspread_client()
+    if not client:
+        return False, "Missing Google libs or credentials."
+    sh = client.open_by_key(GOOGLE_SHEET_ID)
+    try:
+        ws = sh.worksheet(GOOGLE_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=GOOGLE_SHEET_NAME, rows=1, cols=2)
+    rows = [["Timestamp (ET)", "Ticker"]] + [[now_et_str(), t] for t in tickers]
+    ws.clear()
+    ws.update("A1", rows, value_input_option="USER_ENTERED")
+    return True, f"Wrote {len(tickers)} tickers."
+
+# =========================
+# UI — simple, fast, scan on click
+# =========================
 with st.expander("Criteria (adjust then click Run)", expanded=True):
     c1, c2 = st.columns(2)
     with c1:
@@ -308,15 +300,18 @@ with st.expander("Criteria (adjust then click Run)", expanded=True):
         max_price = st.number_input("Max price ($)", value=100.0, step=1.0)
         exclude_top_volume_pct = st.number_input("Exclude top volume (%)", value=1.5, min_value=0.0, max_value=25.0, step=0.5)
         if st.button("🧹 Clear caches"):
-            download_symbol_files_qn_only.clear(); fetch_daily.clear(); build_universe_flow_rank.clear()
+            download_symbol_files_qn_only.clear()
+            fetch_daily_yahoo.clear()
+            build_universe_flow_rank.clear()
             st.toast("Caches cleared. Re-run to rebuild.", icon="🧹")
 
-run_it = st.button("🚀 Run Screener & Update Sheet", type="primary")
+colA, colB = st.columns(2)
+with colA:
+    run_scan = st.button("🚀 Run Screener (compute only)")
+with colB:
+    run_scan_and_write = st.button("📝 Run & Update Google Sheet")
 
-# -----------------------
-# Run + write
-# -----------------------
-if run_it:
+if run_scan or run_scan_and_write:
     max_pool = 4000 if fast_mode else 6000
     yf_chunk = 300 if fast_mode else 200
     yf_threads = True if fast_mode else False
@@ -345,13 +340,14 @@ if run_it:
         with st.expander("Diagnostics", expanded=False):
             st.caption(f"Symbols load: {stats.get('t_sym',0):.2f}s · Daily bars download: {stats.get('t_dl',0):.2f}s")
 
-        try:
-            ok, msg = replace_universe_sheet(syms)
-            if ok:
-                st.success(f"Google Sheet updated: {msg}")
-            else:
-                st.error("Failed to update Google Sheet.")
-        except Exception as e:
-            st.error(f"Google Sheet write error: {e}")
+        if run_scan_and_write:
+            try:
+                ok, msg = replace_universe_sheet(syms)
+                if ok:
+                    st.success(f"Google Sheet updated: {msg}")
+                else:
+                    st.error("Failed to update Google Sheet.")
+            except Exception as e:
+                st.error(f"Google Sheet write error: {e}")
 
-st.caption("Self-healing: installs yfinance at runtime if missing. Keep runtime.txt (python-3.11) and requirements.txt at repo root for clean builds.")
+st.caption("Fast boot: no heavy imports until you click a button. If yfinance is missing, fix requirements.txt at repo root and redeploy.")
