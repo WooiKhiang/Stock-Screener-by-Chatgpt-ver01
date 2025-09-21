@@ -283,18 +283,19 @@ def check_halts(symbols):
     return out
 
 # =========================
-# Pre-market context (not used for indicators)
+# Pre-market context (not used for indicators) — returns np.nan, not None
 # =========================
 def premkt_context(symbols):
-    res = {s: {"gap_pm_pct": None, "pm_vol": None} for s in symbols}
+    res = {s: {"gap_pm_pct": np.nan, "pm_vol": np.nan} for s in symbols}
     if not symbols: return res
     now_utc = dt.datetime.now(dt.timezone.utc)
     et_date = now_utc.astimezone(ET).date()
     pm_start = ET.localize(dt.datetime.combine(et_date, dt.time(4,0))).astimezone(dt.timezone.utc)
     rth_open = ET.localize(dt.datetime.combine(et_date, dt.time(9,30))).astimezone(dt.timezone.utc)
 
-    daily = fetch_daily_bars_multi(symbols, (now_utc - dt.timedelta(days=10)).isoformat().replace("+00:00","Z"),
-                                   now_utc.isoformat().replace("+00:00","Z"))
+    # prior daily close (kept for future use)
+    _ = fetch_daily_bars_multi(symbols, (now_utc - dt.timedelta(days=10)).isoformat().replace("+00:00","Z"),
+                               now_utc.isoformat().replace("+00:00","Z"))
     base = f"{ALPACA_DATA}/v2/stocks/bars"; pm_vols = {s:0.0 for s in symbols}
     for i in range(0, len(symbols), CHUNK_SIZE):
         chunk = symbols[i:i+CHUNK_SIZE]
@@ -313,7 +314,7 @@ def premkt_context(symbols):
                 pm_vols[sym] += float(df["v"].sum())
 
     for s in symbols:
-        res[s] = {"gap_pm_pct": None, "pm_vol": pm_vols.get(s, 0.0)}
+        res[s] = {"gap_pm_pct": np.nan, "pm_vol": pm_vols.get(s, 0.0)}
     return res
 
 # =========================
@@ -335,7 +336,7 @@ def run_pipeline():
     bars = fetch_daily_bars_multi(syms_all, start_utc.isoformat().replace("+00:00","Z"),
                                   end_utc.isoformat().replace("+00:00","Z"))
 
-    # For "big players" context (across the whole universe)
+    # "Big players" context (across universe)
     big_rows = []
     for s, df in bars.items():
         if df is None or len(df) < 25: continue
@@ -432,7 +433,6 @@ def run_pipeline():
         })
 
     if not rows:
-        # Still return context + counts, but empty candidates
         df_ui = pd.DataFrame(); df_out = pd.DataFrame()
         return sent, risk_mode, total_universe, step1_count, step2_count, step3_count, df_ui, df_out, big_top_rvol, big_top_dv
 
@@ -470,8 +470,8 @@ def run_pipeline():
         if halted is True: notes.append("halted")
         elif halted is None: notes.append("halt_check_failed")
         ctx = pm.get(sym, {})
-        df.loc[i,"gap_pm_pct"] = ctx.get("gap_pm_pct")
-        df.loc[i,"pm_vol"]     = ctx.get("pm_vol")
+        df.loc[i,"gap_pm_pct"] = ctx.get("gap_pm_pct")  # np.nan already
+        df.loc[i,"pm_vol"]     = ctx.get("pm_vol")      # numeric
         df.loc[i,"notes"]      = ", ".join(notes) if notes else ""
 
     df_ui  = df.head(SHOW_LIMIT).copy()
@@ -600,9 +600,15 @@ st.subheader("Top Candidates (UI preview)")
 if df_ui.empty:
     st.warning("No survivors today under current gates.")
 else:
-    fmt = {c:"{:.2f}" for c in ["close","atr14","sma20","sma50","ema5","ema20","ema50",
-                                "macd_line","macd_signal","macd_hist","kdj_k","kdj_d","kdj_j",
-                                "rvol_today","roc20","rank_score","gap_pm_pct","pm_vol","avg_vol20","avg_dollar_vol20","atr_pct"]}
+    # --- NEW: ensure numeric columns before styling to avoid TypeError on None/strings ---
+    numeric_cols = ["close","atr14","sma20","sma50","ema5","ema20","ema50",
+                    "macd_line","macd_signal","macd_hist","kdj_k","kdj_d","kdj_j",
+                    "rvol_today","roc20","rank_score","gap_pm_pct","pm_vol","avg_vol20","avg_dollar_vol20","atr_pct"]
+    for col in numeric_cols:
+        if col in df_ui.columns:
+            df_ui[col] = pd.to_numeric(df_ui[col], errors="coerce")
+
+    fmt = {c:"{:.2f}" for c in numeric_cols if c in df_ui.columns}
     st.dataframe(df_ui.head(SHOW_LIMIT).style.format(fmt), use_container_width=True)
 
 # Write to Google Sheets (Context always; Universe only if rows)
