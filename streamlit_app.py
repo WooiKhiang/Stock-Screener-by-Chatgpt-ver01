@@ -1,10 +1,11 @@
-# streamlit_app.py — Pure Hourly Scan (H1) + Daily Flags → Google Sheets
-# - Universe cap slider (default 4000)
-# - Steps 1/2/3 entirely on H1 bars
-# - Attention flags (not gates): D1_EMA200_breakout, D1_MACD_zero_cross_sig_neg, H1_MACD_zero_cross_sig_neg
-# - Context tab: vertical (Metric, Value), readable, hard-refresh each run
+# streamlit_app.py — Auto/Dual/Hourly/Daily scan (Alpaca) → Google Sheets
+# - Toggle scan mode: Auto (prefer H1), Hourly, Daily, Dual (D1 structure + H1 activity)
+# - Dynamic H1 lookback with fallback (prevents 0/0/0 on weekends/holidays)
+# - Diagnostics panel (bar counts + drop reasons + symbol probe)
+# - Context tab: vertical (Metric,Value), readable, hard-refreshed each run
 # - Universe tab: transaction-safe overwrite
-# - Uses GCP service account JSON from Streamlit secrets as GCP_SERVICE_ACCOUNT
+# - Attention flags (not gates): D1_EMA200_breakout, D1_MACD_zero_cross_sig_neg, H1_MACD_zero_cross_sig_neg
+# - KDJ has no J<80 cap. All timestamps are ET.
 
 import os, json, datetime as dt
 import numpy as np
@@ -13,9 +14,7 @@ import pytz
 import requests
 import streamlit as st
 
-# =========================
-# Fixed config
-# =========================
+# ========= Fixed config (IDs, endpoints) =========
 GOOGLE_SHEET_ID   = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 TAB_UNIVERSE      = "Universe"
 TAB_CONTEXT       = "Context"
@@ -24,18 +23,16 @@ ALPACA_KEY    = os.getenv("ALPACA_KEY",    "PKIG445MPT704CN8P0R8")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "3GQdWcnbMo6V8uvhVa6BK6EbvnH4EHinlsU6uvj4")
 ALPACA_BASE   = "https://paper-api.alpaca.markets/v2"
 ALPACA_DATA   = "https://data.alpaca.markets"
-FEED          = "iex"
+FEED          = "iex"  # paper/free tier
 
 SA_RAW = st.secrets.get("GCP_SERVICE_ACCOUNT") or os.getenv("GCP_SERVICE_ACCOUNT")
 
 ET = pytz.timezone("America/New_York")
 HEADERS = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
 
-# =========================
-# UI
-# =========================
-st.set_page_config(page_title="Pure Hourly Scan — Alpaca → Sheets", layout="wide")
-st.title("⏱️ Pure Hourly Scan (H1) — Candidates to Google Sheets")
+# ========= UI =========
+st.set_page_config(page_title="Market Scanner — Alpaca → Sheets", layout="wide")
+st.title("📊 Market Scanner (Alpaca → Google Sheets)")
 
 autorun = st.sidebar.checkbox("Auto-run every hour", value=True)
 try:
@@ -47,44 +44,57 @@ try:
 except Exception:
     pass
 
-st.sidebar.markdown("### Universe & Mode")
+st.sidebar.markdown("### Mode & Universe")
+SCAN_MODE = st.sidebar.selectbox(
+    "Scan mode",
+    ["Auto (prefer Hourly)", "Hourly", "Daily", "Dual (Daily+Hourly)"],
+    index=0,
+    help="Auto: try Hourly; if insufficient bars, fallback to Daily automatically."
+)
 UNIVERSE_CAP = st.sidebar.slider("Universe cap (symbols)", 500, 6000, 4000, 250,
     help="Active & tradable US equities (NASDAQ/NYSE/AMEX). Higher = broader but slower.")
 MANUAL_RISK  = st.sidebar.selectbox("Risk mode", ["auto", "normal", "tight"], index=0)
 
-with st.sidebar.expander("Step 1 — Hourly Hygiene", expanded=True):
+with st.sidebar.expander("Step 1 — Hygiene", expanded=True):
     PRICE_MIN = st.number_input("Min price ($)", value=5.0, step=0.5)
     PRICE_MAX = st.number_input("Max price ($)", value=100.0, step=1.0)
-    st.caption("Liquidity (H1): pass if either condition holds over last 20 hours")
-    LIQ_MIN_AVG_VOLH20 = st.number_input("AvgVolH20 ≥", value=100_000, step=25_000, format="%i")
-    LIQ_MIN_AVG_DVH20  = st.number_input("Avg$VolH20 ≥", value=5_000_000, step=500_000, format="%i")
-    REQUIRE_DAILY_TREND = st.checkbox("Also require Daily trend bias (Close ≥ SMA50 & SMA20 ≥ SMA50)", value=False,
-        help="Optional: consult D1 to keep structural bias. OFF keeps scan purely hourly.")
+    st.caption("Liquidity (pass if either condition holds)")
+    LIQ_MIN_AVG_VOL_D1 = st.number_input("Daily AvgVol20 ≥", value=1_000_000, step=100_000, format="%i")
+    LIQ_MIN_AVG_DV_D1  = st.number_input("Daily Avg$Vol20 ≥", value=20_000_000, step=1_000_000, format="%i")
+    LIQ_MIN_AVG_VOL_H1 = st.number_input("Hourly AvgVol20 ≥", value=100_000, step=25_000, format="%i")
+    LIQ_MIN_AVG_DV_H1  = st.number_input("Hourly Avg$Vol20 ≥", value=5_000_000, step=500_000, format="%i")
+    REQUIRE_DAILY_TREND = st.checkbox("Daily trend bias (Close ≥ SMA50 & SMA20 ≥ SMA50)", value=False,
+        help="OFF keeps pure hourly viable. In Dual mode, Daily trend acts as Step 1 structure.")
 
-with st.sidebar.expander("Step 2 — Hourly Activity", expanded=True):
-    ATR_PCT_MIN = st.number_input("ATR% (H1) min", value=0.0010, step=0.0005, format="%.4f",
-        help="0.0010 = 0.10% of price per hour")
-    ATR_PCT_MAX = st.number_input("ATR% (H1) max", value=0.0200, step=0.0005, format="%.4f",
-        help="2.00% cap avoids hyper-volatility")
-    RVOL_MIN    = st.number_input("RVOL_hour (H1) ≥", value=1.00, step=0.05, format="%.2f",
-        help="This hour's volume vs 20-hour average")
+with st.sidebar.expander("Step 2 — Activity", expanded=True):
+    # Defaults chosen for typical responsiveness
+    ATR_PCT_MIN_H1 = st.number_input("ATR% (H1) min", value=0.0010, step=0.0005, format="%.4f")
+    ATR_PCT_MAX_H1 = st.number_input("ATR% (H1) max", value=0.0200, step=0.0005, format="%.4f")
+    RVOL_MIN_H1    = st.number_input("RVOL (H1) ≥",   value=1.00,    step=0.05,   format="%.2f")
+    ATR_PCT_MIN_D1 = st.number_input("ATR% (D1) min", value=0.010, step=0.001, format="%.3f")
+    ATR_PCT_MAX_D1 = st.number_input("ATR% (D1) max", value=0.080, step=0.001, format="%.3f")
+    RVOL_MIN_D1    = st.number_input("RVOL (D1) ≥",   value=0.90,  step=0.05,  format="%.2f")
+    REQ_SMA50_GT_200 = st.checkbox("Require SMA50 > SMA200 (Daily, tight add-on)", value=False)
 
-with st.sidebar.expander("Step 3 — Hourly Technical Gates", expanded=True):
+with st.sidebar.expander("Step 3 — Technical gates", expanded=True):
     GATE_EMA  = st.checkbox("EMA stack rising (EMA5>EMA20>EMA50; all rising)", value=True)
-    GATE_MACD = st.checkbox("MACD turn (hist<0 & rising; line>signal; line rising)", value=True)
+    GATE_MACD = st.checkbox("MACD turn (hist < 0 & rising; line > signal; line rising)", value=True)
     GATE_KDJ  = st.checkbox("KDJ align (K>D; K↑; D↑; J↑)", value=True)
 
-with st.sidebar.expander("Lookbacks & Output", expanded=False):
-    HOURLY_LOOK_D  = st.slider("Hourly lookback (days)", 5, 30, 10,
-        help="~65–70 RTH hours → stable ATR(14), MACD(26/12/9), KDJ(9) & RVOL baselines.")
-    DAILY_LOOKBACK = st.slider("Daily lookback (days) for flags/context", 60, 200, 100)
-    SHOW_LIMIT     = st.slider("Rows to show (UI)", 10, 50, 20)
-    TAG_SURV_LIMIT = st.slider("Tagging cap (survivors for flags)", 20, 200, 80, 10)
+with st.sidebar.expander("Lookback & Fallback", expanded=False):
+    DAILY_LOOKBACK  = st.slider("Daily lookback (days)", 60, 200, 100,
+        help="Used for Daily scan + flags + context.")
+    HOURLY_LOOK_D   = st.slider("Hourly lookback (days)", 5, 30, 10,
+        help="~65–70 RTH hours over 10 trading days.")
+    AUTO_EXTEND_H1  = st.checkbox("Auto-extend hourly lookback if bars insufficient", value=True)
+    H1_MIN_BARS_REQ = st.slider("Minimum H1 bars required", 30, 70, 45, 1,
+        help="If below in Auto/Hourly/Dual, we'll extend lookback; Auto may fallback to Daily.")
+    H1_MAX_LOOK_D   = st.slider("Max hourly lookback when auto-extending (days)", 10, 45, 30, 1)
 
-# =========================
-# Helpers
-# =========================
-def now_et_str():
+SHOW_LIMIT = st.sidebar.slider("Rows to show (UI)", 10, 50, 20)
+
+# ========= Helpers =========
+def now_et_str() -> str:
     return dt.datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
 
 def parse_sa(raw_json: str) -> dict:
@@ -111,9 +121,7 @@ def rth_only_hour(df: pd.DataFrame) -> pd.DataFrame:
     mask = (et_times.dt.time >= dt.time(9,30)) & (et_times.dt.time <= dt.time(16,0))
     return df[mask].reset_index(drop=True)
 
-# =========================
-# Reference context (yfinance)
-# =========================
+# ========= yfinance context =========
 try:
     import yfinance as yf
     YF_AVAILABLE = True
@@ -125,7 +133,7 @@ INDUSTRY_ETFS = ["SMH","SOXX","XBI","KRE","ITB","XME","IYT","XOP","OIH","TAN"]
 COMMODITY_ETFS = ["GLD","GDX","USO","XOP","OIH"]
 MEGACAPS = ["AAPL","MSFT","NVDA","AMZN","GOOG","GOOGL","META","TSLA"]
 
-def _yf_close_panel(df: pd.DataFrame) -> pd.DataFrame:
+def _yf_panel(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         lvl0 = df.columns.get_level_values(0)
         panel = df["Adj Close"] if "Adj Close" in lvl0 else (df["Close"] if "Close" in lvl0 else df[lvl0[0]])
@@ -142,7 +150,7 @@ def fetch_refs():
     if data is None or len(data)==0:
         return {"vix": np.nan, "sector1d":{}, "sector5d":{}, "industry1d":{}, "industry5d":{},
                 "commodity1d":{}, "commodity5d":{}, "mega1d":{}, "mega5d":{}, "risk_auto":"normal"}
-    panel = _yf_close_panel(data).ffill()
+    panel = _yf_panel(data).ffill()
     last = panel.iloc[-1]; prev = panel.iloc[-2] if len(panel)>=2 else last; prev5 = panel.iloc[-5] if len(panel)>=5 else prev
     ret1d = (last/prev - 1.0); ret5d = (last/prev5 - 1.0)
     vix = float(last.get("^VIX", np.nan))
@@ -162,9 +170,7 @@ def fetch_refs():
             "mega1d": mega1, "mega5d": mega5,
             "risk_auto": "tight" if tight else "normal"}
 
-# =========================
-# Universe & Bars
-# =========================
+# ========= Alpaca I/O =========
 def fetch_active_symbols(cap: int):
     url = f"{ALPACA_BASE}/assets"
     params = {"status": "active", "asset_class": "us_equity"}
@@ -207,7 +213,6 @@ def fetch_bars_multi(symbols, timeframe, start_iso, end_iso, limit=1000):
                         out[sym] = pd.concat([out.get(sym), grp.drop(columns=["symbol"])], ignore_index=True)
             page = js.get("next_page_token")
             if not page: break
-    # sort & RTH filter for hourly
     for s, df in list(out.items()):
         if df is None or df.empty: continue
         df = df.drop_duplicates(subset=["t"]).sort_values("t").reset_index(drop=True)
@@ -216,9 +221,7 @@ def fetch_bars_multi(symbols, timeframe, start_iso, end_iso, limit=1000):
         out[s] = df
     return out
 
-# =========================
-# Indicators
-# =========================
+# ========= Indicators =========
 def sma(x, n): return x.rolling(n, min_periods=n).mean()
 def ema(x, n): return x.ewm(span=n, adjust=False).mean()
 def atr(df, n=14):
@@ -237,198 +240,34 @@ def kdj(df, n=9, k_period=3, d_period=3):
     j = 3*k - 2*d
     return k, d, j
 
-# =========================
-# Pipeline (pure hourly scan)
-# =========================
-def run_pipeline_pure_hourly():
-    # Context references
-    refs = fetch_refs()
-    risk_mode = refs["risk_auto"] if MANUAL_RISK=="auto" else MANUAL_RISK
+# ========= Risk-mode adjustments =========
+def apply_risk_tweaks(mode_used, rvol_h1, atr_min_h1, atr_max_h1, rvol_d1, atr_min_d1, atr_max_d1, req_sma50_gt200):
+    if MANUAL_RISK != "auto":
+        risk_used = MANUAL_RISK
+    else:
+        risk_used = None  # filled by refs later
+    # Default passthroughs; actual risk mode is determined after refs fetched
+    def tweak(risk):
+        if risk == "tight":
+            # Tighten both where applicable
+            rvol_h = (rvol_h1 + 0.10)
+            atr_min_h = max(atr_min_h1, 0.0015)
+            atr_max_h = min(atr_max_h1, 0.0150)
+            rvol_d = (rvol_d1 + 0.20)  # daily RVOL stricter
+            atr_min_d = max(atr_min_d1, 0.015)
+            atr_max_d = min(atr_max_d1, 0.060)
+            return rvol_h, atr_min_h, atr_max_h, rvol_d, atr_min_d, atr_max_d, True or req_sma50_gt200
+        else:
+            return rvol_h1, atr_min_h1, atr_max_h1, rvol_d1, atr_min_d1, atr_max_d1, req_sma50_gt200
+    return risk_used, tweak
 
-    # Universe
-    symbols = fetch_active_symbols(UNIVERSE_CAP)
-    total_universe = len(symbols)
-
-    # Bars: hourly for scan; daily for flags/context only
-    now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-    hourly_start = (now_utc - dt.timedelta(days=HOURLY_LOOK_D)).isoformat().replace("+00:00","Z")
-    daily_start  = (now_utc - dt.timedelta(days=DAILY_LOOKBACK)).isoformat().replace("+00:00","Z")
-    end_iso      = now_utc.isoformat().replace("+00:00","Z")
-
-    bars_h = fetch_bars_multi(symbols, "1Hour", hourly_start, end_iso)
-    bars_d = fetch_bars_multi(symbols, "1Day",  daily_start,  end_iso)
-
-    # Big players lists
-    big_rvol_h1 = []
-    rows = []
-    for s, df in bars_h.items():
-        if df is None or len(df) < 25: continue
-        vol = df["volume"].astype(float).fillna(0)
-        base = vol.rolling(20, min_periods=20).mean().iloc[-1]
-        if base and base>0:
-            rows.append((s, float(vol.iloc[-1]/base)))
-    if rows:
-        tmp = pd.DataFrame(rows, columns=["symbol","rvol_h1"]).sort_values("rvol_h1", ascending=False)
-        big_rvol_h1 = tmp.head(10)["symbol"].tolist()
-
-    big_dv_d1 = []
-    rows = []
-    for s, df in bars_d.items():
-        if df is None or len(df) < 2: continue
-        close = df["close"].astype(float); vol = df["volume"].astype(float).fillna(0)
-        rows.append((s, float(close.iloc[-1]*vol.iloc[-1])))
-    if rows:
-        tmp = pd.DataFrame(rows, columns=["symbol","dollar_vol_d1"]).sort_values("dollar_vol_d1", ascending=False)
-        big_dv_d1 = tmp.head(10)["symbol"].tolist()
-
-    # Screening
-    step1 = step2 = step3 = 0
-    survivors = []
-
-    for s in symbols:
-        dfh = bars_h.get(s)
-        if dfh is None or len(dfh) < 60:
-            continue
-
-        close_h = dfh["close"].astype(float); vol_h = dfh["volume"].astype(float).fillna(0)
-        last_h  = float(close_h.iloc[-1])
-        if not (PRICE_MIN <= last_h <= PRICE_MAX):
-            continue
-
-        avg_vol_h20 = float(vol_h.rolling(20, min_periods=20).mean().iloc[-1])
-        avg_dv_h20  = float((close_h*vol_h).rolling(20, min_periods=20).mean().iloc[-1])
-        if not ((avg_vol_h20 >= LIQ_MIN_AVG_VOLH20) or (avg_dv_h20 >= LIQ_MIN_AVG_DVH20)):
-            continue
-
-        if REQUIRE_DAILY_TREND:
-            dfd = bars_d.get(s)
-            if dfd is None or len(dfd) < 60:
-                continue
-            cd = dfd["close"].astype(float)
-            sma20_d = sma(cd,20).iloc[-1]; sma50_d = sma(cd,50).iloc[-1]
-            if not (cd.iloc[-1] >= sma50_d and sma20_d >= sma50_d):
-                continue
-
-        step1 += 1
-
-        atr14_h = float(atr(dfh, 14).iloc[-1])
-        atr_pct = float(atr14_h / last_h) if last_h > 0 else np.nan
-        base = vol_h.rolling(20, min_periods=20).mean().iloc[-1]
-        rvol_hour = float(vol_h.iloc[-1]/base) if base and base>0 else np.nan
-        if not (ATR_PCT_MIN <= atr_pct <= ATR_PCT_MAX and rvol_hour >= RVOL_MIN):
-            continue
-
-        step2 += 1
-
-        # Technical gates on H1
-        ok = True
-        e5, e20, e50 = ema(close_h,5), ema(close_h,20), ema(close_h,50)
-        if GATE_EMA:
-            ok &= (e5.iloc[-1] > e20.iloc[-1] > e50.iloc[-1] and
-                   e5.iloc[-1] > e5.iloc[-2] and e20.iloc[-1] > e20.iloc[-2] and e50.iloc[-1] > e50.iloc[-2])
-
-        macd_line_h, macd_sig_h, macd_hist_h = macd(close_h)
-        if GATE_MACD:
-            ok &= ((macd_hist_h.iloc[-1] < 0) and (macd_hist_h.iloc[-1] > macd_hist_h.iloc[-2]) and
-                   (macd_line_h.iloc[-1] > macd_sig_h.iloc[-1]) and (macd_line_h.iloc[-1] > macd_line_h.iloc[-2]))
-
-        k, d_, j = kdj(dfh)
-        if GATE_KDJ:
-            ok &= (k.iloc[-1] > d_.iloc[-1] and k.iloc[-1] > k.iloc[-2] and d_.iloc[-1] > d_.iloc[-2] and j.iloc[-1] > j.iloc[-2])
-
-        if not ok:
-            continue
-
-        step3 += 1
-
-        # Ranking features (H1)
-        roc20 = float(close_h.iloc[-1] / close_h.iloc[-20] - 1.0) if len(close_h) > 20 else np.nan
-        inv_atr = (1.0 / atr_pct) if (atr_pct and atr_pct>0) else np.nan
-
-        # Attention flags (not gates)
-        notes = []
-        flag_d1_ema200 = False
-        flag_d1_macd0  = False
-        flag_h1_macd0  = False
-
-        # Daily flags
-        dfd = bars_d.get(s)
-        if dfd is not None and len(dfd) >= 201:
-            cd = dfd["close"].astype(float)
-            e200_d = ema(cd,200)
-            if cd.iloc[-1] > e200_d.iloc[-1] and cd.iloc[-2] <= e200_d.iloc[-2]:
-                flag_d1_ema200 = True; notes.append("D1_EMA200_breakout")
-            m_line_d, m_sig_d, _ = macd(cd)
-            if len(m_line_d) >= 2 and (m_line_d.iloc[-2] <= 0 < m_line_d.iloc[-1]) and (m_sig_d.iloc[-1] < 0):
-                flag_d1_macd0 = True; notes.append("D1_MACD_zero_cross_sig_neg")
-
-        # Hourly flag
-        if len(macd_line_h) >= 2 and (macd_line_h.iloc[-2] <= 0 < macd_line_h.iloc[-1]) and (macd_sig_h.iloc[-1] < 0):
-            flag_h1_macd0 = True; notes.append("H1_MACD_zero_cross_sig_neg")
-
-        survivors.append({
-            "symbol": s,
-            "close": last_h,
-            "avg_vol_h20": avg_vol_h20,
-            "avg_dollar_vol_h20": avg_dv_h20,
-            "atr14_h1": atr14_h,
-            "atr_pct_h1": atr_pct,
-            "ema5_h1": float(e5.iloc[-1]),
-            "ema20_h1": float(e20.iloc[-1]),
-            "ema50_h1": float(e50.iloc[-1]),
-            "macd_line_h1": float(macd_line_h.iloc[-1]),
-            "macd_signal_h1": float(macd_sig_h.iloc[-1]),
-            "macd_hist_h1": float(macd_hist_h.iloc[-1]),
-            "kdj_k_h1": float(k.iloc[-1]),
-            "kdj_d_h1": float(d_.iloc[-1]),
-            "kdj_j_h1": float(j.iloc[-1]),
-            "rvol_hour": rvol_hour,
-            "roc20_h1": roc20,
-            "flag_d1_ema200_breakout": flag_d1_ema200,
-            "flag_d1_macd_zero_cross_sig_neg": flag_d1_macd0,
-            "flag_h1_macd_zero_cross_sig_neg": flag_h1_macd0,
-            "notes": ", ".join(notes) if notes else ""
-        })
-
-    if not survivors:
-        return refs, risk_mode, total_universe, step1, step2, step3, pd.DataFrame(), pd.DataFrame(), big_rvol_h1, big_dv_d1
-
-    df = pd.DataFrame(survivors)
-    df["inv_atr_pct_h1"] = df["atr_pct_h1"].replace(0, np.nan).rpow(-1)
-    # Rank: ROC20 (H1) + RVOL_hour + 1/ATR% (H1)
-    df["rank_score"] = 0.4*zscore(df["roc20_h1"]) + 0.3*zscore(df["rvol_hour"]) + 0.3*zscore(df["inv_atr_pct_h1"])
-    df = df.sort_values("rank_score", ascending=False).reset_index(drop=True)
-
-    df_ui  = df.head(SHOW_LIMIT).copy()
-    df_out = df.head(20).copy()
-    as_of = now_et_str()
-    df_out.insert(0, "risk_mode", risk_mode)
-    df_out.insert(0, "as_of_date", as_of)
-
-    # Universe output columns
-    cols = ["as_of_date","risk_mode","symbol","close",
-            "avg_vol_h20","avg_dollar_vol_h20","atr14_h1","atr_pct_h1",
-            "ema5_h1","ema20_h1","ema50_h1","macd_line_h1","macd_signal_h1","macd_hist_h1",
-            "kdj_k_h1","kdj_d_h1","kdj_j_h1","rvol_hour","roc20_h1","rank_score",
-            "flag_d1_ema200_breakout","flag_d1_macd_zero_cross_sig_neg","flag_h1_macd_zero_cross_sig_neg","notes"]
-    for c in cols:
-        if c not in df_out.columns: df_out[c] = np.nan
-    df_out = df_out[cols]
-
-    return refs, risk_mode, total_universe, step1, step2, step3, df_ui, df_out, big_rvol_h1, big_dv_d1
-
-# =========================
-# Google Sheets I/O
-# =========================
+# ========= Context writer (hard-refresh) =========
 def _open_or_create_ws(gc, title, rows=200, cols=60):
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     try: return sh.worksheet(title)
     except Exception: return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
-def write_sheet_safe(df: pd.DataFrame, tab_name: str):
-    """Transaction-safe overwrite: write new content then trim leftovers."""
-    if df is None or df.empty:
-        raise RuntimeError("No rows to write; preserving previous data.")
+def write_context_hard_replace(metric_value_rows: list):
     import gspread
     from google.oauth2.service_account import Credentials
     sa_info = parse_sa(SA_RAW)
@@ -436,7 +275,40 @@ def write_sheet_safe(df: pd.DataFrame, tab_name: str):
                scopes=["https://www.googleapis.com/auth/spreadsheets",
                        "https://www.googleapis.com/auth/drive"])
     gc = gspread.authorize(creds)
-    ws = _open_or_create_ws(gc, tab_name)
+    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+    temp_name = f"{TAB_CONTEXT}_TMP"
+    try:
+        try:
+            ws_tmp = sh.worksheet(temp_name)
+        except Exception:
+            ws_tmp = sh.add_worksheet(title=temp_name, rows=500, cols=2)
+        df_ctx = pd.DataFrame(metric_value_rows, columns=["Metric","Value"])
+        ws_tmp.clear()
+        ws_tmp.update("A1", [list(df_ctx.columns)] + df_ctx.fillna("").astype(str).values.tolist(), value_input_option="RAW")
+        # swap
+        try:
+            ws_old = sh.worksheet(TAB_CONTEXT)
+            sh.del_worksheet(ws_old)
+        except Exception:
+            pass
+        ws_tmp.update_title(TAB_CONTEXT)
+    except Exception as e:
+        # fallback direct clear/write
+        ws = _open_or_create_ws(gc, TAB_CONTEXT)
+        ws.clear()
+        ws.update("A1", [["Metric","Value"]] + metric_value_rows, value_input_option="RAW")
+
+def write_universe_safe(df: pd.DataFrame):
+    if df is None or df.empty:
+        raise RuntimeError("No rows to write; preserving previous Universe sheet.")
+    import gspread
+    from google.oauth2.service_account import Credentials
+    sa_info = parse_sa(SA_RAW)
+    creds = Credentials.from_service_account_info(sa_info,
+               scopes=["https://www.googleapis.com/auth/spreadsheets",
+                       "https://www.googleapis.com/auth/drive"])
+    gc = gspread.authorize(creds)
+    ws = _open_or_create_ws(gc, TAB_UNIVERSE)
 
     try:
         old_vals = ws.get_all_values()
@@ -448,7 +320,7 @@ def write_sheet_safe(df: pd.DataFrame, tab_name: str):
     new_values = [list(df.columns)] + df.fillna("").astype(str).values.tolist()
     ws.update("A1", new_values, value_input_option="RAW")
 
-    # Trim leftovers safely
+    # trim leftovers
     try:
         def col_letter(n:int):
             s=""; 
@@ -467,54 +339,294 @@ def write_sheet_safe(df: pd.DataFrame, tab_name: str):
     except Exception:
         pass
 
-def write_context_hard_replace(metric_value_rows: list):
-    """Hard-refresh Context tab via temp worksheet swap (atomic)."""
-    import gspread
-    from google.oauth2.service_account import Credentials
-    sa_info = parse_sa(SA_RAW)
-    creds = Credentials.from_service_account_info(sa_info,
-               scopes=["https://www.googleapis.com/auth/spreadsheets",
-                       "https://www.googleapis.com/auth/drive"])
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+# ========= Pipeline =========
+def run_pipeline():
+    # references / context
+    refs = fetch_refs()
+    risk_auto = refs.get("risk_auto","normal")
+    risk_used = MANUAL_RISK if MANUAL_RISK != "auto" else risk_auto
 
-    temp_name = f"{TAB_CONTEXT}_TMP"
-    try:
-        try:
-            ws_tmp = sh.worksheet(temp_name)
-        except Exception:
-            ws_tmp = sh.add_worksheet(title=temp_name, rows=500, cols=2)
-        df_ctx = pd.DataFrame(metric_value_rows, columns=["Metric","Value"])
-        ws_tmp.clear()
-        ws_tmp.update("A1", [list(df_ctx.columns)] + df_ctx.fillna("").astype(str).values.tolist(), value_input_option="RAW")
-        try:
-            ws_old = sh.worksheet(TAB_CONTEXT)
-            sh.del_worksheet(ws_old)
-        except Exception:
-            pass
-        ws_tmp.update_title(TAB_CONTEXT)
-    except Exception as e:
-        # Fallback: direct clear & write
-        ws = _open_or_create_ws(gc, TAB_CONTEXT)
-        ws.clear()
-        ws.update("A1", [["Metric","Value"]] + metric_value_rows, value_input_option="RAW")
+    # risk tweaks
+    risk_placeholder, tweak = apply_risk_tweaks(
+        SCAN_MODE, RVOL_MIN_H1, ATR_PCT_MIN_H1, ATR_PCT_MAX_H1,
+        RVOL_MIN_D1, ATR_PCT_MIN_D1, ATR_PCT_MAX_D1, REQ_SMA50_GT_200
+    )
+    RVOL_MIN_H1_eff, ATR_MIN_H1_eff, ATR_MAX_H1_eff, RVOL_MIN_D1_eff, ATR_MIN_D1_eff, ATR_MAX_D1_eff, REQ_SMA50_GT_200_eff = \
+        tweak(risk_used)
 
-# =========================
-# RUN
-# =========================
-sentiment_col, summary_col = st.columns([2,1])
+    # universe
+    symbols = fetch_active_symbols(UNIVERSE_CAP)
+    total_universe = len(symbols)
 
-with st.spinner("Scanning on Hourly (H1)…"):
-    refs, risk_mode, total_universe, s1, s2, s3, df_ui, df_out, big_rvol_h1, big_dv_d1 = run_pipeline_pure_hourly()
+    # initial lookbacks
+    now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    hourly_days = HOURLY_LOOK_D
+    daily_days  = DAILY_LOOKBACK
+    end_iso     = now_utc.isoformat().replace("+00:00","Z")
 
-# Sentiment / references
-with sentiment_col:
-    st.subheader("Market Context & Breadth")
+    # helper to fetch bars with dynamic hourly extension
+    def get_bars(mode):
+        nonlocal hourly_days
+        need_h = (mode in ["Auto (prefer Hourly)","Hourly","Dual (Daily+Hourly)"])
+        need_d = (mode in ["Auto (prefer Hourly)","Daily","Dual (Daily+Hourly)"])
+        bars_h = {}
+        bars_d = {}
+
+        # Daily first (cheap enough)
+        if need_d:
+            start_d = (now_utc - dt.timedelta(days=daily_days)).isoformat().replace("+00:00","Z")
+            bars_d = fetch_bars_multi(symbols, "1Day", start_d, end_iso)
+
+        # Hourly with dynamic extension
+        if need_h:
+            while True:
+                start_h = (now_utc - dt.timedelta(days=hourly_days)).isoformat().replace("+00:00","Z")
+                bars_h = fetch_bars_multi(symbols, "1Hour", start_h, end_iso)
+                # gauge min H1 bars across symbols
+                counts = [len(df) for df in bars_h.values() if df is not None]
+                min_h = min(counts) if counts else 0
+                if (not AUTO_EXTEND_H1) or (min_h >= H1_MIN_BARS_REQ) or (hourly_days >= H1_MAX_LOOK_D):
+                    return bars_h, bars_d, min_h
+                # extend by +4 days and retry
+                hourly_days = min(H1_MAX_LOOK_D, hourly_days + 4)
+
+        return bars_h, bars_d, 0
+
+    bars_h, bars_d, min_hbars = get_bars(SCAN_MODE)
+
+    # Auto fallback: if mode is Auto and hourly insufficient after extension, switch to Daily
+    effective_mode = SCAN_MODE
+    if SCAN_MODE == "Auto (prefer Hourly)":
+        if min_hbars < H1_MIN_BARS_REQ:
+            effective_mode = "Daily"
+        else:
+            effective_mode = "Hourly"
+
+    # Big-flow context
+    big_rvol_h1 = []
+    if bars_h:
+        rows = []
+        for s, df in bars_h.items():
+            if df is None or len(df) < 25: continue
+            vol = df["volume"].astype(float).fillna(0)
+            base = vol.rolling(20, min_periods=20).mean().iloc[-1]
+            if base and base>0:
+                rows.append((s, float(vol.iloc[-1]/base)))
+        if rows:
+            tmp = pd.DataFrame(rows, columns=["symbol","rvol_h1"]).sort_values("rvol_h1", ascending=False)
+            big_rvol_h1 = tmp.head(10)["symbol"].tolist()
+
+    big_dv_d1 = []
+    if bars_d:
+        rows = []
+        for s, df in bars_d.items():
+            if df is None or len(df) < 2: continue
+            close = df["close"].astype(float); vol = df["volume"].astype(float).fillna(0)
+            rows.append((s, float(close.iloc[-1]*vol.iloc[-1])))
+        if rows:
+            tmp = pd.DataFrame(rows, columns=["symbol","dollar_vol_d1"]).sort_values("dollar_vol_d1", ascending=False)
+            big_dv_d1 = tmp.head(10)["symbol"].tolist()
+
+    # Screening with diagnostics
+    drops = {
+        "insufficient_bars":0, "price_band":0, "liq":0, "daily_trend":0,
+        "atr_rvol":0, "ema":0, "macd":0, "kdj":0
+    }
+    step1 = step2 = step3 = 0
+    survivors = []
+
+    for s in symbols:
+        dfd = bars_d.get(s) if bars_d else None
+        dfh = bars_h.get(s) if bars_h else None
+
+        # prerequisites per mode
+        need_d = (effective_mode in ["Daily","Dual (Daily+Hourly)"])
+        need_h = (effective_mode in ["Hourly","Dual (Daily+Hourly)"])
+
+        enough = True
+        if need_d and (dfd is None or len(dfd) < 60): enough = False
+        if need_h and (dfh is None or len(dfh) < 45): enough = False
+        if not enough:
+            drops["insufficient_bars"] += 1
+            continue
+
+        # ----- Step 1 (Hygiene) -----
+        # Use Daily for Dual/Daily; Hourly for Hourly
+        if effective_mode in ["Daily","Dual (Daily+Hourly)"]:
+            close_d = dfd["close"].astype(float); vol_d = dfd["volume"].astype(float).fillna(0)
+            last_d  = float(close_d.iloc[-1])
+            if not (PRICE_MIN <= last_d <= PRICE_MAX):
+                drops["price_band"] += 1; continue
+            avg_vol20_d = float(vol_d.rolling(20, min_periods=20).mean().iloc[-1])
+            avg_dv20_d  = float((close_d*vol_d).rolling(20, min_periods=20).mean().iloc[-1])
+            if not ((avg_vol20_d >= LIQ_MIN_AVG_VOL_D1) or (avg_dv20_d >= LIQ_MIN_AVG_DV_D1)):
+                drops["liq"] += 1; continue
+            if REQUIRE_DAILY_TREND:
+                sma20_d = float(sma(close_d,20).iloc[-1]); sma50_d = float(sma(close_d,50).iloc[-1])
+                if not (last_d >= sma50_d and sma20_d >= sma50_d):
+                    drops["daily_trend"] += 1; continue
+        else:  # Hourly
+            close_h = dfh["close"].astype(float); vol_h = dfh["volume"].astype(float).fillna(0)
+            last_h  = float(close_h.iloc[-1])
+            if not (PRICE_MIN <= last_h <= PRICE_MAX):
+                drops["price_band"] += 1; continue
+            avg_vol20_h = float(vol_h.rolling(20, min_periods=20).mean().iloc[-1])
+            avg_dv20_h  = float((close_h*vol_h).rolling(20, min_periods=20).mean().iloc[-1])
+            if not ((avg_vol20_h >= LIQ_MIN_AVG_VOL_H1) or (avg_dv20_h >= LIQ_MIN_AVG_DV_H1)):
+                drops["liq"] += 1; continue
+            if REQUIRE_DAILY_TREND:
+                if dfd is None or len(dfd)<60:
+                    drops["daily_trend"] += 1; continue
+                cd = dfd["close"].astype(float)
+                if not (cd.iloc[-1] >= sma(cd,50).iloc[-1] and sma(cd,20).iloc[-1] >= sma(cd,50).iloc[-1]):
+                    drops["daily_trend"] += 1; continue
+        step1 += 1
+
+        # ----- Step 2 (Activity) -----
+        if effective_mode in ["Daily"]:
+            atr14 = float(atr(dfd,14).iloc[-1]); last = float(dfd["close"].iloc[-1])
+            atr_pct = float(atr14 / last) if last>0 else np.nan
+            vol_d = dfd["volume"].astype(float).fillna(0)
+            base = vol_d.rolling(20, min_periods=20).mean().iloc[-1]
+            rvol = float(vol_d.iloc[-1]/base) if base and base>0 else np.nan
+            sma50 = float(sma(dfd["close"].astype(float),50).iloc[-1]); sma200 = float(sma(dfd["close"].astype(float),200).iloc[-1]) if len(dfd)>=200 else np.nan
+            if not (ATR_MIN_D1_eff <= atr_pct <= ATR_MAX_D1_eff and rvol >= RVOL_MIN_D1_eff):
+                drops["atr_rvol"] += 1; continue
+            if REQ_SMA50_GT_200_eff and not (sma50 > sma200):
+                drops["atr_rvol"] += 1; continue
+        elif effective_mode in ["Hourly","Dual (Daily+Hourly)"]:
+            use = dfh
+            close_h = use["close"].astype(float); vol_h = use["volume"].astype(float).fillna(0)
+            last = float(close_h.iloc[-1])
+            atr14 = float(atr(use,14).iloc[-1]); atr_pct = float(atr14/last) if last>0 else np.nan
+            base = vol_h.rolling(20, min_periods=20).mean().iloc[-1]
+            rvol = float(vol_h.iloc[-1]/base) if base and base>0 else np.nan
+            if not (ATR_MIN_H1_eff <= atr_pct <= ATR_MAX_H1_eff and rvol >= RVOL_MIN_H1_eff):
+                drops["atr_rvol"] += 1; continue
+            if effective_mode == "Dual (Daily+Hourly)" and REQ_SMA50_GT_200_eff:
+                if dfd is None or len(dfd)<200:
+                    drops["atr_rvol"] += 1; continue
+                cd = dfd["close"].astype(float)
+                if not (sma(cd,50).iloc[-1] > sma(cd,200).iloc[-1]):
+                    drops["atr_rvol"] += 1; continue
+        step2 += 1
+
+        # ----- Step 3 (Technical gates) -----
+        dfI = dfd if effective_mode=="Daily" else dfh
+        clI = dfI["close"].astype(float)
+        ok = True; ema_ok=True; macd_ok=True; kdj_ok=True
+        if GATE_EMA:
+            e5,e20,e50 = ema(clI,5), ema(clI,20), ema(clI,50)
+            ema_ok = (e5.iloc[-1] > e20.iloc[-1] > e50.iloc[-1] and
+                      e5.iloc[-1] > e5.iloc[-2] and e20.iloc[-1] > e20.iloc[-2] and e50.iloc[-1] > e50.iloc[-2])
+            ok &= ema_ok
+        else:
+            e5=e20=e50=None
+        if GATE_MACD:
+            macd_line, macd_sig, macd_hist = macd(clI)
+            macd_ok = ((macd_hist.iloc[-1] < 0) and (macd_hist.iloc[-1] > macd_hist.iloc[-2]) and
+                       (macd_line.iloc[-1] > macd_sig.iloc[-1]) and (macd_line.iloc[-1] > macd_line.iloc[-2]))
+            ok &= macd_ok
+        else:
+            macd_line, macd_sig, macd_hist = macd(clI)
+        if GATE_KDJ:
+            k,d_,j = kdj(dfI)
+            kdj_ok = (k.iloc[-1] > d_.iloc[-1] and k.iloc[-1] > k.iloc[-2] and d_.iloc[-1] > d_.iloc[-2] and j.iloc[-1] > j.iloc[-2])
+            ok &= kdj_ok
+        else:
+            k,d_,j = kdj(dfI)
+        if not ok:
+            if not ema_ok: drops["ema"] += 1
+            elif not macd_ok: drops["macd"] += 1
+            elif not kdj_ok: drops["kdj"] += 1
+            else: drops["kdj"] += 1
+            continue
+        step3 += 1
+
+        # ----- Features & flags -----
+        # Rank features
+        roc20 = float(clI.iloc[-1] / clI.iloc[-20] - 1.0) if len(clI) > 20 else np.nan
+        inv_atr = (1.0 / (atr14/last)) if (last>0 and atr14>0) else np.nan
+
+        # Attention flags (not gates)
+        notes=[]; flag_d1_ema200=False; flag_d1_macd0=False; flag_h1_macd0=False
+        # daily flags if we have daily bars
+        if dfd is not None and len(dfd) >= 201:
+            cd = dfd["close"].astype(float); e200 = ema(cd,200)
+            if cd.iloc[-1] > e200.iloc[-1] and cd.iloc[-2] <= e200.iloc[-2]:
+                flag_d1_ema200=True; notes.append("D1_EMA200_breakout")
+            m_line_d, m_sig_d, _ = macd(cd)
+            if len(m_line_d)>=2 and (m_line_d.iloc[-2] <= 0 < m_line_d.iloc[-1]) and (m_sig_d.iloc[-1] < 0):
+                flag_d1_macd0=True; notes.append("D1_MACD_zero_cross_sig_neg")
+        # hourly flag if we have hourly bars
+        if dfh is not None and len(dfh) >= 2:
+            ml_h, ms_h, _ = macd(dfh["close"].astype(float))
+            if len(ml_h)>=2 and (ml_h.iloc[-2] <= 0 < ml_h.iloc[-1]) and (ms_h.iloc[-1] < 0):
+                flag_h1_macd0=True; notes.append("H1_MACD_zero_cross_sig_neg")
+
+        # Collect row (harmonize column names across modes)
+        row = {
+            "symbol": s,
+            "close": float(dfI["close"].iloc[-1]),
+            "rvol": float(rvol),
+            "atr_pct": float(atr14/last) if last>0 else np.nan,
+            "ema5": float(e5.iloc[-1]) if e5 is not None else np.nan,
+            "ema20": float(e20.iloc[-1]) if e20 is not None else np.nan,
+            "ema50": float(e50.iloc[-1]) if e50 is not None else np.nan,
+            "macd_line": float(macd_line.iloc[-1]),
+            "macd_signal": float(macd_sig.iloc[-1]),
+            "macd_hist": float(macd_hist.iloc[-1]),
+            "kdj_k": float(k.iloc[-1]),
+            "kdj_d": float(d_.iloc[-1]),
+            "kdj_j": float(j.iloc[-1]),
+            "roc20": float(roc20),
+            "flag_d1_ema200_breakout": flag_d1_ema200,
+            "flag_d1_macd_zero_cross_sig_neg": flag_d1_macd0,
+            "flag_h1_macd_zero_cross_sig_neg": flag_h1_macd0,
+            "notes": ", ".join(notes) if notes else ""
+        }
+        survivors.append(row)
+
+    if not survivors:
+        return refs, risk_used, effective_mode, total_universe, step1, step2, step3, pd.DataFrame(), pd.DataFrame(), big_rvol_h1, big_dv_d1, drops, bars_h, bars_d, min_hbars
+
+    df = pd.DataFrame(survivors)
+    df["inv_atr_pct"] = df["atr_pct"].replace(0, np.nan).rpow(-1)
+    df["rank_score"]  = 0.4*zscore(df["roc20"]) + 0.3*zscore(df["rvol"]) + 0.3*zscore(df["inv_atr_pct"])
+    df = df.sort_values("rank_score", ascending=False).reset_index(drop=True)
+
+    df_ui  = df.head(SHOW_LIMIT).copy()
+    df_out = df.head(20).copy()
+    as_of = now_et_str()
+    df_out.insert(0,"risk_mode", risk_used)
+    df_out.insert(0,"as_of_date", as_of)
+
+    # Output columns for Universe
+    cols = ["as_of_date","risk_mode","symbol","close","rvol","atr_pct",
+            "ema5","ema20","ema50","macd_line","macd_signal","macd_hist",
+            "kdj_k","kdj_d","kdj_j","roc20","rank_score",
+            "flag_d1_ema200_breakout","flag_d1_macd_zero_cross_sig_neg","flag_h1_macd_zero_cross_sig_neg","notes"]
+    for c in cols:
+        if c not in df_out.columns: df_out[c] = np.nan
+    df_out = df_out[cols]
+
+    return refs, risk_used, effective_mode, total_universe, step1, step2, step3, df_ui, df_out, big_rvol_h1, big_dv_d1, drops, bars_h, bars_d, min_hbars
+
+# ========= RUN =========
+left, right = st.columns([2,1])
+
+with st.spinner("Running scan…"):
+    refs, risk_used, mode_used, total_universe, s1, s2, s3, df_ui, df_out, big_rvol_h1, big_dv_d1, drops, bars_h, bars_d, min_hbars = run_pipeline()
+
+# ---- Context panel ----
+with left:
+    st.subheader("Market Context")
     vix_val = refs.get("vix", np.nan)
     st.write(
         f"**VIX:** {vix_val:.2f}" if isinstance(vix_val,(int,float)) and np.isfinite(vix_val) else "**VIX:** n/a",
         f" | **Risk (auto):** `{refs.get('risk_auto','normal')}`",
-        f" | **Using:** `{risk_mode}`"
+        f" | **Using:** `{risk_used}`",
+        f" | **Mode:** `{mode_used}`"
     )
     if refs.get("sector1d"):
         sect_df = pd.DataFrame({"Sector": list(refs["sector1d"].keys()),
@@ -523,71 +635,106 @@ with sentiment_col:
         st.dataframe(sect_df.sort_values("1D", ascending=False).style.format({"1D":"{:.2%}","5D":"{:.2%}"}),
                      use_container_width=True)
 
-with summary_col:
+with right:
     st.subheader("Run Summary")
     st.write(f"**As of (ET):** {now_et_str()}")
     st.write(f"**Universe cap:** {UNIVERSE_CAP:,}")
     st.write(f"**Universe scanned:** {total_universe:,}")
     st.write(f"**Step1/2/3 survivors:** {s1:,} / {s2:,} / {s3:,}")
-    st.write(f"**Tabs:** `{TAB_UNIVERSE}`, `{TAB_CONTEXT}`")
+    st.write(f"**Min H1 bars (fetched):** {min_hbars if bars_h else 0}")
 
-# UI table
+# ---- UI table ----
 st.subheader("Top Candidates (preview)")
 if df_ui.empty:
-    st.warning("No survivors under current hourly gates.")
+    st.warning("No survivors under current gates.")
 else:
-    num_cols = ["close","avg_vol_h20","avg_dollar_vol_h20","atr14_h1","atr_pct_h1",
-                "ema5_h1","ema20_h1","ema50_h1","macd_line_h1","macd_signal_h1","macd_hist_h1",
-                "kdj_k_h1","kdj_d_h1","kdj_j_h1","rvol_hour","roc20_h1","rank_score"]
+    num_cols = ["close","rvol","atr_pct","ema5","ema20","ema50","macd_line","macd_signal","macd_hist",
+                "kdj_k","kdj_d","kdj_j","roc20","rank_score"]
     for c in num_cols:
         if c in df_ui.columns: df_ui[c] = pd.to_numeric(df_ui[c], errors="coerce")
     fmt = {c:"{:.2f}" for c in num_cols if c in df_ui.columns}
     st.dataframe(df_ui.head(SHOW_LIMIT).style.format(fmt), use_container_width=True)
 
-# Build Context (vertical) and write (hard refresh)
-ctx = []
-ctx.append(["Timestamp (ET)", now_et_str()])
-ctx.append(["Risk mode (auto)", refs.get("risk_auto","")])
-ctx.append(["Risk mode (using)", risk_mode])
-ctx.append(["Scan timeframe", "Hourly (H1)"])
-ctx.append(["Universe cap", f"{UNIVERSE_CAP}"])
-ctx.append(["Universe scanned", f"{total_universe}"])
-ctx.append(["Step 1 survivors", f"{s1}"])
-ctx.append(["Step 2 survivors", f"{s2}"])
-ctx.append(["Step 3 survivors", f"{s3}"])
-ctx.append(["VIX level", f"{refs.get('vix', np.nan):.2f}" if isinstance(refs.get('vix'),(int,float)) and np.isfinite(refs.get('vix')) else "n/a"])
+# ---- Write Context (vertical; hard refresh) ----
+ctx_rows = []
+ctx_rows.append(["Timestamp (ET)", now_et_str()])
+ctx_rows.append(["Risk mode (auto)", refs.get("risk_auto","")])
+ctx_rows.append(["Risk mode (using)", risk_used])
+ctx_rows.append(["Scan mode (effective)", mode_used])
+ctx_rows.append(["Universe cap", f"{UNIVERSE_CAP}"])
+ctx_rows.append(["Universe scanned", f"{total_universe}"])
+ctx_rows.append(["Step 1 survivors", f"{s1}"])
+ctx_rows.append(["Step 2 survivors", f"{s2}"])
+ctx_rows.append(["Step 3 survivors", f"{s3}"])
+ctx_rows.append(["VIX level", f"{refs.get('vix', np.nan):.2f}" if isinstance(refs.get('vix'),(int,float)) and np.isfinite(refs.get('vix')) else "n/a"])
 
 def add_bucket(title, d1:dict, d5:dict):
-    ctx.append([title, ""])
+    ctx_rows.append([title, ""])
     for k in sorted(d1.keys()):
         v1 = d1.get(k, np.nan); v5 = d5.get(k, np.nan)
         v1s = f"{v1:.2%}" if isinstance(v1,(int,float)) and np.isfinite(v1) else "n/a"
         v5s = f"{v5:.2%}" if isinstance(v5,(int,float)) and np.isfinite(v5) else "n/a"
-        ctx.append([f"  {k}", f"1D {v1s} | 5D {v5s}"])
+        ctx_rows.append([f"  {k}", f"1D {v1s} | 5D {v5s}"])
 
 add_bucket("Sectors",   refs.get("sector1d",{}),   refs.get("sector5d",{}))
 add_bucket("Industries",refs.get("industry1d",{}), refs.get("industry5d",{}))
 add_bucket("Gold/Oil",  refs.get("commodity1d",{}),refs.get("commodity5d",{}))
 
-if big_rvol_h1:
-    ctx.append(["Top-10 RVOL (Hourly)", ", ".join(big_rvol_h1)])
-if big_dv_d1:
-    ctx.append(["Top-10 Dollar Volume (Daily)", ", ".join(big_dv_d1)])
+if big_rvol_h1: ctx_rows.append(["Top-10 RVOL (Hourly)", ", ".join(big_rvol_h1)])
+if big_dv_d1:  ctx_rows.append(["Top-10 Dollar Volume (Daily)", ", ".join(big_dv_d1)])
 
 try:
-    write_context_hard_replace(ctx)
+    write_context_hard_replace(ctx_rows)
     st.success("Context tab refreshed.")
 except Exception as e:
     st.error(f"Failed to write Context: {e}")
 
-# Write Universe (only when we have rows)
+# ---- Write Universe (only if rows) ----
 try:
     if df_out.empty:
         st.warning("No rows to write — Universe left unchanged.")
     else:
-        write_sheet_safe(df_out, TAB_UNIVERSE)
+        write_universe_safe(df_out)
         st.success("Universe tab updated.")
 except Exception as e:
     st.error(f"Failed to write Universe (previous data preserved): {e}")
 
-st.caption("All gates run on H1. Daily is used only for attention flags and market context. Context is vertical and hard-refreshed each run.")
+# ========= Diagnostics =========
+with st.expander("🛠 Diagnostics", expanded=False):
+    st.markdown("**Drop reasons (counts)**")
+    st.json(drops)
+
+    if bars_h:
+        counts = [len(df) for df in bars_h.values() if df is not None]
+        if counts:
+            st.write(f"H1 bars — min/median/max: **{int(np.min(counts))} / {int(np.median(counts))} / {int(np.max(counts))}**")
+    if bars_d:
+        counts = [len(df) for df in bars_d.values() if df is not None]
+        if counts:
+            st.write(f"D1 bars — min/median/max: **{int(np.min(counts))} / {int(np.median(counts))} / {int(np.max(counts))}**")
+
+    probe = st.text_input("Probe symbol (e.g., AAPL)", value="AAPL").strip().upper()
+    if probe:
+        try:
+            dfh = bars_h.get(probe); dfd = bars_d.get(probe)
+            st.write(f"**{probe}** — H1 bars: {len(dfh) if isinstance(dfh,pd.DataFrame) else 0}, D1 bars: {len(dfd) if isinstance(dfd,pd.DataFrame) else 0}")
+            if isinstance(dfh, pd.DataFrame) and not dfh.empty:
+                ch = dfh["close"].astype(float); vh = dfh["volume"].astype(float).fillna(0)
+                last = float(ch.iloc[-1]); atr14 = float(atr(dfh,14).iloc[-1]); base = vh.rolling(20, min_periods=20).mean().iloc[-1]
+                rvol = float(vh.iloc[-1]/base) if base and base>0 else np.nan
+                st.write(f"H1 close: {last:.2f} | ATR%: {((atr14/last)*100):.2f}% | RVOL_hour: {rvol:.2f}")
+                if GATE_EMA:
+                    e5,e20,e50 = ema(ch,5), ema(ch,20), ema(ch,50)
+                    st.write(f"EMA5:{e5.iloc[-1]:.2f}  EMA20:{e20.iloc[-1]:.2f}  EMA50:{e50.iloc[-1]:.2f}")
+                if GATE_MACD:
+                    ml, ms, mh = macd(ch)
+                    st.write(f"MACD line:{ml.iloc[-1]:.3f}  signal:{ms.iloc[-1]:.3f}  hist:{mh.iloc[-1]:.3f}")
+            if isinstance(dfd, pd.DataFrame) and not dfd.empty:
+                cd = dfd["close"].astype(float); vd = dfd["volume"].astype(float).fillna(0)
+                base = vd.rolling(20, min_periods=20).mean().iloc[-1]
+                rvol_d = float(vd.iloc[-1]/base) if base and base>0 else np.nan
+                st.write(f"D1 close: {cd.iloc[-1]:.2f} | RVOL_today: {rvol_d:.2f}")
+        except Exception as e:
+            st.write(f"Probe error: {e}")
+
+st.caption("Auto mode prefers Hourly; if H1 bars are insufficient, falls back to Daily. Context is vertical and refreshed each run.")
