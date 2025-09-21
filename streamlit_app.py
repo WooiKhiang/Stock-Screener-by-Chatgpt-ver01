@@ -12,7 +12,7 @@ import streamlit as st
 GOOGLE_SHEET_ID   = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 GOOGLE_SHEET_NAME = "Universe"   # <- we overwrite this tab each run
 
-# Alpaca credentials (feel free to move these to Streamlit secrets later)
+# Alpaca credentials (you can move these to Streamlit secrets later)
 ALPACA_KEY    = os.getenv("ALPACA_KEY",    "PKIG445MPT704CN8P0R8")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "3GQdWcnbMo6V8uvhVa6BK6EbvnH4EHinlsU6uvj4")
 ALPACA_BASE   = "https://paper-api.alpaca.markets/v2"   # assets, account, calendar
@@ -35,12 +35,11 @@ st.sidebar.header("Run Control")
 autorun = st.sidebar.checkbox("Auto-run every hour", value=True,
                               help="Refreshes this app every 60 minutes and pushes the latest candidates.")
 try:
-    # Available in many Streamlit versions
+    # Try Streamlit's autorefresh; fallback to JS if not present
     st_autorefresh = getattr(st, "autorefresh", None) or getattr(st, "experimental_autorefresh", None)
     if autorun and st_autorefresh:
         st_autorefresh(interval=60*60*1000, key="hourly_autorefresh")  # 60 minutes
     elif autorun:
-        # Fallback: simple JS reload (safe; used only if autorefresh isn't available)
         st.markdown("<script>setTimeout(()=>window.location.reload(), 3600000);</script>", unsafe_allow_html=True)
 except Exception:
     pass
@@ -61,6 +60,7 @@ st.title("🧭 Daily Candidates — Clean, fast, PDT-safe (Alpaca → Sheets)")
 # Helpers
 # =========================
 ET = pytz.timezone("America/New_York")
+HEADERS = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
 
 def now_et_str():
     return dt.datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
@@ -85,31 +85,81 @@ def zscore(x: pd.Series) -> pd.Series:
         return pd.Series([0.0]*len(x), index=x.index)
     return (x - m) / s
 
-HEADERS = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
-
 # =========================
 # Sentiment: yfinance (context only)
 # =========================
-def fetch_sentiment():
+# Soft import yfinance so the app still runs if it’s missing
+try:
     import yfinance as yf
+    YF_AVAILABLE = True
+except Exception:
+    YF_AVAILABLE = False
+
+def _yf_extract_close(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Handle yfinance shapes:
+    - MultiIndex columns with levels ('Adj Close', ticker) or ('Close', ticker)
+    - Single-level columns with tickers directly
+    Returns a DataFrame with tickers as columns and closes as values.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        lvl0 = df.columns.get_level_values(0)
+        if "Adj Close" in lvl0:
+            panel = df["Adj Close"].copy()
+        elif "Close" in lvl0:
+            panel = df["Close"].copy()
+        else:
+            # Fall back to the first level
+            first = sorted(set(lvl0))[0]
+            panel = df[first].copy()
+    else:
+        panel = df.copy()
+    # If it’s a Series (single ticker), make it 2D
+    if isinstance(panel, pd.Series):
+        panel = panel.to_frame()
+    return panel
+
+def fetch_sentiment():
+    if not YF_AVAILABLE:
+        return {"vix": float("nan"), "ret1d": {}, "ret5d": {}, "risk_mode_auto": "normal"}
+
     tickers = ["SPY", "^VIX", "XLF", "XLK", "XLY", "XLP", "XLV", "XLE", "XLI", "XLU", "XLRE", "XLB", "IYZ"]
-    data = yf.download(tickers=" ".join(tickers), period="10d", interval="1d", auto_adjust=True, progress=False)
-    last = data["Adj Close"].ffill().iloc[-1]
-    prev = data["Adj Close"].ffill().iloc[-2]
-    ret1d = (last/prev - 1.0).rename("ret1d")
-    ret5d = (last / data["Adj Close"].ffill().iloc[-5] - 1.0).rename("ret5d")
-    vix = float(last["^VIX"])
+    # Use auto_adjust=False so 'Adj Close' is available; but our extractor handles both anyway
+    data = yf.download(tickers=" ".join(tickers), period="10d", interval="1d",
+                       auto_adjust=False, progress=False)
+    if data is None or len(data) == 0:
+        return {"vix": float("nan"), "ret1d": {}, "ret5d": {}, "risk_mode_auto": "normal"}
+
+    panel = _yf_extract_close(data).ffill()
+    if len(panel) < 6:
+        # Not enough history; default gracefully
+        last = panel.iloc[-1]
+        prev = panel.iloc[-2] if len(panel) >= 2 else last
+        ret1d = (last/prev - 1.0).to_dict()
+        vix = float(last.get("^VIX", np.nan))
+        return {"vix": vix, "ret1d": ret1d, "ret5d": {}, "risk_mode_auto": "normal"}
+
+    last = panel.iloc[-1]
+    prev = panel.iloc[-2]
+    ret1d = (last/prev - 1.0).to_dict()
+
+    prev5 = panel.iloc[-5]
+    ret5d = (last/prev5 - 1.0).to_dict()
+
+    vix = float(last.get("^VIX", np.nan))
     defensives = ["XLV", "XLP", "XLU"]
     cyclicals  = ["XLK", "XLY", "XLF"]
-    def_mean_1 = ret1d[defensives].mean()
-    cyc_mean_1 = ret1d[cyclicals].mean()
-    def_mean_5 = ret5d[defensives].mean()
-    cyc_mean_5 = ret5d[cyclicals].mean()
+
+    def_mean_1 = np.nanmean([ret1d.get(s, np.nan) for s in defensives])
+    cyc_mean_1 = np.nanmean([ret1d.get(s, np.nan) for s in cyclicals])
+    def_mean_5 = np.nanmean([ret5d.get(s, np.nan) for s in defensives])
+    cyc_mean_5 = np.nanmean([ret5d.get(s, np.nan) for s in cyclicals])
+
     tight = (vix > 20.0) and (def_mean_1 > cyc_mean_1) and (def_mean_5 > cyc_mean_5)
     return {
         "vix": vix,
-        "ret1d": ret1d.to_dict(),
-        "ret5d": ret5d.to_dict(),
+        "ret1d": ret1d,
+        "ret5d": ret5d,
         "risk_mode_auto": "tight" if tight else "normal"
     }
 
@@ -195,7 +245,7 @@ def fetch_daily_bars_multi(symbols, start_iso, end_iso, timeframe="1Day", limit=
                         result[sym] = pd.concat([prev, g], ignore_index=True) if prev is not None else g
             page = js.get("next_page_token")
             if not page: break
-    # Ensure sorted, RTH-only doesn’t apply to 1D (already RTH)
+    # Ensure sorted
     for s, df in list(result.items()):
         result[s] = df.drop_duplicates(subset=["t"]).sort_values("t").reset_index(drop=True)
     return result
@@ -237,7 +287,7 @@ def fetch_hourly_bars(symbols, start_utc, end_utc):
                 add = add[["symbol","t","open","high","low","close","volume"]]
                 for sym, grp in add.groupby("symbol"):
                     result[sym] = grp.drop(columns=["symbol"]).copy()
-    # filter to RTH window per day
+    # filter to RTH window for today
     o,c = ny_open_close_utc(dt.datetime.now(dt.timezone.utc))
     for s, df in list(result.items()):
         mask = (df["t"]>=o) & (df["t"]<=c)
@@ -286,17 +336,13 @@ def check_halts(symbols):
         params = {"symbols": ",".join(chunk), "feed": FEED}
         r = requests.get(base, headers=HEADERS, params=params, timeout=60)
         if r.status_code >= 400:
-            # Soft fail: mark as unchecked
-            for s in chunk: out[s] = None
+            for s in chunk: out[s] = None  # unchecked
             continue
         js = r.json() or {}
         snap = js.get("snapshots", {})
         for s, info in snap.items():
-            halted = None
-            try:
-                halted = bool(info.get("latestTrade", {}).get("tape", None)) and bool(info.get("trading_halted", False))
-            except Exception:
-                halted = info.get("trading_halted", False)
+            # Alpaca snapshot has 'trading_halted' at top level
+            halted = info.get("trading_halted", None)
             out[s] = halted
     return out
 
@@ -304,7 +350,6 @@ def check_halts(symbols):
 # Pre-market context (survivors only; not used for signals)
 # =========================
 def premkt_context(symbols):
-    # compute gap_pm_pct vs prior close and premarket volume 04:00–09:29 ET
     res = {s: {"gap_pm_pct": None, "pm_vol": None} for s in symbols}
     if not symbols: return res
     now_utc = dt.datetime.now(dt.timezone.utc)
@@ -347,15 +392,9 @@ def premkt_context(symbols):
         prev_close = None
         if s in daily and len(daily[s])>=2:
             prev_close = float(daily[s]["close"].iloc[-2])
-            last_premkt_trade = None
-            # If any minute bars exist, take the last PM close as context; else use prior close
-            pm_vol = res_pm.get(s, 0.0)
-            gap = None
-            if prev_close and s in daily and len(daily[s])>=1:
-                last_close = float(daily[s]["close"].iloc[-1])  # last RTH close (yday)
-                # We don't have PM price cleanly on IEX always; use prev_close baseline
-                gap = 0.0
-            res[s] = {"gap_pm_pct": gap, "pm_vol": float(pm_vol)}
+        pm_vol = res_pm.get(s, 0.0)
+        # We keep 'gap_pm_pct' as None on IEX (lack of robust PM price)
+        res[s] = {"gap_pm_pct": None, "pm_vol": float(pm_vol)}
     return res
 
 # =========================
@@ -410,11 +449,10 @@ def run_pipeline():
         if risk_mode == "tight":
             if not (0.015 <= atr_pct <= 0.06):
                 continue
-            # require SMA50 > SMA200
             sma200 = sma(close, 200).iloc[-1]
             if not (sma50.iloc[-1] > sma200):
                 continue
-            if rvol_today < 1.1:  # tight mode
+            if rvol_today < 1.1:
                 continue
         else:
             if not (0.01 <= atr_pct <= 0.08):
@@ -467,7 +505,7 @@ def run_pipeline():
         })
 
     if not rows:
-        return sent, risk_mode, pd.DataFrame()
+        return sent, risk_mode, (TOP_N_TIGHT if risk_mode=="tight" else TOP_N_NORMAL), pd.DataFrame(), pd.DataFrame()
 
     df = pd.DataFrame(rows)
 
@@ -477,7 +515,6 @@ def run_pipeline():
     df = df.sort_values("rank_score", ascending=False).reset_index(drop=True)
 
     # Tagging — EMA200 series (cross/dip/rebreak) & hourly fakeout on top survivors only
-    # Quick EMA200 tracker:
     def tag_ema200(daily_df):
         c = daily_df["close"]; e200 = ema(c,200)
         tags=[]
@@ -486,25 +523,17 @@ def run_pipeline():
                 tags.append("EMA200_cross_up")
             if c.iloc[-1] < e200.iloc[-1] and c.iloc[-2] >= e200.iloc[-2]:
                 tags.append("EMA200_dip")
-            # 'rebreak' heuristic: crossed up in last 20d, minor dip, now back above
             last20 = (c.tail(20) > e200.tail(20)).astype(int)
             if last20.iloc[-1]==1 and last20.sum()>=18 and (c.iloc[-2] < e200.iloc[-2]):
                 tags.append("EMA200_rebreak")
         return tags
 
-    # Compute tags on survivors (limit to 80 for speed)
     survivors_syms = df["symbol"].head(80).tolist()
-    # Hourly fakeout (RTH today)
     o,c = ny_open_close_utc(dt.datetime.now(dt.timezone.utc))
     h1 = fetch_hourly_bars(survivors_syms, o, c)
-
-    # Pre-market context
     pm = premkt_context(survivors_syms)
-
-    # Trading halts check
     halts = check_halts(survivors_syms)
 
-    # Apply tags & context
     for i, row in df.iterrows():
         sym = row["symbol"]
         notes = []
@@ -533,7 +562,7 @@ def run_pipeline():
     df_ui  = df.head(SHOW_LIMIT).copy()
     df_out = df.head(20).copy()   # we always write Top-20 to sheet
 
-    # Add as_of_date and risk_mode cols (ET)
+    # Add as_of_date and risk_mode cols (ET) — repeated on each row
     as_of = now_et_str()
     df_out.insert(0, "risk_mode", risk_mode)
     df_out.insert(0, "as_of_date", as_of)
@@ -544,16 +573,13 @@ def run_pipeline():
         "atr14","atr_pct","sma20","sma50","ema5","ema20","ema50",
         "macd_line","macd_signal","macd_hist","kdj_k","kdj_d","kdj_j",
         "rvol_today","roc20","rank_score","gap_pm_pct","pm_vol",
-        # optional feasibility placeholders (kept for schema compatibility)
-        # you'd wire Alpaca /v2/account here if you want exact equity-based sizing
+        "feasible_qty_at_0p7pct_risk","stop_price_2p5atr",  # placeholders (optional gate off)
         "notes"
     ]
-    present = [c for c in cols if c in df_out.columns]
-    missing = [c for c in cols if c not in df_out.columns]
-    df_out = df_out[present]
-    # append missing columns (empty) to fit header
-    for m in missing:
-        df_out[m] = np.nan
+    # Ensure all columns exist
+    for m in cols:
+        if m not in df_out.columns:
+            df_out[m] = np.nan
     df_out = df_out[cols]
 
     return sent, risk_mode, topN, df_ui, df_out
@@ -592,14 +618,16 @@ with st.spinner("Running daily pipeline (Alpaca + yfinance)…"):
 with sentiment_col:
     st.subheader("Market Sentiment (context only)")
     vix = sent["vix"]
-    st.write(f"**VIX:** {vix:.2f}  |  **Risk mode (auto):** `{sent['risk_mode_auto']}`  |  **Using:** `{risk_mode}`")
+    st.write(f"**VIX:** {vix:.2f}" if isinstance(vix, (int,float)) and np.isfinite(vix) else "**VIX:** n/a",
+             f" | **Risk mode (auto):** `{sent.get('risk_mode_auto','normal')}`",
+             f" | **Using:** `{risk_mode}`")
     # quick sector table (1D/5D)
     sector_list = ["XLF","XLK","XLY","XLP","XLV","XLE","XLI","XLU","XLRE","XLB","IYZ"]
     df_sect = pd.DataFrame({
         "sector": sector_list,
-        "ret1d": [sent["ret1d"].get(s, np.nan) for s in sector_list],
-        "ret5d": [sent["ret5d"].get(s, np.nan) for s in sector_list],
-    }).sort_values("ret1d", ascending=False)
+        "ret1d": [sent.get("ret1d", {}).get(s, np.nan) for s in sector_list],
+        "ret5d": [sent.get("ret5d", {}).get(s, np.nan) for s in sector_list],
+    }).sort_values("ret1d", ascending=False, na_position="last")
     st.dataframe(df_sect.style.format({"ret1d":"{:.2%}","ret5d":"{:.2%}"}), use_container_width=True)
 
 # Summary / controls
@@ -627,4 +655,4 @@ try:
 except Exception as e:
     st.error(f"Sheets write failed: {e}")
 
-st.caption("Indicators use **RTH** bars only. Pre-/post-market values appear only in context columns. Hourly auto-run refreshes this page; each run **overwrites** the Google Sheet tab.")
+st.caption("Indicators use **RTH** bars only. Pre-/post-market values appear only in context columns. Hourly auto-run refreshes this page; each run **overwrites** the Google Sheet tab with ET timestamps on every row.")
