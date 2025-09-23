@@ -1,9 +1,9 @@
-# Market Scanner — ActiveNow (fast) + Signals (light) → Google Sheets
-# Tabs (drop & recreate safely): ActiveNow, SignalsH1, SignalsD1, Context
-# Stage A: Alpaca snapshots (IEX), no lookback → price band + active volume rank + PDH/DHP flags
-#          NEW: pre/post fallback to prevDailyBar for price/volume so premarket runs aren't empty
-# Stage B: On Top-K only → Alpaca H1/D1 bars (IEX) w/ fallback to yfinance → Donchian10, RSI(3), EMA stack, MACD zero-line, EMA200 breakout
-# Sheets: conflict-safe writes; auto cleanup of *_conflict tabs
+# Ultra-lean Market Scanner — Volume-only (no lookback) → Google Sheets
+# Tabs (drop & recreate safely): ActiveNow, Context
+# Data source: Alpaca snapshots (IEX). No hourly/daily bar downloads.
+# Ranking: minute volume (if RTH) else daily volume; if missing pre/post → prev-day volume.
+# Price fallback: latestTrade.p → minuteBar.c → dailyBar.c → prevDailyBar.c
+# Flags: PDH break, Day-high proximity (only when today's high exists)
 
 import os, json, time, random, datetime as dt
 import numpy as np
@@ -16,16 +16,14 @@ import pytz, requests, streamlit as st
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 
 TAB_ACTIVENOW = "ActiveNow"
-TAB_SIG_H1    = "SignalsH1"
-TAB_SIG_D1    = "SignalsD1"
 TAB_CONTEXT   = "Context"
 
-# Alpaca creds (prefer env; literals as fallback)
+# Alpaca creds (use env if provided)
 ALPACA_KEY    = os.getenv("ALPACA_KEY",    "PKIG445MPT704CN8P0R8")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "3GQdWcnbMo6V8uvhVa6BK6EbvnH4EHinlsU6uvj4")
 ALPACA_BASE   = "https://paper-api.alpaca.markets/v2"
 ALPACA_DATA   = "https://data.alpaca.markets"
-FEED          = "iex"   # avoid SIP 403s
+FEED          = "iex"   # avoid SIP entitlement issues
 
 # Google SA JSON in Streamlit secrets
 SA_RAW = st.secrets.get("GCP_SERVICE_ACCOUNT") or os.getenv("GCP_SERVICE_ACCOUNT")
@@ -36,8 +34,8 @@ HEADERS = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
 # =========================
 # UI
 # =========================
-st.set_page_config(page_title="Market Scanner — ActiveNow + Signals", layout="wide")
-st.title("⚡ Market Scanner — ActiveNow + Signals (Alpaca → Google Sheets)")
+st.set_page_config(page_title="Volume Scanner — ActiveNow", layout="wide")
+st.title("⚡ Volume Scanner — ActiveNow (Snapshots only)")
 
 autorun = st.sidebar.checkbox("Auto-run hourly", value=True)
 try:
@@ -52,18 +50,16 @@ except Exception:
 st.sidebar.markdown("### Universe")
 UNIVERSE_CAP = st.sidebar.slider("Symbols to scan (cap)", 1000, 12000, 8000, 500)
 
-st.sidebar.markdown("### Filters (Stage A)")
+st.sidebar.markdown("### Filters")
 PRICE_MIN = st.sidebar.number_input("Min price ($)", value=5.0, step=0.5)
 PRICE_MAX = st.sidebar.number_input("Max price ($)", value=100.0, step=1.0)
-TOP_K     = st.sidebar.slider("Top K to keep (by active volume)", 200, 3000, 1200, 100)
+TOP_K     = st.sidebar.slider("Top K to keep (by volume)", 200, 3000, 1200, 100)
 
-st.sidebar.markdown("### Flags (Stage A)")
+st.sidebar.markdown("### Flags (no lookback)")
 DHP_DELTA = st.sidebar.slider("Day-high proximity δ", 0.001, 0.02, 0.005, 0.001,
-                              help="Flag if last ≥ today's high × (1−δ). 0.005 = within 0.5% of day high")
+                              help="Flag if last ≥ today's high × (1−δ). Only when today's high exists.")
 
-st.sidebar.markdown("### Bars (Stage B — survivors only, automatic)")
-H1_LIMIT = st.sidebar.slider("Hourly bars limit (H1)", 30, 80, 60, 5)
-D1_LIMIT = st.sidebar.slider("Daily bars limit (D1)", 180, 260, 220, 10)
+st.sidebar.markdown("### Network")
 SNAPSHOT_CHUNK = st.sidebar.slider("Snapshot chunk size (start)", 100, 600, 300, 50)
 
 # =========================
@@ -77,7 +73,7 @@ def now_et_str():
 
 def is_market_open_now():
     n = now_et()
-    if n.weekday() >= 5:  # weekend
+    if n.weekday() >= 5:
         return False
     return dt.time(9,30) <= n.time() <= dt.time(16,0)
 
@@ -93,33 +89,8 @@ def parse_sa(raw_json: str) -> dict:
             raw_json = raw_json.replace(block, block.replace("\r\n","\n").replace("\n","\\n"))
         return json.loads(raw_json)
 
-def rth_only_hour(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return df
-    et_times = df["t"].dt.tz_convert(ET)
-    mask = (et_times.dt.time >= dt.time(9,30)) & (et_times.dt.time <= dt.time(16,0))
-    return df[mask].reset_index(drop=True)
-
-def ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
-
-def macd_line_sig(x: pd.Series, fast=12, slow=26, signal=9):
-    ef, es = ema(x, fast), ema(x, slow)
-    line = ef - es
-    sig  = line.ewm(span=signal, adjust=False).mean()
-    return line, sig
-
-def rsi(series: pd.Series, n: int = 3) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
-    roll_down = down.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
-    rs = roll_up / roll_down.replace(0, np.nan)
-    r = 100 - (100 / (1 + rs))
-    return r
-
 # =========================
-# Alpaca I/O
+# Alpaca I/O (robust snapshots)
 # =========================
 _last_data_error = {}
 
@@ -133,13 +104,12 @@ def fetch_active_symbols(cap: int):
         if x.get("exchange") in keep_exch and x.get("tradable"):
             s = x.get("symbol","")
             if not s: continue
-            if s.endswith((".U",".W","WS","W","R",".P","-P")):  # sanitize tails
+            if s.endswith((".U",".W","WS","W","R",".P","-P")):
                 continue
             syms.append(s)
         if len(syms) >= cap: break
     return syms[:cap]
 
-# ---------- Robust snapshots ----------
 def _snapshots_request(symbols_batch, max_retries=5, timeout_s=120):
     url = f"{ALPACA_DATA}/v2/stocks/snapshots"
     params = {"symbols": ",".join(symbols_batch), "feed": FEED}
@@ -168,89 +138,6 @@ def _snapshots_request(symbols_batch, max_retries=5, timeout_s=120):
     _last_data_error["snapshots"] = (408, "retry timeout")
     return None
 
-def fetch_bars_multi(symbols, timeframe="1Hour", limit=60, chunk=150):
-    out = {}
-    end = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-    start = end - dt.timedelta(days=60 if timeframe=="1Hour" else 400)
-    start_iso = start.isoformat().replace("+00:00","Z")
-    end_iso   = end.isoformat().replace("+00:00","Z")
-
-    def _bars_request(params, max_retries=4):
-        url = f"{ALPACA_DATA}/v2/stocks/bars"
-        p = dict(params); p["feed"] = FEED
-        backoff = 1.0
-        for _ in range(max_retries):
-            try:
-                r = requests.get(url, headers=HEADERS, params=p, timeout=90)
-            except requests.Timeout:
-                pass
-            else:
-                if r.status_code in (429,500,502,503,504):
-                    pass
-                elif r.status_code >= 400:
-                    try: msg = r.json().get("message", r.text[:300])
-                    except Exception: msg = r.text[:300]
-                    _last_data_error[f"bars_{p.get('timeframe')}"] = (r.status_code, msg)
-                    return None
-                else:
-                    try:
-                        return r.json()
-                    except Exception:
-                        _last_data_error[f"bars_{p.get('timeframe')}"] = (r.status_code, "JSON parse error")
-                        return None
-            time.sleep(backoff + random.random()*0.3)
-            backoff = min(backoff*1.7, 6.0)
-        _last_data_error[f"bars_{p.get('timeframe')}"] = (408, "retry timeout")
-        return None
-
-    def merge_json(js):
-        bars = js.get("bars", [])
-        if isinstance(bars, dict):
-            for sym, arr in bars.items():
-                if not arr:
-                    if sym not in out: out[sym] = pd.DataFrame(columns=["t","open","high","low","close","volume"])
-                    continue
-                df = pd.DataFrame(arr)
-                df["t"] = pd.to_datetime(df["t"], utc=True)
-                df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
-                out[sym] = pd.concat([out.get(sym), df[["t","open","high","low","close","volume"]]], ignore_index=True)
-        else:
-            if bars:
-                df = pd.DataFrame(bars)
-                df["t"] = pd.to_datetime(df["t"], utc=True)
-                df.rename(columns={"S":"symbol","o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
-                for sym, grp in df.groupby("symbol"):
-                    out[sym] = pd.concat([out.get(sym), grp[["t","open","high","low","close","volume"]]], ignore_index=True)
-
-    i = 0
-    cur_chunk = max(60, chunk)
-    while i < len(symbols):
-        batch = symbols[i:i+cur_chunk]
-        params = dict(timeframe=timeframe, symbols=",".join(batch), limit=limit,
-                      start=start_iso, end=end_iso, adjustment="raw")
-        page=None; ok=False
-        while True:
-            p = dict(params)
-            if page: p["page_token"] = page
-            js = _bars_request(p)
-            if js is None: break
-            merge_json(js)
-            page = js.get("next_page_token")
-            if not page: ok=True; break
-        if not ok and cur_chunk > 60:
-            cur_chunk = max(40, cur_chunk // 2)
-            continue
-        i += len(batch)
-        time.sleep(0.12)
-    # Clean & RTH for H1
-    for s, df in list(out.items()):
-        if df is None or df.empty: continue
-        df = df.drop_duplicates(subset=["t"]).sort_values("t").reset_index(drop=True)
-        if timeframe.lower() in ("1hour","1h","60m","60min"):
-            df = rth_only_hour(df)
-        out[s] = df
-    return out
-
 def fetch_snapshots_multi(symbols, chunk=300):
     out = {}
     i = 0
@@ -263,20 +150,28 @@ def fetch_snapshots_multi(symbols, chunk=300):
             if cur_chunk > 40:
                 cur_chunk = max(20, cur_chunk // 2)
                 continue
-            # fallback: synthesize from daily bars for this batch
+            # fallback: synthesize from daily bars (1-day & prev-day) for this batch
             try:
-                bars_today = fetch_bars_multi(batch, timeframe="1Day", limit=1, chunk=max(60, cur_chunk))
-                bars_prev2 = fetch_bars_multi(batch, timeframe="1Day", limit=2, chunk=max(60, cur_chunk))
+                # Use bars endpoint but only 1–2 rows; still light
+                url = f"{ALPACA_DATA}/v2/stocks/bars"
+                params_today = {"symbols": ",".join(batch), "timeframe":"1Day","limit":1,"adjustment":"raw","feed":FEED}
+                params_prev2 = {"symbols": ",".join(batch), "timeframe":"1Day","limit":2,"adjustment":"raw","feed":FEED}
+                r1 = requests.get(url, headers=HEADERS, params=params_today, timeout=60)
+                r2 = requests.get(url, headers=HEADERS, params=params_prev2, timeout=60)
+                js1 = r1.json() if r1.ok else {}
+                js2 = r2.json() if r2.ok else {}
+                bars1 = js1.get("bars",{})
+                bars2 = js2.get("bars",{})
                 for s in batch:
                     snap = {}
-                    tbar = bars_today.get(s)
-                    pbar2 = bars_prev2.get(s)
-                    if tbar is not None and not tbar.empty:
-                        last = tbar.iloc[-1]
-                        snap["dailyBar"] = {"c": float(last["close"]), "h": float(last["high"]), "v": float(last["volume"])}
-                    if pbar2 is not None and len(pbar2) >= 2:
-                        prev = pbar2.iloc[-2]
-                        snap["prevDailyBar"] = {"h": float(prev["high"]), "c": float(prev["close"]), "v": float(prev["volume"])}
+                    t = bars1.get(s) or []
+                    p = bars2.get(s) or []
+                    if t:
+                        last = t[-1]
+                        snap["dailyBar"] = {"c": float(last.get("c",0)), "h": float(last.get("h",0)), "v": float(last.get("v",0))}
+                    if p and len(p) >= 2:
+                        prev = p[-2]
+                        snap["prevDailyBar"] = {"c": float(prev.get("c",0)), "h": float(prev.get("h",0)), "v": float(prev.get("v",0))}
                     out[s] = snap
             except Exception:
                 for s in batch: out[s] = {}
@@ -291,46 +186,6 @@ def fetch_snapshots_multi(symbols, chunk=300):
         time.sleep(0.15)
         if cur_chunk < chunk:
             cur_chunk = min(chunk, int(cur_chunk * 1.25))
-    return out
-
-# =========================
-# Yahoo fallback (only if needed)
-# =========================
-def fetch_yf_hourly(symbols):
-    try:
-        import yfinance as yf
-    except Exception:
-        return {}
-    out = {}
-    for s in symbols:
-        try:
-            df = yf.download(s, period="30d", interval="1h", auto_adjust=False, progress=False, prepost=False, threads=False)
-            if df is None or df.empty:
-                out[s] = pd.DataFrame(); continue
-            df = df.reset_index().rename(columns={"Datetime":"t","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
-            df["t"] = pd.to_datetime(df["t"], utc=True)
-            df = rth_only_hour(df)
-            out[s] = df[["t","open","high","low","close","volume"]].copy()
-        except Exception:
-            out[s] = pd.DataFrame()
-    return out
-
-def fetch_yf_daily(symbols):
-    try:
-        import yfinance as yf
-    except Exception:
-        return {}
-    out = {}
-    for s in symbols:
-        try:
-            df = yf.download(s, period="250d", interval="1d", auto_adjust=False, progress=False, prepost=False, threads=False)
-            if df is None or df.empty:
-                out[s] = pd.DataFrame(); continue
-            df = df.reset_index().rename(columns={"Date":"t","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
-            df["t"] = pd.to_datetime(df["t"], utc=True)
-            out[s] = df[["t","open","high","low","close","volume"]].copy()
-        except Exception:
-            out[s] = pd.DataFrame()
     return out
 
 # =========================
@@ -356,7 +211,6 @@ def cleanup_conflict_tabs(sh, base_title: str):
         pass
 
 def drop_and_create(sh, title, rows=200, cols=40):
-    # Try to delete; if it fails or races, fall back to clearing the existing sheet
     try:
         titles = {w.title: w for w in sh.worksheets()}
         if title in titles:
@@ -368,7 +222,6 @@ def drop_and_create(sh, title, rows=200, cols=40):
                 sh.del_worksheet(tmp)
             else:
                 sh.del_worksheet(ws)
-                # wait for deletion to propagate
                 time.sleep(0.4)
                 ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
         else:
@@ -376,7 +229,6 @@ def drop_and_create(sh, title, rows=200, cols=40):
         cleanup_conflict_tabs(sh, title)
         return ws
     except Exception:
-        # fallback: ensure exists then clear a big range
         try:
             ws = sh.worksheet(title)
         except Exception:
@@ -391,7 +243,7 @@ def write_frame_to_ws(sh, title, df: pd.DataFrame):
     ws.update("A1", values, value_input_option="RAW")
 
 # =========================
-# Stage A — snapshots → ActiveNow
+# Stage A — snapshots → ActiveNow (no lookback)
 # =========================
 def stage_a_activenow():
     symbols = fetch_active_symbols(UNIVERSE_CAP)
@@ -407,7 +259,7 @@ def stage_a_activenow():
         db = snap.get("dailyBar") or {}
         pdbar = snap.get("prevDailyBar") or {}
 
-        # ---- robust price: lt.p -> mb.c -> db.c -> prevDaily.c (NEW fallback)
+        # Price fallback: lt.p -> mb.c -> db.c -> prevDaily.c
         p = None
         try:
             for cand in (lt.get("p"), mb.get("c"), db.get("c"), pdbar.get("c")):
@@ -419,7 +271,9 @@ def stage_a_activenow():
             price_drops += 1
             continue
 
-        # ---- robust volume: minute (if RTH & >0) else daily -> prevDaily (NEW)
+        # Volume fallback:
+        #   If market open & minute vol > 0 -> use minute volume,
+        #   else use today's daily vol; if missing/0 (pre-open) -> prevDaily vol.
         mv = float(mb.get("v") or 0.0)
         dv = float(db.get("v") or 0.0)
         pv = float(pdbar.get("v") or 0.0)
@@ -431,7 +285,7 @@ def stage_a_activenow():
             else:
                 active_vol, vol_source = pv, "prev_daily"
 
-        # ---- flags (no lookback)
+        # Flags: PDH break (needs prevDaily.h); Day-high proximity only when today's high exists.
         prev_high  = pdbar.get("h")
         today_high = db.get("h")
         flag_pdh_break = bool(prev_high is not None and p > float(prev_high))
@@ -462,88 +316,7 @@ def stage_a_activenow():
     return df_out, symbols, {"price_drops": price_drops, "rth": rth}
 
 # =========================
-# Stage B — bars → SignalsH1 / SignalsD1
-# =========================
-def stage_b_signals(top_symbols):
-    # ----- Hourly bars (H1) -----
-    bars_h = fetch_bars_multi(top_symbols, timeframe="1Hour", limit=H1_LIMIT, chunk=150)
-    need_yf_h = [s for s in top_symbols if (bars_h.get(s) is None or bars_h.get(s).empty or len(bars_h.get(s)) < 12)]
-    if need_yf_h:
-        yf_h = fetch_yf_hourly(need_yf_h)
-        for s in need_yf_h:
-            if yf_h.get(s) is not None and not yf_h[s].empty:
-                bars_h[s] = yf_h[s]
-
-    # ----- Daily bars (D1) -----
-    bars_d = fetch_bars_multi(top_symbols, timeframe="1Day", limit=D1_LIMIT, chunk=150)
-    need_yf_d = [s for s in top_symbols if (bars_d.get(s) is None or bars_d.get(s).empty or len(bars_d.get(s)) < 201)]
-    if need_yf_d:
-        yf_d = fetch_yf_daily(need_yf_d)
-        for s in need_yf_d:
-            if yf_d.get(s) is not None and not yf_d[s].empty:
-                bars_d[s] = yf_d[s]
-
-    # ----- Compute H1 flags -----
-    rows_h1 = []
-    for s in top_symbols:
-        df = bars_h.get(s)
-        if df is None or df.empty or len(df) < 12:
-            continue
-        cl = df["close"].astype(float); hi = df["high"].astype(float); vol = df["volume"].astype(float)
-
-        # Donchian-10 breakout: close(t) > max(high[t-10 .. t-1])
-        hh10_prev = hi.shift(1).rolling(10, min_periods=10).max().iloc[-1]
-        donchian10_break = bool(np.isfinite(hh10_prev) and cl.iloc[-1] > hh10_prev)
-
-        # RSI(3) cross above 50
-        rsi3 = rsi(cl, 3)
-        rsi3_cross50 = bool(len(rsi3) >= 2 and rsi3.iloc[-2] <= 50 and rsi3.iloc[-1] > 50)
-
-        # EMA stack (info)
-        e10, e20, e50, e100 = ema(cl,10), ema(cl,20), ema(cl,50), ema(cl,100)
-        stack_h1_bull = bool(cl.iloc[-1] > e50.iloc[-1] > e100.iloc[-1] and e10.iloc[-1] > e20.iloc[-1])
-
-        # MACD zero-line cross while signal < 0
-        ml, ms = macd_line_sig(cl)
-        macd_zero_cross_sig_neg = bool(len(ml)>=2 and (ml.iloc[-2] <= 0 < ml.iloc[-1]) and (ms.iloc[-1] < 0))
-
-        rows_h1.append({
-            "symbol": s,
-            "last_h1_close": float(cl.iloc[-1]),
-            "last_h1_vol": float(vol.iloc[-1]),
-            "flag_donchian10_breakout": donchian10_break,
-            "flag_rsi3_cross50": rsi3_cross50,
-            "stack_h1_bull": stack_h1_bull,
-            "flag_h1_macd_zero_cross_sig_neg": macd_zero_cross_sig_neg
-        })
-
-    df_h1 = pd.DataFrame(rows_h1)
-    if not df_h1.empty:
-        df_h1.insert(0, "as_of_et", now_et_str())
-
-    # ----- Compute D1 flag -----
-    rows_d1 = []
-    for s in top_symbols:
-        df = bars_d.get(s)
-        if df is None or df.empty or len(df) < 201:
-            continue
-        cl = df["close"].astype(float)
-        e200 = ema(cl,200)
-        flag = bool(cl.iloc[-1] > e200.iloc[-1] and cl.iloc[-2] <= e200.iloc[-2])
-        rows_d1.append({
-            "symbol": s,
-            "last_d1_close": float(cl.iloc[-1]),
-            "flag_d1_ema200_breakout": flag
-        })
-
-    df_d1 = pd.DataFrame(rows_d1)
-    if not df_d1.empty:
-        df_d1.insert(0, "as_of_et", now_et_str())
-
-    return df_h1, df_d1
-
-# =========================
-# Context (no lookback)
+# Context (tiny; no lookback)
 # =========================
 CONTEXT_TICKERS = ["SPY", "VIXY", "XLF", "XLK", "XLY", "XLP", "XLV", "XLE", "XLI", "XLU",
                    "XLRE", "XLB", "SMH", "XOP", "XBI", "XME", "KRE", "ITB", "IYT", "TAN"]
@@ -571,11 +344,11 @@ def build_context():
 # =========================
 left, right = st.columns([2,1])
 
-with st.spinner("Stage A — scanning snapshots…"):
+with st.spinner("Scanning snapshots (no lookback)…"):
     df_active, all_syms, a_diag = stage_a_activenow()
 
 with left:
-    st.subheader(f"ActiveNow — Top {len(df_active) if not df_active.empty else 0} by active volume (Price ${PRICE_MIN:.0f}–${PRICE_MAX:.0f})")
+    st.subheader(f"ActiveNow — Top {len(df_active) if not df_active.empty else 0} by volume (Price ${PRICE_MIN:.0f}–${PRICE_MAX:.0f})")
     if df_active.empty:
         st.warning("No matches under current settings.")
     else:
@@ -583,14 +356,14 @@ with left:
         st.dataframe(df_active.style.format(fmt), use_container_width=True)
 
 with right:
-    st.subheader("Run Summary (Stage A)")
+    st.subheader("Run Summary")
     st.write(f"**As of (ET):** {now_et_str()}")
     st.write(f"**Universe cap:** {UNIVERSE_CAP:,}")
     st.write(f"**Universe scanned:** {len(all_syms):,}")
     st.write(f"**Market open:** {a_diag.get('rth')}")
     st.write(f"**Price-band drops:** {a_diag.get('price_drops',0)}")
 
-# Write ActiveNow immediately (conflict-safe)
+# Write ActiveNow (conflict-safe)
 try:
     sh = get_gc()
     if not df_active.empty:
@@ -605,52 +378,7 @@ try:
 except Exception as e:
     st.error(f"Failed to write {TAB_ACTIVENOW}: {e}")
 
-# Stage B — survivors only
-if not df_active.empty:
-    with st.spinner("Stage B — computing SignalsH1 / SignalsD1 on Top-K survivors…"):
-        top_syms = df_active["symbol"].tolist()
-        df_h1, df_d1 = stage_b_signals(top_syms)
-
-        # Preview
-        st.subheader("Signals (preview)")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**SignalsH1**")
-            if df_h1.empty:
-                st.warning("SignalsH1: no rows.")
-            else:
-                st.dataframe(df_h1.head(20), use_container_width=True)
-        with col2:
-            st.markdown("**SignalsD1**")
-            if df_d1.empty:
-                st.warning("SignalsD1: no rows.")
-            else:
-                st.dataframe(df_d1.head(20), use_container_width=True)
-
-        # Write Sheets (conflict-safe)
-        try:
-            if not df_h1.empty:
-                write_frame_to_ws(sh, TAB_SIG_H1, df_h1)
-            else:
-                write_frame_to_ws(sh, TAB_SIG_H1, pd.DataFrame(columns=[
-                    "as_of_et","symbol","last_h1_close","last_h1_vol",
-                    "flag_donchian10_breakout","flag_rsi3_cross50","stack_h1_bull","flag_h1_macd_zero_cross_sig_neg"
-                ]))
-            st.success(f"{TAB_SIG_H1} refreshed.")
-        except Exception as e:
-            st.error(f"Failed to write {TAB_SIG_H1}: {e}")
-        try:
-            if not df_d1.empty:
-                write_frame_to_ws(sh, TAB_SIG_D1, df_d1)
-            else:
-                write_frame_to_ws(sh, TAB_SIG_D1, pd.DataFrame(columns=[
-                    "as_of_et","symbol","last_d1_close","flag_d1_ema200_breakout"
-                ]))
-            st.success(f"{TAB_SIG_D1} refreshed.")
-        except Exception as e:
-            st.error(f"Failed to write {TAB_SIG_D1}: {e}")
-
-# Context (small)
+# Context
 with st.spinner("Updating Context…"):
     try:
         df_ctx = build_context()
