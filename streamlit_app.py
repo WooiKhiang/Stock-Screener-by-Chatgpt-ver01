@@ -1,9 +1,9 @@
 # Hourly Scanner (lean) — Alpaca → Google Sheets
+# FIX: Force feed=iex (no SIP fallback) to avoid 403 "subscription does not permit querying recent SIP data".
 # Gates: price band, H1 liquidity, RVOL_hour, EMA stack, optional KDJ cross
-# Flags (not gates): H1 MACD zero cross w/ signal<0, D1 EMA200 breakout (survivors-only)
+# Flags: H1 MACD zero cross w/ signal<0; D1 EMA200 breakout (survivors-only)
 # Rank: 0.6*Z(RVOL_hour) + 0.4*Z(1/ATR%)
 # Output: overwrite "Universe" tab each run (safe replace). RTH-only for hourly bars.
-# Robust fetch: retries, chunk-down, per-symbol fallback; Diagnostics shows last data error.
 
 import os, json, time, datetime as dt
 import numpy as np
@@ -19,7 +19,7 @@ ALPACA_KEY    = os.getenv("ALPACA_KEY",    "PKIG445MPT704CN8P0R8")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "3GQdWcnbMo6V8uvhVa6BK6EbvnH4EHinlsU6uvj4")
 ALPACA_BASE   = "https://paper-api.alpaca.markets/v2"
 ALPACA_DATA   = "https://data.alpaca.markets"
-FEED          = "iex"  # free/paper
+FEED          = "iex"  # FORCE IEX
 
 SA_RAW = st.secrets.get("GCP_SERVICE_ACCOUNT") or os.getenv("GCP_SERVICE_ACCOUNT")
 
@@ -104,14 +104,38 @@ def fetch_active_symbols(cap: int):
     syms = [s for s in syms if not s.endswith(bad_suffixes)]
     return syms[:cap]
 
+def _bars_request(params, max_retries=3):
+    """ Single HTTP call using FEED=iex only; no SIP fallback. """
+    base = f"{ALPACA_DATA}/v2/stocks/bars"
+    p = dict(params)
+    p["feed"] = FEED  # FORCE IEX
+    for attempt in range(max_retries):
+        r = requests.get(base, headers=HEADERS, params=p, timeout=60)
+        if r.status_code in (429,500,502,503,504):
+            time.sleep(1.2*(attempt+1)); continue
+        if r.status_code >= 400:
+            try:
+                msg = r.json().get("message", r.text[:300])
+            except Exception:
+                msg = r.text[:300]
+            _last_data_error.update({"where": f"/bars {p.get('timeframe')} feed=iex",
+                                     "status": r.status_code, "message": msg})
+            return None
+        try:
+            return r.json()
+        except Exception:
+            _last_data_error.update({"where": f"/bars parse feed=iex", "status": r.status_code, "message": "JSON parse error"})
+            return None
+    _last_data_error.update({"where": f"/bars {p.get('timeframe')} feed=iex", "status": 408, "message": "retry timeout"})
+    return None
+
 def fetch_bars_multi_limit(symbols, timeframe="1Hour", limit=80, chunk_size=150, max_retries=3):
     """
-    Multi-symbol bars fetch using limit; includes retries, chunk-down, and per-symbol fallback.
+    Multi-symbol bars fetch using limit; retries and per-symbol fallback.
     RTH filter is applied for hourly.
+    FEED is forced to IEX to avoid SIP 403.
     """
-    base = f"{ALPACA_DATA}/v2/stocks/bars"
     out = {}
-    tf_candidates = [timeframe, "1H", "1Hour"]
     end = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     start = end - dt.timedelta(days=40)
     start_iso = start.isoformat().replace("+00:00","Z")
@@ -137,78 +161,51 @@ def fetch_bars_multi_limit(symbols, timeframe="1Hour", limit=80, chunk_size=150,
                 for sym, grp in df.groupby("symbol"):
                     out[sym] = pd.concat([out.get(sym), grp[["t","open","high","low","close","volume"]]], ignore_index=True)
 
-    def do(params):
-        # Try with feed first, then without
-        for use_feed in [True, False]:
-            p = dict(params)
-            if use_feed and FEED:
-                p["feed"] = FEED
-            else:
-                p.pop("feed", None)
-            for attempt in range(max_retries):
-                r = requests.get(base, headers=HEADERS, params=p, timeout=60)
-                if r.status_code in (429,500,502,503,504):
-                    time.sleep(1.2*(attempt+1)); continue
-                if r.status_code >= 400:
-                    try:
-                        msg = r.json().get("message", r.text[:300])
-                    except Exception:
-                        msg = r.text[:300]
-                    _last_data_error.update({"where": f"/bars {p.get('timeframe')} feed={'on' if use_feed else 'off'}",
-                                             "status": r.status_code, "message": msg})
-                    return None
-                try:
-                    return r.json()
-                except Exception:
-                    _last_data_error.update({"where": f"/bars parse", "status": r.status_code, "message": "JSON parse error"})
-                    return None
-        return None
-
     i = 0
     while i < len(symbols):
         chunk = symbols[i:i+chunk_size]
-        ok = False
-        for tf in tf_candidates:
-            params = dict(timeframe=tf, symbols=",".join(chunk), limit=limit, start=start_iso, end=end_iso, adjustment="raw")
-            page = None
-            while True:
-                if page: params["page_token"] = page
-                js = do(params)
-                if js is None: break
-                merge_json(js)
-                page = js.get("next_page_token")
-                if not page:
-                    ok = True
-                    break
-            if ok: break
-
+        params = dict(timeframe=timeframe, symbols=",".join(chunk), limit=limit,
+                      start=start_iso, end=end_iso, adjustment="raw")
+        page = None; ok=False
+        while True:
+            p = dict(params)
+            if page: p["page_token"] = page
+            js = _bars_request(p, max_retries=max_retries)
+            if js is None: break
+            merge_json(js)
+            page = js.get("next_page_token")
+            if not page:
+                ok = True; break
         if not ok:
-            # chunk-down then per-symbol fallback
+            # per-symbol fallback
             if chunk_size > 60:
+                # Try smaller chunks first
+                i = i  # no-op; we'll re-loop with reduced chunk size
                 chunk_size = max(60, chunk_size//2)
                 continue
             for sym in chunk:
-                for tf in tf_candidates:
-                    params = dict(timeframe=tf, symbols=sym, limit=limit, start=start_iso, end=end_iso, adjustment="raw")
-                    page=None; merged=False
-                    for attempt in range(max_retries):
-                        if page: params["page_token"]=page
-                        js = do(params)
-                        if js is None: break
-                        merge_json(js)
-                        page = js.get("next_page_token")
-                        if not page:
-                            merged=True; break
-                    if merged: break
+                params = dict(timeframe=timeframe, symbols=sym, limit=limit,
+                              start=start_iso, end=end_iso, adjustment="raw")
+                page=None; merged=False
+                for attempt in range(max_retries):
+                    pp = dict(params)
+                    if page: pp["page_token"]=page
+                    js = _bars_request(pp, max_retries=max_retries)
+                    if js is None: break
+                    merge_json(js)
+                    page = js.get("next_page_token")
+                    if not page:
+                        merged=True; break
                 if sym not in out:
                     out[sym] = pd.DataFrame(columns=["t","open","high","low","close","volume"])
         i += chunk_size
 
-    # Clean + RTH filter
-    for s, df in list(out.items()):
-        if df is None or df.empty: continue
-        df = df.drop_duplicates(subset=["t"]).sort_values("t").reset_index(drop=True)
-        out[s] = rth_only_hour(df)
+    # Clean + RTH filter for hourly
+    if timeframe.lower() in ("1hour","1h","60min","60m","1hour"):
+        for s, df in list(out.items()):
+            if df is None or df.empty: continue
+            df = df.drop_duplicates(subset=["t"]).sort_values("t").reset_index(drop=True)
+            out[s] = rth_only_hour(df)
     return out
 
 # ========= Indicators =========
@@ -275,9 +272,9 @@ def run_scan():
     symbols = fetch_active_symbols(UNIVERSE_CAP)
     total_universe = len(symbols)
 
-    # Fetch hourly bars
+    # Fetch hourly bars (feed=iex enforced)
     bars_h = fetch_bars_multi_limit(symbols, timeframe="1Hour", limit=H1_LIMIT_BARS, chunk_size=CHUNK_SIZE)
-    counts = [len(df) for df in bars_h.values() if df is not None]
+    counts = [len(df) for df in bars_h.values() if isinstance(df, pd.DataFrame)]
     min_hbars = min(counts) if counts else 0
     if min_hbars < H1_MIN_BARS_REQ:
         return total_universe, min_hbars, pd.DataFrame(), {"last_error": _last_data_error, "drops": {"insufficient_bars": total_universe}}
@@ -346,8 +343,7 @@ def run_scan():
             "atr_pct": atr_pct,
             "inv_atr_pct": inv_atr,
             "flag_h1_macd_zero_cross_sig_neg": flag_h1_macd0,
-            # placeholder for D1 flag; filled later
-            "flag_d1_ema200_breakout": False,
+            "flag_d1_ema200_breakout": False,  # fill later
             "notes": "H1_MACD_zero_cross_sig_neg" if flag_h1_macd0 else ""
         })
 
@@ -356,7 +352,7 @@ def run_scan():
 
     df = pd.DataFrame(survivors)
 
-    # Fetch D1 bars only for survivors and tag EMA200 breakout (cheap)
+    # Fetch D1 bars only for survivors and tag EMA200 breakout (cheap; feed=iex)
     surv_syms = df["symbol"].tolist()
     bars_d = fetch_bars_multi_limit(surv_syms, timeframe="1Day", limit=220, chunk_size=min(CHUNK_SIZE, 120))
     ema200_break = {}
@@ -371,10 +367,10 @@ def run_scan():
         ema200_break[s] = brk
 
     df["flag_d1_ema200_breakout"] = df["symbol"].map(ema200_break).fillna(False)
-    df.loc[df["flag_d1_ema200_breakout"], "notes"] = (
-        df.loc[df["flag_d1_ema200_breakout"], "notes"].replace("", "D1_EMA200_breakout") +
-        df.loc[df["flag_d1_ema200_breakout"], "notes"].mask(df["notes"].ne(""), ", D1_EMA200_breakout")
-    ).str.replace("^,\\s*", "", regex=True)
+    # Append to notes
+    mask = df["flag_d1_ema200_breakout"]
+    df.loc[mask, "notes"] = (df.loc[mask, "notes"].str.replace("^\\s*$", "D1_EMA200_breakout", regex=True))
+    df.loc[mask & df["notes"].ne("D1_EMA200_breakout"), "notes"] = df.loc[mask & df["notes"].ne("D1_EMA200_breakout"), "notes"] + ", D1_EMA200_breakout"
 
     # Rank
     df["rank_score"] = 0.6*zscore(df["rvol_hour"]) + 0.4*zscore(df["inv_atr_pct"])
@@ -402,6 +398,7 @@ with right:
     st.write(f"**Universe cap:** {UNIVERSE_CAP:,}")
     st.write(f"**Universe scanned:** {total_universe:,}")
     st.write(f"**Min H1 bars (fetched):** {min_hbars}")
+    st.write("**Feed:** iex")
 
 with left:
     st.subheader("Top candidates (preview)")
