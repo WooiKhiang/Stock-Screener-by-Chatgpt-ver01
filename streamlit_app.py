@@ -1,9 +1,10 @@
 # Ultra-lean Market Scanner — Volume-only (no lookback) → Google Sheets
 # Tabs (drop & recreate safely): ActiveNow, Context
-# Data source: Alpaca snapshots (IEX). No hourly/daily bar downloads.
+# Data source: Alpaca snapshots (IEX). No hourly/daily bar downloads except tiny 1–2 bar fallback inside snapshots helper.
 # Ranking: minute volume (if RTH) else daily volume; if missing pre/post → prev-day volume.
-# Price fallback: latestTrade.p → minuteBar.c → dailyBar.c → prevDailyBar.c
+# Price fallback: latestTrade.p → minuteBar.c → dailyBar.c → prevDailyBar.c (ignore zeros)
 # Flags: PDH break, Day-high proximity (only when today's high exists)
+# Context adds GLD/USO/SLV (gold/oil/silver proxies) and shows session = pre/regular/post/closed.
 
 import os, json, time, random, datetime as dt
 import numpy as np
@@ -71,11 +72,21 @@ def now_et():
 def now_et_str():
     return now_et().strftime("%Y-%m-%d %H:%M:%S")
 
-def is_market_open_now():
+def session_status():
     n = now_et()
     if n.weekday() >= 5:
-        return False
-    return dt.time(9,30) <= n.time() <= dt.time(16,0)
+        return "closed"
+    t = n.time()
+    if dt.time(4,0) <= t < dt.time(9,30):
+        return "pre"
+    if dt.time(9,30) <= t <= dt.time(16,0):
+        return "regular"
+    if dt.time(16,0) < t <= dt.time(20,0):
+        return "post"
+    return "closed"
+
+def is_market_open_now():
+    return session_status() == "regular"
 
 def parse_sa(raw_json: str) -> dict:
     if not raw_json: raise RuntimeError("Missing GCP_SERVICE_ACCOUNT in secrets/env.")
@@ -90,7 +101,7 @@ def parse_sa(raw_json: str) -> dict:
         return json.loads(raw_json)
 
 # =========================
-# Alpaca I/O (robust snapshots)
+# Alpaca I/O (robust snapshots + tiny daily fallback)
 # =========================
 _last_data_error = {}
 
@@ -138,6 +149,76 @@ def _snapshots_request(symbols_batch, max_retries=5, timeout_s=120):
     _last_data_error["snapshots"] = (408, "retry timeout")
     return None
 
+def fetch_bars_multi(symbols, timeframe="1Day", limit=2, chunk=150):
+    # used ONLY as a lightweight fallback to synthesize daily & prevDaily
+    out = {}
+    end = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    start = end - dt.timedelta(days=10)
+    start_iso = start.isoformat().replace("+00:00","Z")
+    end_iso   = end.isoformat().replace("+00:00","Z")
+
+    def _bars_request(params, max_retries=3):
+        url = f"{ALPACA_DATA}/v2/stocks/bars"
+        p = dict(params); p["feed"] = FEED
+        backoff = 1.0
+        for _ in range(max_retries):
+            try:
+                r = requests.get(url, headers=HEADERS, params=p, timeout=60)
+            except requests.Timeout:
+                pass
+            else:
+                if r.status_code in (429,500,502,503,504):
+                    pass
+                elif r.status_code >= 400:
+                    try: msg = r.json().get("message", r.text[:300])
+                    except Exception: msg = r.text[:300]
+                    _last_data_error[f"bars_{p.get('timeframe')}"] = (r.status_code, msg)
+                    return None
+                else:
+                    try:
+                        return r.json()
+                    except Exception:
+                        _last_data_error[f"bars_{p.get('timeframe')}"] = (r.status_code, "JSON parse error")
+                        return None
+            time.sleep(backoff + random.random()*0.3)
+            backoff = min(backoff*1.7, 6.0)
+        _last_data_error[f"bars_{p.get('timeframe')}"] = (408, "retry timeout")
+        return None
+
+    def merge_json(js):
+        bars = js.get("bars", [])
+        if isinstance(bars, dict):
+            for sym, arr in bars.items():
+                if not arr:
+                    out[sym] = pd.DataFrame(columns=["t","open","high","low","close","volume"]); continue
+                df = pd.DataFrame(arr)
+                df["t"] = pd.to_datetime(df["t"], utc=True)
+                df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
+                out[sym] = df[["t","open","high","low","close","volume"]].sort_values("t").reset_index(drop=True)
+        else:
+            if bars:
+                df = pd.DataFrame(bars)
+                df["t"] = pd.to_datetime(df["t"], utc=True)
+                df.rename(columns={"S":"symbol","o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
+                for sym, grp in df.groupby("symbol"):
+                    out[sym] = grp[["t","open","high","low","close","volume"]].sort_values("t").reset_index(drop=True)
+
+    i = 0
+    cur_chunk = max(60, chunk)
+    while i < len(symbols):
+        batch = symbols[i:i+cur_chunk]
+        params = dict(timeframe=timeframe, symbols=",".join(batch), limit=limit,
+                      start=start_iso, end=end_iso, adjustment="raw")
+        js = _bars_request(params)
+        if js is None and cur_chunk > 60:
+            cur_chunk = max(40, cur_chunk // 2)
+            continue
+        if js is not None:
+            merge_json(js)
+        i += len(batch)
+        time.sleep(0.1)
+    return out
+
 def fetch_snapshots_multi(symbols, chunk=300):
     out = {}
     i = 0
@@ -150,28 +231,24 @@ def fetch_snapshots_multi(symbols, chunk=300):
             if cur_chunk > 40:
                 cur_chunk = max(20, cur_chunk // 2)
                 continue
-            # fallback: synthesize from daily bars (1-day & prev-day) for this batch
+            # robust fallback using 1–2 daily bars
             try:
-                # Use bars endpoint but only 1–2 rows; still light
-                url = f"{ALPACA_DATA}/v2/stocks/bars"
-                params_today = {"symbols": ",".join(batch), "timeframe":"1Day","limit":1,"adjustment":"raw","feed":FEED}
-                params_prev2 = {"symbols": ",".join(batch), "timeframe":"1Day","limit":2,"adjustment":"raw","feed":FEED}
-                r1 = requests.get(url, headers=HEADERS, params=params_today, timeout=60)
-                r2 = requests.get(url, headers=HEADERS, params=params_prev2, timeout=60)
-                js1 = r1.json() if r1.ok else {}
-                js2 = r2.json() if r2.ok else {}
-                bars1 = js1.get("bars",{})
-                bars2 = js2.get("bars",{})
+                bars_today = fetch_bars_multi(batch, timeframe="1Day", limit=1,  chunk=max(60, cur_chunk))
+                bars_prev2 = fetch_bars_multi(batch, timeframe="1Day", limit=2,  chunk=max(60, cur_chunk))
                 for s in batch:
                     snap = {}
-                    t = bars1.get(s) or []
-                    p = bars2.get(s) or []
-                    if t:
-                        last = t[-1]
-                        snap["dailyBar"] = {"c": float(last.get("c",0)), "h": float(last.get("h",0)), "v": float(last.get("v",0))}
-                    if p and len(p) >= 2:
-                        prev = p[-2]
-                        snap["prevDailyBar"] = {"c": float(prev.get("c",0)), "h": float(prev.get("h",0)), "v": float(prev.get("v",0))}
+                    tbar = bars_today.get(s)
+                    pbar = bars_prev2.get(s)
+                    if tbar is not None and not tbar.empty:
+                        last = tbar.iloc[-1]
+                        snap["dailyBar"] = {
+                            "c": float(last["close"]), "h": float(last["high"]), "v": float(last["volume"])
+                        }
+                    if pbar is not None and len(pbar) >= 2:
+                        prev = pbar.iloc[-2]
+                        snap["prevDailyBar"] = {
+                            "c": float(prev["close"]), "h": float(prev["high"]), "v": float(prev["volume"])
+                        }
                     out[s] = snap
             except Exception:
                 for s in batch: out[s] = {}
@@ -259,21 +336,21 @@ def stage_a_activenow():
         db = snap.get("dailyBar") or {}
         pdbar = snap.get("prevDailyBar") or {}
 
-        # Price fallback: lt.p -> mb.c -> db.c -> prevDaily.c
+        # Price fallback: lt.p -> mb.c -> db.c -> prevDaily.c (ignore zeros)
         p = None
-        try:
-            for cand in (lt.get("p"), mb.get("c"), db.get("c"), pdbar.get("c")):
-                if cand is not None:
-                    p = float(cand); break
-        except Exception:
-            p = None
+        for cand in (lt.get("p"), mb.get("c"), db.get("c"), pdbar.get("c")):
+            try:
+                val = float(cand) if cand is not None else None
+            except Exception:
+                val = None
+            if val and val > 0:
+                p = val
+                break
         if p is None or not (PRICE_MIN <= p <= PRICE_MAX):
             price_drops += 1
             continue
 
-        # Volume fallback:
-        #   If market open & minute vol > 0 -> use minute volume,
-        #   else use today's daily vol; if missing/0 (pre-open) -> prevDaily vol.
+        # Volume fallback: minute (if RTH & >0) else daily -> prevDaily
         mv = float(mb.get("v") or 0.0)
         dv = float(db.get("v") or 0.0)
         pv = float(pdbar.get("v") or 0.0)
@@ -285,7 +362,7 @@ def stage_a_activenow():
             else:
                 active_vol, vol_source = pv, "prev_daily"
 
-        # Flags: PDH break (needs prevDaily.h); Day-high proximity only when today's high exists.
+        # Flags
         prev_high  = pdbar.get("h")
         today_high = db.get("h")
         flag_pdh_break = bool(prev_high is not None and p > float(prev_high))
@@ -308,35 +385,62 @@ def stage_a_activenow():
         })
 
     if not rows:
-        return pd.DataFrame(), symbols, {"price_drops": price_drops, "rth": rth}
+        return pd.DataFrame(), symbols, {"price_drops": price_drops, "session": session_status()}
 
     df = pd.DataFrame(rows).sort_values(["active_vol","daily_vol","minute_vol"], ascending=[False, False, False]).reset_index(drop=True)
     df_out = df.head(TOP_K).copy()
     df_out.insert(0, "as_of_et", now_et_str())
-    return df_out, symbols, {"price_drops": price_drops, "rth": rth}
+    df_out.insert(1, "session", session_status())
+    return df_out, symbols, {"price_drops": price_drops, "session": session_status()}
 
 # =========================
-# Context (tiny; no lookback)
+# Context (tiny; no lookback) + GLD/USO/SLV
 # =========================
-CONTEXT_TICKERS = ["SPY", "VIXY", "XLF", "XLK", "XLY", "XLP", "XLV", "XLE", "XLI", "XLU",
-                   "XLRE", "XLB", "SMH", "XOP", "XBI", "XME", "KRE", "ITB", "IYT", "TAN"]
+CONTEXT_TICKERS = [
+    "SPY","VIXY","XLF","XLK","XLY","XLP","XLV","XLE","XLI","XLU","XLRE","XLB","SMH","XOP","XBI","XME","KRE","ITB","IYT","TAN",
+    # commodity proxies:
+    "GLD","USO","SLV"
+]
 
 def build_context():
-    snaps = fetch_snapshots_multi(CONTEXT_TICKERS, chunk=min(100, len(CONTEXT_TICKERS)))
-    rows = [{"key":"as_of_et", "value": now_et_str()},
-            {"key":"market_open", "value": str(is_market_open_now())}]
+    snaps = fetch_snapshots_multi(CONTEXT_TICKERS, chunk=min(120, len(CONTEXT_TICKERS)))
+    rows = [
+        {"key": "as_of_et", "value": now_et_str()},
+        {"key": "session",  "value": session_status()},
+        {"key": "market_open_regular", "value": str(is_market_open_now())},
+        {"key": "includes_premarket_post", "value": "Ranking uses minute volume during regular hours only; otherwise daily/prev day."}
+    ]
     for s in CONTEXT_TICKERS:
         snap = snaps.get(s) or {}
+        lt = snap.get("latestTrade") or {}
         db = snap.get("dailyBar") or {}
         pdbar = snap.get("prevDailyBar") or {}
+
+        # current price (with fallbacks, ignore zeros)
+        px = None
+        for cand in (lt.get("p"), db.get("c"), pdbar.get("c")):
+            try:
+                val = float(cand) if cand is not None else None
+            except Exception:
+                val = None
+            if val and val > 0:
+                px = val; break
+
+        # 1D %
+        pct = ""
         try:
             c = float(db.get("c") or np.nan)
             pc = float(pdbar.get("c") or np.nan)
             if np.isfinite(c) and np.isfinite(pc) and pc != 0:
-                pct = 100.0*(c-pc)/pc
-                rows.append({"key": f"{s}_1d_pct", "value": f"{pct:+.2f}%"})
+                pct = f"{100.0*(c-pc)/pc:+.2f}%"
         except Exception:
-            pass
+            pct = ""
+
+        if px is not None:
+            rows.append({"key": f"{s}_price", "value": f"{px:.2f}"})
+        if pct != "":
+            rows.append({"key": f"{s}_1d_pct", "value": pct})
+
     return pd.DataFrame(rows, columns=["key","value"])
 
 # =========================
@@ -358,10 +462,11 @@ with left:
 with right:
     st.subheader("Run Summary")
     st.write(f"**As of (ET):** {now_et_str()}")
+    st.write(f"**Session:** {a_diag.get('session')}")
     st.write(f"**Universe cap:** {UNIVERSE_CAP:,}")
     st.write(f"**Universe scanned:** {len(all_syms):,}")
-    st.write(f"**Market open:** {a_diag.get('rth')}")
     st.write(f"**Price-band drops:** {a_diag.get('price_drops',0)}")
+    st.caption("Minute volume used only in **regular** session; otherwise daily/prev-day volume.")
 
 # Write ActiveNow (conflict-safe)
 try:
@@ -371,7 +476,7 @@ try:
         st.success(f"{TAB_ACTIVENOW} updated.")
     else:
         write_frame_to_ws(sh, TAB_ACTIVENOW, pd.DataFrame(columns=[
-            "as_of_et","symbol","price","minute_vol","daily_vol","active_vol","vol_source",
+            "as_of_et","session","symbol","price","minute_vol","daily_vol","active_vol","vol_source",
             "flag_pdh_break","flag_day_high_proximity"
         ]))
         st.info(f"{TAB_ACTIVENOW} created (empty).")
