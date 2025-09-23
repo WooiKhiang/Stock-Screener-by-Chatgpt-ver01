@@ -1,10 +1,10 @@
 # Ultra-lean Market Scanner — Volume-only (no lookback) → Google Sheets
 # Tabs (drop & recreate safely): ActiveNow, Context
-# Data source: Alpaca snapshots (IEX). No hourly/daily bar downloads except tiny 1–2 bar fallback inside snapshots helper.
+# Data: Alpaca snapshots (IEX). No historical lookback; only a tiny 1–2 daily-bar fallback inside snapshots helper.
 # Ranking: minute volume (if RTH) else daily volume; if missing pre/post → prev-day volume.
-# Price fallback: latestTrade.p → minuteBar.c → dailyBar.c → prevDailyBar.c (ignore zeros)
+# Price fallback: latestTrade.p → minuteBar.c → dailyBar.c → prevDailyBar.c → latestQuote mid (bp/ap)
 # Flags: PDH break, Day-high proximity (only when today's high exists)
-# Context adds GLD/USO/SLV (gold/oil/silver proxies) and shows session = pre/regular/post/closed.
+# UI: Context panel shows SPY, GLD (gold), USO (oil), SLV (silver) prices + 1D %; also session label.
 
 import os, json, time, random, datetime as dt
 import numpy as np
@@ -19,7 +19,7 @@ GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
 TAB_ACTIVENOW = "ActiveNow"
 TAB_CONTEXT   = "Context"
 
-# Alpaca creds (use env if provided)
+# Alpaca creds (env preferred; fallbacks supplied)
 ALPACA_KEY    = os.getenv("ALPACA_KEY",    "PKIG445MPT704CN8P0R8")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "3GQdWcnbMo6V8uvhVa6BK6EbvnH4EHinlsU6uvj4")
 ALPACA_BASE   = "https://paper-api.alpaca.markets/v2"
@@ -100,10 +100,19 @@ def parse_sa(raw_json: str) -> dict:
             raw_json = raw_json.replace(block, block.replace("\r\n","\n").replace("\n","\\n"))
         return json.loads(raw_json)
 
+def safe_float(x):
+    try:
+        v = float(x)
+        return v if (v is not None and v > 0) else None
+    except Exception:
+        return None
+
 # =========================
 # Alpaca I/O (robust snapshots + tiny daily fallback)
 # =========================
 _last_data_error = {}
+_diag_counts = {"price_src": {"trade":0,"minbar":0,"daybar":0,"prevday":0,"quote_mid":0,"none":0},
+                "vol_src": {"minute":0,"daily":0,"prev_daily":0}}
 
 def fetch_active_symbols(cap: int):
     url = f"{ALPACA_BASE}/assets"
@@ -241,14 +250,10 @@ def fetch_snapshots_multi(symbols, chunk=300):
                     pbar = bars_prev2.get(s)
                     if tbar is not None and not tbar.empty:
                         last = tbar.iloc[-1]
-                        snap["dailyBar"] = {
-                            "c": float(last["close"]), "h": float(last["high"]), "v": float(last["volume"])
-                        }
+                        snap["dailyBar"] = {"c": float(last["close"]), "h": float(last["high"]), "v": float(last["volume"])}
                     if pbar is not None and len(pbar) >= 2:
                         prev = pbar.iloc[-2]
-                        snap["prevDailyBar"] = {
-                            "c": float(prev["close"]), "h": float(prev["high"]), "v": float(prev["volume"])
-                        }
+                        snap["prevDailyBar"] = {"c": float(prev["close"]), "h": float(prev["high"]), "v": float(prev["volume"])}
                     out[s] = snap
             except Exception:
                 for s in batch: out[s] = {}
@@ -264,6 +269,54 @@ def fetch_snapshots_multi(symbols, chunk=300):
         if cur_chunk < chunk:
             cur_chunk = min(chunk, int(cur_chunk * 1.25))
     return out
+
+# ----- price/volume pickers (with source counters) -----
+def pick_price(snap):
+    lt  = snap.get("latestTrade") or {}
+    mb  = snap.get("minuteBar") or {}
+    db  = snap.get("dailyBar") or {}
+    pdB = snap.get("prevDailyBar") or {}
+    qt  = snap.get("latestQuote") or {}
+
+    for cand, label in ((lt.get("p"),"trade"), (mb.get("c"),"minbar"),
+                        (db.get("c"),"daybar"), (pdB.get("c"),"prevday")):
+        val = safe_float(cand)
+        if val:
+            _diag_counts["price_src"][label] += 1
+            return val
+
+    # last resort: quote mid (or bid/ask if only one side)
+    bp = safe_float(qt.get("bp"))
+    ap = safe_float(qt.get("ap"))
+    if bp and ap:
+        _diag_counts["price_src"]["quote_mid"] += 1
+        return (bp + ap) / 2.0
+    if ap:
+        _diag_counts["price_src"]["quote_mid"] += 1
+        return ap
+    if bp:
+        _diag_counts["price_src"]["quote_mid"] += 1
+        return bp
+
+    _diag_counts["price_src"]["none"] += 1
+    return None
+
+def pick_active_volume(snap, rth: bool):
+    mb = snap.get("minuteBar") or {}
+    db = snap.get("dailyBar") or {}
+    pdB = snap.get("prevDailyBar") or {}
+    mv = safe_float(mb.get("v")) or 0.0
+    dv = safe_float(db.get("v")) or 0.0
+    pv = safe_float(pdB.get("v")) or 0.0
+
+    if rth and mv > 0:
+        _diag_counts["vol_src"]["minute"] += 1
+        return mv, "minute"
+    if dv > 0:
+        _diag_counts["vol_src"]["daily"] += 1
+        return dv, "daily"
+    _diag_counts["vol_src"]["prev_daily"] += 1
+    return pv, "prev_daily"
 
 # =========================
 # Google Sheets (conflict-safe)
@@ -331,55 +384,33 @@ def stage_a_activenow():
     price_drops = 0
     for s in symbols:
         snap = snaps.get(s) or {}
-        lt = snap.get("latestTrade") or {}
-        mb = snap.get("minuteBar") or {}
-        db = snap.get("dailyBar") or {}
-        pdbar = snap.get("prevDailyBar") or {}
-
-        # Price fallback: lt.p -> mb.c -> db.c -> prevDaily.c (ignore zeros)
-        p = None
-        for cand in (lt.get("p"), mb.get("c"), db.get("c"), pdbar.get("c")):
-            try:
-                val = float(cand) if cand is not None else None
-            except Exception:
-                val = None
-            if val and val > 0:
-                p = val
-                break
+        p = pick_price(snap)
         if p is None or not (PRICE_MIN <= p <= PRICE_MAX):
             price_drops += 1
             continue
 
-        # Volume fallback: minute (if RTH & >0) else daily -> prevDaily
-        mv = float(mb.get("v") or 0.0)
-        dv = float(db.get("v") or 0.0)
-        pv = float(pdbar.get("v") or 0.0)
-        if rth and mv > 0:
-            active_vol, vol_source = mv, "minute"
-        else:
-            if dv > 0:
-                active_vol, vol_source = dv, "daily"
-            else:
-                active_vol, vol_source = pv, "prev_daily"
+        active_vol, vol_src = pick_active_volume(snap, rth)
+        db = snap.get("dailyBar") or {}
+        pdB = snap.get("prevDailyBar") or {}
 
-        # Flags
-        prev_high  = pdbar.get("h")
+        prev_high  = pdB.get("h")
         today_high = db.get("h")
-        flag_pdh_break = bool(prev_high is not None and p > float(prev_high))
+        flag_pdh_break = bool(prev_high is not None and safe_float(p) and (p > float(prev_high)))
         flag_day_high_prox = False
-        if today_high is not None:
+        if today_high is not None and safe_float(today_high):
             try:
                 flag_day_high_prox = p >= float(today_high) * (1.0 - float(DHP_DELTA))
             except Exception:
                 flag_day_high_prox = False
 
+        mb = snap.get("minuteBar") or {}
         rows.append({
             "symbol": s,
             "price": p,
-            "minute_vol": float(mv),
-            "daily_vol": float(dv),
+            "minute_vol": float(safe_float(mb.get("v")) or 0.0),
+            "daily_vol":  float(safe_float(db.get("v")) or 0.0),
             "active_vol": float(active_vol),
-            "vol_source": vol_source,
+            "vol_source": vol_src,
             "flag_pdh_break": flag_pdh_break,
             "flag_day_high_proximity": flag_day_high_prox
         })
@@ -394,53 +425,39 @@ def stage_a_activenow():
     return df_out, symbols, {"price_drops": price_drops, "session": session_status()}
 
 # =========================
-# Context (tiny; no lookback) + GLD/USO/SLV
+# Context (tiny; no lookback) + SPY/GLD/USO/SLV
 # =========================
 CONTEXT_TICKERS = [
-    "SPY","VIXY","XLF","XLK","XLY","XLP","XLV","XLE","XLI","XLU","XLRE","XLB","SMH","XOP","XBI","XME","KRE","ITB","IYT","TAN",
-    # commodity proxies:
-    "GLD","USO","SLV"
+    "SPY",  # S&P 500 proxy
+    "GLD",  # Gold
+    "USO",  # Oil
+    "SLV",  # Silver
 ]
 
-def build_context():
-    snaps = fetch_snapshots_multi(CONTEXT_TICKERS, chunk=min(120, len(CONTEXT_TICKERS)))
+def build_context_rows():
+    snaps = fetch_snapshots_multi(CONTEXT_TICKERS, chunk=min(40, len(CONTEXT_TICKERS)))
     rows = [
         {"key": "as_of_et", "value": now_et_str()},
         {"key": "session",  "value": session_status()},
-        {"key": "market_open_regular", "value": str(is_market_open_now())},
-        {"key": "includes_premarket_post", "value": "Ranking uses minute volume during regular hours only; otherwise daily/prev day."}
+        {"key": "notes",    "value": "Minute volume is used only in regular session; otherwise daily/prev-day volume."}
     ]
     for s in CONTEXT_TICKERS:
         snap = snaps.get(s) or {}
-        lt = snap.get("latestTrade") or {}
+        px = pick_price(snap)
         db = snap.get("dailyBar") or {}
-        pdbar = snap.get("prevDailyBar") or {}
-
-        # current price (with fallbacks, ignore zeros)
-        px = None
-        for cand in (lt.get("p"), db.get("c"), pdbar.get("c")):
-            try:
-                val = float(cand) if cand is not None else None
-            except Exception:
-                val = None
-            if val and val > 0:
-                px = val; break
-
-        # 1D %
+        pdB = snap.get("prevDailyBar") or {}
         pct = ""
         try:
-            c = float(db.get("c") or np.nan)
-            pc = float(pdbar.get("c") or np.nan)
-            if np.isfinite(c) and np.isfinite(pc) and pc != 0:
+            c  = safe_float(db.get("c"))
+            pc = safe_float(pdB.get("c"))
+            if c and pc:
                 pct = f"{100.0*(c-pc)/pc:+.2f}%"
         except Exception:
             pct = ""
-
         if px is not None:
             rows.append({"key": f"{s}_price", "value": f"{px:.2f}"})
-        if pct != "":
+        if pct:
             rows.append({"key": f"{s}_1d_pct", "value": pct})
-
     return pd.DataFrame(rows, columns=["key","value"])
 
 # =========================
@@ -459,6 +476,12 @@ with left:
         fmt = {"price":"{:.2f}","minute_vol":"{:.0f}","daily_vol":"{:.0f}","active_vol":"{:.0f}"}
         st.dataframe(df_active.style.format(fmt), use_container_width=True)
 
+    # --- Context panel (SPY, GLD, USO, SLV) ---
+    st.markdown("### Context — SPY / Gold (GLD) / Oil (USO) / Silver (SLV)")
+    df_ctx_ui = build_context_rows()
+    if not df_ctx_ui.empty:
+        st.dataframe(df_ctx_ui, use_container_width=True)
+
 with right:
     st.subheader("Run Summary")
     st.write(f"**As of (ET):** {now_et_str()}")
@@ -466,7 +489,7 @@ with right:
     st.write(f"**Universe cap:** {UNIVERSE_CAP:,}")
     st.write(f"**Universe scanned:** {len(all_syms):,}")
     st.write(f"**Price-band drops:** {a_diag.get('price_drops',0)}")
-    st.caption("Minute volume used only in **regular** session; otherwise daily/prev-day volume.")
+    st.caption("Diagnostics below show price/volume source usage (trade/minbar/daybar/prevday/quote).")
 
 # Write ActiveNow (conflict-safe)
 try:
@@ -483,11 +506,10 @@ try:
 except Exception as e:
     st.error(f"Failed to write {TAB_ACTIVENOW}: {e}")
 
-# Context
-with st.spinner("Updating Context…"):
+# Write Context (vertical key/value)
+with st.spinner("Updating Context sheet…"):
     try:
-        df_ctx = build_context()
-        write_frame_to_ws(sh, TAB_CONTEXT, df_ctx)
+        write_frame_to_ws(sh, TAB_CONTEXT, df_ctx_ui)
         st.success(f"{TAB_CONTEXT} refreshed.")
     except Exception as e:
         st.error(f"Failed to write {TAB_CONTEXT}: {e}")
@@ -497,5 +519,5 @@ with st.expander("🛠 Diagnostics", expanded=False):
     if _last_data_error:
         for k, v in _last_data_error.items():
             st.write(f"**{k}** → {v}")
-    else:
-        st.write("No errors recorded.")
+    st.write("**Price source counts**:", _diag_counts["price_src"])
+    st.write("**Volume source counts**:", _diag_counts["vol_src"])
