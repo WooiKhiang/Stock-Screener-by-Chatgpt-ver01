@@ -1,9 +1,10 @@
-# Market Scanner — Stage A (fast snapshots) + Stage B (light bars on survivors)
-# Tabs written (drop & recreate each run): ActiveNow, SignalsH1, SignalsD1, Context
-# Data: Alpaca (IEX). Stage-B bars auto-fallback to yfinance if Alpaca fails for a batch.
-# Author: you & me :)
+# Market Scanner — ActiveNow (fast) + Signals (light) → Google Sheets
+# Tabs (always drop & recreate): ActiveNow, SignalsH1, SignalsD1, Context
+# Stage A: Alpaca snapshots (IEX), no lookback → price band + active volume rank + PDH/DHP flags
+# Stage B: On Top-K only → Alpaca H1/D1 bars (IEX) w/ fallback to yfinance → Donchian10, RSI(3), EMA stack, MACD zero-line, EMA200 breakout
+# Robust snapshots: dynamic batch shrinking + longer timeout/retries + daily-bar fallback if needed
 
-import os, json, time, datetime as dt
+import os, json, time, random, datetime as dt
 import numpy as np
 import pandas as pd
 import pytz, requests, streamlit as st
@@ -62,7 +63,7 @@ DHP_DELTA = st.sidebar.slider("Day-high proximity δ", 0.001, 0.01, 0.005, 0.001
 st.sidebar.markdown("### Bars (Stage B — survivors only, automatic)")
 H1_LIMIT = st.sidebar.slider("Hourly bars limit (H1)", 30, 80, 60, 5)
 D1_LIMIT = st.sidebar.slider("Daily bars limit (D1)", 180, 260, 220, 10)
-SNAPSHOT_CHUNK = st.sidebar.slider("Snapshot chunk size", 100, 600, 300, 50)
+SNAPSHOT_CHUNK = st.sidebar.slider("Snapshot chunk size (start)", 100, 600, 300, 50)
 
 # =========================
 # Helpers
@@ -137,59 +138,33 @@ def fetch_active_symbols(cap: int):
         if len(syms) >= cap: break
     return syms[:cap]
 
-def _snapshots_request(symbols_batch, max_retries=3):
+# ---------- Robust snapshots ----------
+def _snapshots_request(symbols_batch, max_retries=5, timeout_s=120):
     url = f"{ALPACA_DATA}/v2/stocks/snapshots"
     params = {"symbols": ",".join(symbols_batch), "feed": FEED}
+    backoff = 1.0
     for attempt in range(max_retries):
-        r = requests.get(url, headers=HEADERS, params=params, timeout=60)
-        if r.status_code in (429,500,502,503,504):
-            time.sleep(1.1*(attempt+1)); continue
-        if r.status_code >= 400:
-            try: msg = r.json().get("message", r.text[:300])
-            except Exception: msg = r.text[:300]
-            _last_data_error["snapshots"] = (r.status_code, msg)
-            return None
         try:
-            return r.json()
-        except Exception:
-            _last_data_error["snapshots"] = (r.status_code, "JSON parse error")
-            return None
+            r = requests.get(url, headers=HEADERS, params=params, timeout=timeout_s)
+        except requests.Timeout:
+            pass
+        else:
+            if r.status_code in (429,500,502,503,504):
+                pass
+            elif r.status_code >= 400:
+                try: msg = r.json().get("message", r.text[:300])
+                except Exception: msg = r.text[:300]
+                _last_data_error["snapshots"] = (r.status_code, msg)
+                return None
+            else:
+                try:
+                    return r.json()
+                except Exception:
+                    _last_data_error["snapshots"] = (r.status_code, "JSON parse error")
+                    return None
+        time.sleep(backoff + random.random()*0.5)  # jitter
+        backoff = min(backoff*1.8, 8.0)
     _last_data_error["snapshots"] = (408, "retry timeout")
-    return None
-
-def fetch_snapshots_multi(symbols, chunk=300):
-    out = {}
-    i = 0
-    while i < len(symbols):
-        batch = symbols[i:i+chunk]
-        js = _snapshots_request(batch)
-        if js is None:
-            for s in batch: out[s] = {}
-            i += chunk; continue
-        snaps = js.get("snapshots") or {}
-        for s in batch:
-            out[s] = snaps.get(s, {}) or {}
-        i += chunk
-    return out
-
-def _bars_request(params, max_retries=3):
-    url = f"{ALPACA_DATA}/v2/stocks/bars"
-    p = dict(params); p["feed"] = FEED
-    for attempt in range(max_retries):
-        r = requests.get(url, headers=HEADERS, params=p, timeout=60)
-        if r.status_code in (429,500,502,503,504):
-            time.sleep(1.1*(attempt+1)); continue
-        if r.status_code >= 400:
-            try: msg = r.json().get("message", r.text[:300])
-            except Exception: msg = r.text[:300]
-            _last_data_error[f"bars_{p.get('timeframe')}"] = (r.status_code, msg)
-            return None
-        try:
-            return r.json()
-        except Exception:
-            _last_data_error[f"bars_{p.get('timeframe')}"] = (r.status_code, "JSON parse error")
-            return None
-    _last_data_error[f"bars_{p.get('timeframe')}"] = (408, "retry timeout")
     return None
 
 def fetch_bars_multi(symbols, timeframe="1Hour", limit=60, chunk=150):
@@ -198,6 +173,34 @@ def fetch_bars_multi(symbols, timeframe="1Hour", limit=60, chunk=150):
     start = end - dt.timedelta(days=60 if timeframe=="1Hour" else 400)
     start_iso = start.isoformat().replace("+00:00","Z")
     end_iso   = end.isoformat().replace("+00:00","Z")
+
+    def _bars_request(params, max_retries=4):
+        url = f"{ALPACA_DATA}/v2/stocks/bars"
+        p = dict(params); p["feed"] = FEED
+        backoff = 1.0
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(url, headers=HEADERS, params=p, timeout=90)
+            except requests.Timeout:
+                pass
+            else:
+                if r.status_code in (429,500,502,503,504):
+                    pass
+                elif r.status_code >= 400:
+                    try: msg = r.json().get("message", r.text[:300])
+                    except Exception: msg = r.text[:300]
+                    _last_data_error[f"bars_{p.get('timeframe')}"] = (r.status_code, msg)
+                    return None
+                else:
+                    try:
+                        return r.json()
+                    except Exception:
+                        _last_data_error[f"bars_{p.get('timeframe')}"] = (r.status_code, "JSON parse error")
+                        return None
+            time.sleep(backoff + random.random()*0.3)
+            backoff = min(backoff*1.7, 6.0)
+        _last_data_error[f"bars_{p.get('timeframe')}"] = (408, "retry timeout")
+        return None
 
     def merge_json(js):
         bars = js.get("bars", [])
@@ -219,24 +222,25 @@ def fetch_bars_multi(symbols, timeframe="1Hour", limit=60, chunk=150):
                     out[sym] = pd.concat([out.get(sym), grp[["t","open","high","low","close","volume"]]], ignore_index=True)
 
     i = 0
+    cur_chunk = max(60, chunk)
     while i < len(symbols):
-        batch = symbols[i:i+chunk]
-        params = dict(timeframe=timeframe, symbols=",".join(batch), limit=limit, start=start_iso, end=end_iso, adjustment="raw")
+        batch = symbols[i:i+cur_chunk]
+        params = dict(timeframe=timeframe, symbols=",".join(batch), limit=limit,
+                      start=start_iso, end=end_iso, adjustment="raw")
         page=None; ok=False
         while True:
-            p = dict(params); 
+            p = dict(params)
             if page: p["page_token"] = page
             js = _bars_request(p)
             if js is None: break
             merge_json(js)
             page = js.get("next_page_token")
             if not page: ok=True; break
-        if not ok and chunk > 60:
-            # try smaller chunk
-            chunk = max(60, chunk//2)
+        if not ok and cur_chunk > 60:
+            cur_chunk = max(40, cur_chunk // 2)
             continue
         i += len(batch)
-
+        time.sleep(0.12)
     # Clean & RTH for H1
     for s, df in list(out.items()):
         if df is None or df.empty: continue
@@ -244,6 +248,56 @@ def fetch_bars_multi(symbols, timeframe="1Hour", limit=60, chunk=150):
         if timeframe.lower() in ("1hour","1h","60m","60min"):
             df = rth_only_hour(df)
         out[s] = df
+    return out
+
+def fetch_snapshots_multi(symbols, chunk=300):
+    out = {}
+    i = 0
+    cur_chunk = max(40, chunk)
+    while i < len(symbols):
+        batch = symbols[i:i+cur_chunk]
+        js = _snapshots_request(batch, max_retries=5, timeout_s=120)
+        if js is None:
+            # shrink chunk and retry this slice
+            if cur_chunk > 40:
+                cur_chunk = max(20, cur_chunk // 2)
+                continue
+            # still failing at small size → fallback to daily bars for this batch
+            try:
+                # today daily bar for vol & close
+                bars_today = fetch_bars_multi(batch, timeframe="1Day", limit=1, chunk=max(60, cur_chunk))
+                # prev daily bar for PDH
+                bars_prev2 = fetch_bars_multi(batch, timeframe="1Day", limit=2, chunk=max(60, cur_chunk))
+                for s in batch:
+                    snap = {}
+                    tbar = bars_today.get(s)
+                    pbar2 = bars_prev2.get(s)
+                    if tbar is not None and not tbar.empty:
+                        last = tbar.iloc[-1]
+                        snap["dailyBar"] = {
+                            "c": float(last["close"]),
+                            "h": float(last["high"]),
+                            "v": float(last["volume"])
+                        }
+                    if pbar2 is not None and len(pbar2) >= 2:
+                        prev = pbar2.iloc[-2]
+                        snap["prevDailyBar"] = {"h": float(prev["high"]), "c": float(prev["close"])}
+                    # minuteBar and latestTrade absent in fallback
+                    out[s] = snap
+            except Exception:
+                for s in batch: out[s] = {}
+            i += cur_chunk
+            time.sleep(0.15)
+            continue
+
+        snaps = js.get("snapshots") or {}
+        for s in batch:
+            out[s] = snaps.get(s, {}) or {}
+        i += cur_chunk
+        time.sleep(0.15)
+        # cautiously bump chunk back up if stable
+        if cur_chunk < chunk:
+            cur_chunk = min(chunk, int(cur_chunk * 1.25))
     return out
 
 # =========================
@@ -255,15 +309,13 @@ def fetch_yf_hourly(symbols):
     except Exception:
         return {}
     out = {}
-    # yfinance download for many tickers can return multiindex; safer to do per symbol with threads disabled
     for s in symbols:
         try:
             df = yf.download(s, period="30d", interval="1h", auto_adjust=False, progress=False, prepost=False, threads=False)
             if df is None or df.empty:
-                out[s] = pd.DataFrame()
-                continue
+                out[s] = pd.DataFrame(); continue
             df = df.reset_index().rename(columns={"Datetime":"t","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
-            df["t"] = pd.to_datetime(df["t"], utc=True)  # yfinance tz-naive -> assume UTC then localize if needed
+            df["t"] = pd.to_datetime(df["t"], utc=True)
             df = rth_only_hour(df)
             out[s] = df[["t","open","high","low","close","volume"]].copy()
         except Exception:
@@ -280,8 +332,7 @@ def fetch_yf_daily(symbols):
         try:
             df = yf.download(s, period="250d", interval="1d", auto_adjust=False, progress=False, prepost=False, threads=False)
             if df is None or df.empty:
-                out[s] = pd.DataFrame()
-                continue
+                out[s] = pd.DataFrame(); continue
             df = df.reset_index().rename(columns={"Date":"t","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
             df["t"] = pd.to_datetime(df["t"], utc=True)
             out[s] = df[["t","open","high","low","close","volume"]].copy()
@@ -306,7 +357,7 @@ def drop_and_create(sh, title, rows=200, cols=40):
     try:
         try:
             ws = sh.worksheet(title)
-            # To avoid "cannot delete last worksheet", create temp if needed
+            # create temp to allow deletion if it's the last worksheet
             if len(sh.worksheets()) == 1:
                 tmp = sh.add_worksheet(title="__tmp__", rows=1, cols=1)
                 sh.del_worksheet(ws)
@@ -320,7 +371,7 @@ def drop_and_create(sh, title, rows=200, cols=40):
         ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
         return ws
     except Exception:
-        # Fallback: clear large range if deletion fails due to perms
+        # fallback clear if cannot delete due to perms
         ws = sh.worksheet(title) if title in [w.title for w in sh.worksheets()] else sh.add_worksheet(title=title, rows=rows, cols=cols)
         ws.batch_clear(["A1:Z100000"])
         return ws
@@ -336,7 +387,7 @@ def write_frame_to_ws(sh, title, df: pd.DataFrame):
 def stage_a_activenow():
     # Universe
     symbols = fetch_active_symbols(UNIVERSE_CAP)
-    # Snapshots
+    # Snapshots (robust)
     snaps = fetch_snapshots_multi(symbols, chunk=SNAPSHOT_CHUNK)
     rth = is_market_open_now()
 
@@ -366,7 +417,7 @@ def stage_a_activenow():
         active_vol = mv if (rth and mv > 0) else dv
         vol_source = "minute" if (rth and mv > 0) else "daily"
 
-        # flags (no lookback)
+        # flags from snapshots (no lookback)
         prev_high = pdbar.get("h")
         today_high = db.get("h")
 
@@ -403,7 +454,6 @@ def stage_a_activenow():
 def stage_b_signals(top_symbols):
     # ----- Hourly bars (H1) -----
     bars_h = fetch_bars_multi(top_symbols, timeframe="1Hour", limit=H1_LIMIT, chunk=150)
-    # Identify empties (fallback to yfinance)
     need_yf_h = [s for s in top_symbols if (bars_h.get(s) is None or bars_h.get(s).empty or len(bars_h.get(s)) < 12)]
     if need_yf_h:
         yf_h = fetch_yf_hourly(need_yf_h)
@@ -413,7 +463,7 @@ def stage_b_signals(top_symbols):
 
     # ----- Daily bars (D1) -----
     bars_d = fetch_bars_multi(top_symbols, timeframe="1Day", limit=D1_LIMIT, chunk=150)
-    need_yf_d = [s for s in top_symbols if (bars_d.get(s) is None or bars_d.get(s).empty or len(bars_d.get(s)) < 210)]
+    need_yf_d = [s for s in top_symbols if (bars_d.get(s) is None or bars_d.get(s).empty or len(bars_d.get(s)) < 201)]
     if need_yf_d:
         yf_d = fetch_yf_daily(need_yf_d)
         for s in need_yf_d:
@@ -436,11 +486,11 @@ def stage_b_signals(top_symbols):
         rsi3 = rsi(cl, 3)
         rsi3_cross50 = bool(len(rsi3) >= 2 and rsi3.iloc[-2] <= 50 and rsi3.iloc[-1] > 50)
 
-        # EMA stack (optional info flag)
+        # EMA stack (info flag)
         e10, e20, e50, e100 = ema(cl,10), ema(cl,20), ema(cl,50), ema(cl,100)
         stack_h1_bull = bool(cl.iloc[-1] > e50.iloc[-1] > e100.iloc[-1] and e10.iloc[-1] > e20.iloc[-1])
 
-        # MACD zero-line cross while signal < 0 (attention flag)
+        # MACD zero-line cross while signal < 0
         ml, ms = macd_line_sig(cl)
         macd_zero_cross_sig_neg = bool(len(ml)>=2 and (ml.iloc[-2] <= 0 < ml.iloc[-1]) and (ms.iloc[-1] < 0))
 
@@ -535,7 +585,6 @@ try:
         write_frame_to_ws(sh, TAB_ACTIVENOW, df_active)
         st.success(f"{TAB_ACTIVENOW} updated.")
     else:
-        # Still drop & recreate empty with header to make state explicit
         write_frame_to_ws(sh, TAB_ACTIVENOW, pd.DataFrame(columns=[
             "as_of_et","symbol","price","minute_vol","daily_vol","active_vol","vol_source",
             "flag_pdh_break","flag_day_high_proximity"
