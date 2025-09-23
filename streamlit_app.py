@@ -1,8 +1,9 @@
 # Market Scanner — ActiveNow (fast) + Signals (light) → Google Sheets
-# Tabs (always drop & recreate): ActiveNow, SignalsH1, SignalsD1, Context
+# Tabs (drop & recreate safely): ActiveNow, SignalsH1, SignalsD1, Context
 # Stage A: Alpaca snapshots (IEX), no lookback → price band + active volume rank + PDH/DHP flags
+#          NEW: pre/post fallback to prevDailyBar for price/volume so premarket runs aren't empty
 # Stage B: On Top-K only → Alpaca H1/D1 bars (IEX) w/ fallback to yfinance → Donchian10, RSI(3), EMA stack, MACD zero-line, EMA200 breakout
-# Robust snapshots: dynamic batch shrinking + longer timeout/retries + daily-bar fallback if needed
+# Sheets: conflict-safe writes; auto cleanup of *_conflict tabs
 
 import os, json, time, random, datetime as dt
 import numpy as np
@@ -24,9 +25,9 @@ ALPACA_KEY    = os.getenv("ALPACA_KEY",    "PKIG445MPT704CN8P0R8")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "3GQdWcnbMo6V8uvhVa6BK6EbvnH4EHinlsU6uvj4")
 ALPACA_BASE   = "https://paper-api.alpaca.markets/v2"
 ALPACA_DATA   = "https://data.alpaca.markets"
-FEED          = "iex"   # force IEX to avoid SIP entitlement issues
+FEED          = "iex"   # avoid SIP 403s
 
-# Google SA JSON must be in Streamlit secrets
+# Google SA JSON in Streamlit secrets
 SA_RAW = st.secrets.get("GCP_SERVICE_ACCOUNT") or os.getenv("GCP_SERVICE_ACCOUNT")
 
 ET = pytz.timezone("America/New_York")
@@ -57,7 +58,7 @@ PRICE_MAX = st.sidebar.number_input("Max price ($)", value=100.0, step=1.0)
 TOP_K     = st.sidebar.slider("Top K to keep (by active volume)", 200, 3000, 1200, 100)
 
 st.sidebar.markdown("### Flags (Stage A)")
-DHP_DELTA = st.sidebar.slider("Day-high proximity δ", 0.001, 0.01, 0.005, 0.001,
+DHP_DELTA = st.sidebar.slider("Day-high proximity δ", 0.001, 0.02, 0.005, 0.001,
                               help="Flag if last ≥ today's high × (1−δ). 0.005 = within 0.5% of day high")
 
 st.sidebar.markdown("### Bars (Stage B — survivors only, automatic)")
@@ -76,7 +77,7 @@ def now_et_str():
 
 def is_market_open_now():
     n = now_et()
-    if n.weekday() >= 5:  # Sat/Sun
+    if n.weekday() >= 5:  # weekend
         return False
     return dt.time(9,30) <= n.time() <= dt.time(16,0)
 
@@ -143,7 +144,7 @@ def _snapshots_request(symbols_batch, max_retries=5, timeout_s=120):
     url = f"{ALPACA_DATA}/v2/stocks/snapshots"
     params = {"symbols": ",".join(symbols_batch), "feed": FEED}
     backoff = 1.0
-    for attempt in range(max_retries):
+    for _ in range(max_retries):
         try:
             r = requests.get(url, headers=HEADERS, params=params, timeout=timeout_s)
         except requests.Timeout:
@@ -162,7 +163,7 @@ def _snapshots_request(symbols_batch, max_retries=5, timeout_s=120):
                 except Exception:
                     _last_data_error["snapshots"] = (r.status_code, "JSON parse error")
                     return None
-        time.sleep(backoff + random.random()*0.5)  # jitter
+        time.sleep(backoff + random.random()*0.5)
         backoff = min(backoff*1.8, 8.0)
     _last_data_error["snapshots"] = (408, "retry timeout")
     return None
@@ -178,7 +179,7 @@ def fetch_bars_multi(symbols, timeframe="1Hour", limit=60, chunk=150):
         url = f"{ALPACA_DATA}/v2/stocks/bars"
         p = dict(params); p["feed"] = FEED
         backoff = 1.0
-        for attempt in range(max_retries):
+        for _ in range(max_retries):
             try:
                 r = requests.get(url, headers=HEADERS, params=p, timeout=90)
             except requests.Timeout:
@@ -262,11 +263,9 @@ def fetch_snapshots_multi(symbols, chunk=300):
             if cur_chunk > 40:
                 cur_chunk = max(20, cur_chunk // 2)
                 continue
-            # still failing at small size → fallback to daily bars for this batch
+            # fallback: synthesize from daily bars for this batch
             try:
-                # today daily bar for vol & close
                 bars_today = fetch_bars_multi(batch, timeframe="1Day", limit=1, chunk=max(60, cur_chunk))
-                # prev daily bar for PDH
                 bars_prev2 = fetch_bars_multi(batch, timeframe="1Day", limit=2, chunk=max(60, cur_chunk))
                 for s in batch:
                     snap = {}
@@ -274,15 +273,10 @@ def fetch_snapshots_multi(symbols, chunk=300):
                     pbar2 = bars_prev2.get(s)
                     if tbar is not None and not tbar.empty:
                         last = tbar.iloc[-1]
-                        snap["dailyBar"] = {
-                            "c": float(last["close"]),
-                            "h": float(last["high"]),
-                            "v": float(last["volume"])
-                        }
+                        snap["dailyBar"] = {"c": float(last["close"]), "h": float(last["high"]), "v": float(last["volume"])}
                     if pbar2 is not None and len(pbar2) >= 2:
                         prev = pbar2.iloc[-2]
-                        snap["prevDailyBar"] = {"h": float(prev["high"]), "c": float(prev["close"])}
-                    # minuteBar and latestTrade absent in fallback
+                        snap["prevDailyBar"] = {"h": float(prev["high"]), "c": float(prev["close"]), "v": float(prev["volume"])}
                     out[s] = snap
             except Exception:
                 for s in batch: out[s] = {}
@@ -295,7 +289,6 @@ def fetch_snapshots_multi(symbols, chunk=300):
             out[s] = snaps.get(s, {}) or {}
         i += cur_chunk
         time.sleep(0.15)
-        # cautiously bump chunk back up if stable
         if cur_chunk < chunk:
             cur_chunk = min(chunk, int(cur_chunk * 1.25))
     return out
@@ -341,7 +334,7 @@ def fetch_yf_daily(symbols):
     return out
 
 # =========================
-# Google Sheets (drop & recreate)
+# Google Sheets (conflict-safe)
 # =========================
 def get_gc():
     import gspread
@@ -353,27 +346,43 @@ def get_gc():
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     return sh
 
-def drop_and_create(sh, title, rows=200, cols=40):
+def cleanup_conflict_tabs(sh, base_title: str):
     try:
-        try:
-            ws = sh.worksheet(title)
-            # create temp to allow deletion if it's the last worksheet
-            if len(sh.worksheets()) == 1:
+        for ws in sh.worksheets():
+            if ws.title.startswith(f"{base_title}_conflict"):
+                try: sh.del_worksheet(ws)
+                except Exception: pass
+    except Exception:
+        pass
+
+def drop_and_create(sh, title, rows=200, cols=40):
+    # Try to delete; if it fails or races, fall back to clearing the existing sheet
+    try:
+        titles = {w.title: w for w in sh.worksheets()}
+        if title in titles:
+            ws = titles[title]
+            if len(titles) == 1:
                 tmp = sh.add_worksheet(title="__tmp__", rows=1, cols=1)
                 sh.del_worksheet(ws)
                 ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
                 sh.del_worksheet(tmp)
-                return ws
             else:
                 sh.del_worksheet(ws)
-        except Exception:
-            pass
-        ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
+                # wait for deletion to propagate
+                time.sleep(0.4)
+                ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
+        else:
+            ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
+        cleanup_conflict_tabs(sh, title)
         return ws
     except Exception:
-        # fallback clear if cannot delete due to perms
-        ws = sh.worksheet(title) if title in [w.title for w in sh.worksheets()] else sh.add_worksheet(title=title, rows=rows, cols=cols)
-        ws.batch_clear(["A1:Z100000"])
+        # fallback: ensure exists then clear a big range
+        try:
+            ws = sh.worksheet(title)
+        except Exception:
+            ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
+        ws.batch_clear(["A1:ZZ100000"])
+        cleanup_conflict_tabs(sh, title)
         return ws
 
 def write_frame_to_ws(sh, title, df: pd.DataFrame):
@@ -385,9 +394,7 @@ def write_frame_to_ws(sh, title, df: pd.DataFrame):
 # Stage A — snapshots → ActiveNow
 # =========================
 def stage_a_activenow():
-    # Universe
     symbols = fetch_active_symbols(UNIVERSE_CAP)
-    # Snapshots (robust)
     snaps = fetch_snapshots_multi(symbols, chunk=SNAPSHOT_CHUNK)
     rth = is_market_open_now()
 
@@ -400,27 +407,33 @@ def stage_a_activenow():
         db = snap.get("dailyBar") or {}
         pdbar = snap.get("prevDailyBar") or {}
 
-        # last price: latestTrade.p -> minuteBar.c -> dailyBar.c
+        # ---- robust price: lt.p -> mb.c -> db.c -> prevDaily.c (NEW fallback)
         p = None
         try:
-            if lt.get("p") is not None: p = float(lt["p"])
-            elif mb.get("c") is not None: p = float(mb["c"])
-            elif db.get("c") is not None: p = float(db["c"])
+            for cand in (lt.get("p"), mb.get("c"), db.get("c"), pdbar.get("c")):
+                if cand is not None:
+                    p = float(cand); break
         except Exception:
             p = None
         if p is None or not (PRICE_MIN <= p <= PRICE_MAX):
-            price_drops += 1; continue
+            price_drops += 1
+            continue
 
-        # volumes
+        # ---- robust volume: minute (if RTH & >0) else daily -> prevDaily (NEW)
         mv = float(mb.get("v") or 0.0)
         dv = float(db.get("v") or 0.0)
-        active_vol = mv if (rth and mv > 0) else dv
-        vol_source = "minute" if (rth and mv > 0) else "daily"
+        pv = float(pdbar.get("v") or 0.0)
+        if rth and mv > 0:
+            active_vol, vol_source = mv, "minute"
+        else:
+            if dv > 0:
+                active_vol, vol_source = dv, "daily"
+            else:
+                active_vol, vol_source = pv, "prev_daily"
 
-        # flags from snapshots (no lookback)
-        prev_high = pdbar.get("h")
+        # ---- flags (no lookback)
+        prev_high  = pdbar.get("h")
         today_high = db.get("h")
-
         flag_pdh_break = bool(prev_high is not None and p > float(prev_high))
         flag_day_high_prox = False
         if today_high is not None:
@@ -432,9 +445,9 @@ def stage_a_activenow():
         rows.append({
             "symbol": s,
             "price": p,
-            "minute_vol": mv,
-            "daily_vol": dv,
-            "active_vol": active_vol,
+            "minute_vol": float(mv),
+            "daily_vol": float(dv),
+            "active_vol": float(active_vol),
             "vol_source": vol_source,
             "flag_pdh_break": flag_pdh_break,
             "flag_day_high_proximity": flag_day_high_prox
@@ -486,7 +499,7 @@ def stage_b_signals(top_symbols):
         rsi3 = rsi(cl, 3)
         rsi3_cross50 = bool(len(rsi3) >= 2 and rsi3.iloc[-2] <= 50 and rsi3.iloc[-1] > 50)
 
-        # EMA stack (info flag)
+        # EMA stack (info)
         e10, e20, e50, e100 = ema(cl,10), ema(cl,20), ema(cl,50), ema(cl,100)
         stack_h1_bull = bool(cl.iloc[-1] > e50.iloc[-1] > e100.iloc[-1] and e10.iloc[-1] > e20.iloc[-1])
 
@@ -516,7 +529,6 @@ def stage_b_signals(top_symbols):
             continue
         cl = df["close"].astype(float)
         e200 = ema(cl,200)
-        # Cross up today: close[t] > EMA200[t] and close[t-1] <= EMA200[t-1]
         flag = bool(cl.iloc[-1] > e200.iloc[-1] and cl.iloc[-2] <= e200.iloc[-2])
         rows_d1.append({
             "symbol": s,
@@ -578,7 +590,7 @@ with right:
     st.write(f"**Market open:** {a_diag.get('rth')}")
     st.write(f"**Price-band drops:** {a_diag.get('price_drops',0)}")
 
-# Write ActiveNow immediately (drop & recreate)
+# Write ActiveNow immediately (conflict-safe)
 try:
     sh = get_gc()
     if not df_active.empty:
@@ -593,13 +605,13 @@ try:
 except Exception as e:
     st.error(f"Failed to write {TAB_ACTIVENOW}: {e}")
 
-# Stage B — compute signals on survivors, then write tabs
+# Stage B — survivors only
 if not df_active.empty:
     with st.spinner("Stage B — computing SignalsH1 / SignalsD1 on Top-K survivors…"):
         top_syms = df_active["symbol"].tolist()
         df_h1, df_d1 = stage_b_signals(top_syms)
 
-        # Show brief preview
+        # Preview
         st.subheader("Signals (preview)")
         col1, col2 = st.columns(2)
         with col1:
@@ -615,7 +627,7 @@ if not df_active.empty:
             else:
                 st.dataframe(df_d1.head(20), use_container_width=True)
 
-        # Write Sheets (drop & recreate)
+        # Write Sheets (conflict-safe)
         try:
             if not df_h1.empty:
                 write_frame_to_ws(sh, TAB_SIG_H1, df_h1)
@@ -638,7 +650,7 @@ if not df_active.empty:
         except Exception as e:
             st.error(f"Failed to write {TAB_SIG_D1}: {e}")
 
-# Context (small, no lookback)
+# Context (small)
 with st.spinner("Updating Context…"):
     try:
         df_ctx = build_context()
