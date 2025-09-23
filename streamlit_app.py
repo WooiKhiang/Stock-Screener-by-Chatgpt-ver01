@@ -1,62 +1,83 @@
-# Ultra-lean Hourly Scanner — Alpaca → Google Sheets
-# Filters: Price in [5, 100], RVOL_hour >= 1.0
-# Rank: RVOL_hour desc
-# Output: overwrite "Universe" tab each run
-# Notes: feed forced to IEX to avoid SIP 403; RTH-only for hourly bars
+# Market Scanner — Stage A (fast snapshots) + Stage B (light bars on survivors)
+# Tabs written (drop & recreate each run): ActiveNow, SignalsH1, SignalsD1, Context
+# Data: Alpaca (IEX). Stage-B bars auto-fallback to yfinance if Alpaca fails for a batch.
+# Author: you & me :)
 
 import os, json, time, datetime as dt
 import numpy as np
 import pandas as pd
 import pytz, requests, streamlit as st
 
-# ========= Config =========
+# =========================
+# Config & Secrets
+# =========================
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
-TAB_UNIVERSE    = "Universe"
 
-# Alpaca creds — prefer env; literals here as fallback
+TAB_ACTIVENOW = "ActiveNow"
+TAB_SIG_H1    = "SignalsH1"
+TAB_SIG_D1    = "SignalsD1"
+TAB_CONTEXT   = "Context"
+
+# Alpaca creds (prefer env; literals as fallback)
 ALPACA_KEY    = os.getenv("ALPACA_KEY",    "PKIG445MPT704CN8P0R8")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "3GQdWcnbMo6V8uvhVa6BK6EbvnH4EHinlsU6uvj4")
 ALPACA_BASE   = "https://paper-api.alpaca.markets/v2"
 ALPACA_DATA   = "https://data.alpaca.markets"
-FEED          = "iex"  # force IEX to avoid SIP 403
+FEED          = "iex"   # force IEX to avoid SIP entitlement issues
 
+# Google SA JSON must be in Streamlit secrets
 SA_RAW = st.secrets.get("GCP_SERVICE_ACCOUNT") or os.getenv("GCP_SERVICE_ACCOUNT")
 
 ET = pytz.timezone("America/New_York")
 HEADERS = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
 
-# ========= UI =========
-st.set_page_config(page_title="Hourly RVOL Scanner — Alpaca → Sheets", layout="wide")
-st.title("⏱️ Hourly RVOL Scanner — Alpaca → Google Sheets")
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="Market Scanner — ActiveNow + Signals", layout="wide")
+st.title("⚡ Market Scanner — ActiveNow + Signals (Alpaca → Google Sheets)")
 
 autorun = st.sidebar.checkbox("Auto-run hourly", value=True)
 try:
     autorefresh = getattr(st, "autorefresh", None) or getattr(st, "experimental_autorefresh", None)
     if autorun and autorefresh:
-        autorefresh(interval=60*60*1000, key="auto_1h_rvol")
+        autorefresh(interval=60*60*1000, key="auto_hr_scanner")
     elif autorun:
         st.markdown("<script>setTimeout(()=>window.location.reload(),3600000);</script>", unsafe_allow_html=True)
 except Exception:
     pass
 
 st.sidebar.markdown("### Universe")
-UNIVERSE_CAP = st.sidebar.slider("Symbols to scan (cap)", 200, 6000, 4000, 200)
+UNIVERSE_CAP = st.sidebar.slider("Symbols to scan (cap)", 1000, 12000, 8000, 500)
 
-st.sidebar.markdown("### Filters")
+st.sidebar.markdown("### Filters (Stage A)")
 PRICE_MIN = st.sidebar.number_input("Min price ($)", value=5.0, step=0.5)
 PRICE_MAX = st.sidebar.number_input("Max price ($)", value=100.0, step=1.0)
-RVOL_MIN  = st.sidebar.number_input("RVOL_hour ≥", value=1.00, step=0.05, format="%.2f")
+TOP_K     = st.sidebar.slider("Top K to keep (by active volume)", 200, 3000, 1200, 100)
 
-st.sidebar.markdown("### Lookback / Speed")
-H1_LIMIT_BARS = st.sidebar.slider("Hourly bars to fetch (limit)", 40, 120, 80, 5,
-                                  help="80 bars covers RVOL20 comfortably.")
-H1_MIN_BARS_REQ = st.sidebar.slider("Minimum H1 bars required", 20, 80, 30, 1)
-CHUNK_SIZE = st.sidebar.slider("Fetch chunk size", 60, 200, 150, 20)
-SHOW_LIMIT = st.sidebar.slider("Rows to show", 10, 100, 50)
+st.sidebar.markdown("### Flags (Stage A)")
+DHP_DELTA = st.sidebar.slider("Day-high proximity δ", 0.001, 0.01, 0.005, 0.001,
+                              help="Flag if last ≥ today's high × (1−δ). 0.005 = within 0.5% of day high")
 
-# ========= Helpers =========
+st.sidebar.markdown("### Bars (Stage B — survivors only, automatic)")
+H1_LIMIT = st.sidebar.slider("Hourly bars limit (H1)", 30, 80, 60, 5)
+D1_LIMIT = st.sidebar.slider("Daily bars limit (D1)", 180, 260, 220, 10)
+SNAPSHOT_CHUNK = st.sidebar.slider("Snapshot chunk size", 100, 600, 300, 50)
+
+# =========================
+# Helpers
+# =========================
+def now_et():
+    return dt.datetime.now(ET)
+
 def now_et_str():
-    return dt.datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
+    return now_et().strftime("%Y-%m-%d %H:%M:%S")
+
+def is_market_open_now():
+    n = now_et()
+    if n.weekday() >= 5:  # Sat/Sun
+        return False
+    return dt.time(9,30) <= n.time() <= dt.time(16,0)
 
 def parse_sa(raw_json: str) -> dict:
     if not raw_json: raise RuntimeError("Missing GCP_SERVICE_ACCOUNT in secrets/env.")
@@ -76,43 +97,105 @@ def rth_only_hour(df: pd.DataFrame) -> pd.DataFrame:
     mask = (et_times.dt.time >= dt.time(9,30)) & (et_times.dt.time <= dt.time(16,0))
     return df[mask].reset_index(drop=True)
 
-# ========= Alpaca I/O =========
-_last_data_error = {"where":"", "status":None, "message":""}
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+def macd_line_sig(x: pd.Series, fast=12, slow=26, signal=9):
+    ef, es = ema(x, fast), ema(x, slow)
+    line = ef - es
+    sig  = line.ewm(span=signal, adjust=False).mean()
+    return line, sig
+
+def rsi(series: pd.Series, n: int = 3) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    roll_down = down.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    r = 100 - (100 / (1 + rs))
+    return r
+
+# =========================
+# Alpaca I/O
+# =========================
+_last_data_error = {}
 
 def fetch_active_symbols(cap: int):
     url = f"{ALPACA_BASE}/assets"
     params = {"status": "active", "asset_class": "us_equity"}
     r = requests.get(url, headers=HEADERS, params=params, timeout=60); r.raise_for_status()
     keep_exch = {"NASDAQ","NYSE","AMEX"}
-    syms = [x["symbol"] for x in r.json() if x.get("exchange") in keep_exch and x.get("tradable")]
-    bad_suffixes = (".U",".W","WS","W","R",".P","-P")
-    syms = [s for s in syms if not s.endswith(bad_suffixes)]
+    syms = []
+    for x in r.json():
+        if x.get("exchange") in keep_exch and x.get("tradable"):
+            s = x.get("symbol","")
+            if not s: continue
+            if s.endswith((".U",".W","WS","W","R",".P","-P")):  # sanitize tails
+                continue
+            syms.append(s)
+        if len(syms) >= cap: break
     return syms[:cap]
 
-def _bars_request(params, max_retries=3):
-    base = f"{ALPACA_DATA}/v2/stocks/bars"
-    p = dict(params); p["feed"] = FEED  # force IEX
+def _snapshots_request(symbols_batch, max_retries=3):
+    url = f"{ALPACA_DATA}/v2/stocks/snapshots"
+    params = {"symbols": ",".join(symbols_batch), "feed": FEED}
     for attempt in range(max_retries):
-        r = requests.get(base, headers=HEADERS, params=p, timeout=60)
+        r = requests.get(url, headers=HEADERS, params=params, timeout=60)
         if r.status_code in (429,500,502,503,504):
-            time.sleep(1.2*(attempt+1)); continue
+            time.sleep(1.1*(attempt+1)); continue
         if r.status_code >= 400:
             try: msg = r.json().get("message", r.text[:300])
             except Exception: msg = r.text[:300]
-            _last_data_error.update({"where": f"/bars {p.get('timeframe')} feed=iex",
-                                     "status": r.status_code, "message": msg})
+            _last_data_error["snapshots"] = (r.status_code, msg)
             return None
-        try: return r.json()
+        try:
+            return r.json()
         except Exception:
-            _last_data_error.update({"where": "parse feed=iex", "status": r.status_code, "message": "JSON parse error"})
+            _last_data_error["snapshots"] = (r.status_code, "JSON parse error")
             return None
-    _last_data_error.update({"where": f"/bars {p.get('timeframe')} feed=iex", "status": 408, "message": "retry timeout"})
+    _last_data_error["snapshots"] = (408, "retry timeout")
     return None
 
-def fetch_bars_multi_limit(symbols, timeframe="1Hour", limit=80, chunk_size=150, max_retries=3):
+def fetch_snapshots_multi(symbols, chunk=300):
+    out = {}
+    i = 0
+    while i < len(symbols):
+        batch = symbols[i:i+chunk]
+        js = _snapshots_request(batch)
+        if js is None:
+            for s in batch: out[s] = {}
+            i += chunk; continue
+        snaps = js.get("snapshots") or {}
+        for s in batch:
+            out[s] = snaps.get(s, {}) or {}
+        i += chunk
+    return out
+
+def _bars_request(params, max_retries=3):
+    url = f"{ALPACA_DATA}/v2/stocks/bars"
+    p = dict(params); p["feed"] = FEED
+    for attempt in range(max_retries):
+        r = requests.get(url, headers=HEADERS, params=p, timeout=60)
+        if r.status_code in (429,500,502,503,504):
+            time.sleep(1.1*(attempt+1)); continue
+        if r.status_code >= 400:
+            try: msg = r.json().get("message", r.text[:300])
+            except Exception: msg = r.text[:300]
+            _last_data_error[f"bars_{p.get('timeframe')}"] = (r.status_code, msg)
+            return None
+        try:
+            return r.json()
+        except Exception:
+            _last_data_error[f"bars_{p.get('timeframe')}"] = (r.status_code, "JSON parse error")
+            return None
+    _last_data_error[f"bars_{p.get('timeframe')}"] = (408, "retry timeout")
+    return None
+
+def fetch_bars_multi(symbols, timeframe="1Hour", limit=60, chunk=150):
     out = {}
     end = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-    start = end - dt.timedelta(days=40)  # advisory
+    start = end - dt.timedelta(days=60 if timeframe=="1Hour" else 400)
     start_iso = start.isoformat().replace("+00:00","Z")
     end_iso   = end.isoformat().replace("+00:00","Z")
 
@@ -121,8 +204,7 @@ def fetch_bars_multi_limit(symbols, timeframe="1Hour", limit=80, chunk_size=150,
         if isinstance(bars, dict):
             for sym, arr in bars.items():
                 if not arr:
-                    if sym not in out:
-                        out[sym] = pd.DataFrame(columns=["t","open","high","low","close","volume"])
+                    if sym not in out: out[sym] = pd.DataFrame(columns=["t","open","high","low","close","volume"])
                     continue
                 df = pd.DataFrame(arr)
                 df["t"] = pd.to_datetime(df["t"], utc=True)
@@ -138,178 +220,388 @@ def fetch_bars_multi_limit(symbols, timeframe="1Hour", limit=80, chunk_size=150,
 
     i = 0
     while i < len(symbols):
-        chunk = symbols[i:i+chunk_size]
-        params = dict(timeframe=timeframe, symbols=",".join(chunk), limit=limit,
-                      start=start_iso, end=end_iso, adjustment="raw")
+        batch = symbols[i:i+chunk]
+        params = dict(timeframe=timeframe, symbols=",".join(batch), limit=limit, start=start_iso, end=end_iso, adjustment="raw")
         page=None; ok=False
         while True:
-            p = dict(params)
+            p = dict(params); 
             if page: p["page_token"] = page
-            js = _bars_request(p, max_retries=max_retries)
+            js = _bars_request(p)
             if js is None: break
             merge_json(js)
             page = js.get("next_page_token")
-            if not page:
-                ok=True; break
-        if not ok:
-            # per-symbol fallback inside this chunk
-            if chunk_size > 60:
-                chunk_size = max(60, chunk_size//2)
-                continue
-            for sym in chunk:
-                params = dict(timeframe=timeframe, symbols=sym, limit=limit,
-                              start=start_iso, end=end_iso, adjustment="raw")
-                page=None
-                for attempt in range(max_retries):
-                    p = dict(params); 
-                    if page: p["page_token"] = page
-                    js = _bars_request(p, max_retries=max_retries)
-                    if js is None: break
-                    merge_json(js)
-                    page = js.get("next_page_token")
-                    if not page: break
-                if sym not in out:
-                    out[sym] = pd.DataFrame(columns=["t","open","high","low","close","volume"])
-        i += chunk_size
+            if not page: ok=True; break
+        if not ok and chunk > 60:
+            # try smaller chunk
+            chunk = max(60, chunk//2)
+            continue
+        i += len(batch)
 
-    # RTH filter for hourly
-    if timeframe.lower() in ("1hour","1h","60m","60min"):
-        for s, df in list(out.items()):
-            if df is None or df.empty: continue
-            df = df.drop_duplicates(subset=["t"]).sort_values("t").reset_index(drop=True)
-            out[s] = rth_only_hour(df)
+    # Clean & RTH for H1
+    for s, df in list(out.items()):
+        if df is None or df.empty: continue
+        df = df.drop_duplicates(subset=["t"]).sort_values("t").reset_index(drop=True)
+        if timeframe.lower() in ("1hour","1h","60m","60min"):
+            df = rth_only_hour(df)
+        out[s] = df
     return out
 
-# ========= Sheets write (overwrite + trim) =========
-def _open_or_create_ws(gc, title, rows=200, cols=40):
-    sh = gc.open_by_key(GOOGLE_SHEET_ID)
-    try: return sh.worksheet(title)
-    except Exception: return sh.add_worksheet(title=title, rows=rows, cols=cols)
+# =========================
+# Yahoo fallback (only if needed)
+# =========================
+def fetch_yf_hourly(symbols):
+    try:
+        import yfinance as yf
+    except Exception:
+        return {}
+    out = {}
+    # yfinance download for many tickers can return multiindex; safer to do per symbol with threads disabled
+    for s in symbols:
+        try:
+            df = yf.download(s, period="30d", interval="1h", auto_adjust=False, progress=False, prepost=False, threads=False)
+            if df is None or df.empty:
+                out[s] = pd.DataFrame()
+                continue
+            df = df.reset_index().rename(columns={"Datetime":"t","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+            df["t"] = pd.to_datetime(df["t"], utc=True)  # yfinance tz-naive -> assume UTC then localize if needed
+            df = rth_only_hour(df)
+            out[s] = df[["t","open","high","low","close","volume"]].copy()
+        except Exception:
+            out[s] = pd.DataFrame()
+    return out
 
-def write_universe_safe(df: pd.DataFrame):
+def fetch_yf_daily(symbols):
+    try:
+        import yfinance as yf
+    except Exception:
+        return {}
+    out = {}
+    for s in symbols:
+        try:
+            df = yf.download(s, period="250d", interval="1d", auto_adjust=False, progress=False, prepost=False, threads=False)
+            if df is None or df.empty:
+                out[s] = pd.DataFrame()
+                continue
+            df = df.reset_index().rename(columns={"Date":"t","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+            df["t"] = pd.to_datetime(df["t"], utc=True)
+            out[s] = df[["t","open","high","low","close","volume"]].copy()
+        except Exception:
+            out[s] = pd.DataFrame()
+    return out
+
+# =========================
+# Google Sheets (drop & recreate)
+# =========================
+def get_gc():
     import gspread
     from google.oauth2.service_account import Credentials
     sa_info = parse_sa(SA_RAW)
     creds = Credentials.from_service_account_info(sa_info,
         scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"])
     gc = gspread.authorize(creds)
-    ws = _open_or_create_ws(gc, TAB_UNIVERSE)
+    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+    return sh
 
+def drop_and_create(sh, title, rows=200, cols=40):
+    try:
+        try:
+            ws = sh.worksheet(title)
+            # To avoid "cannot delete last worksheet", create temp if needed
+            if len(sh.worksheets()) == 1:
+                tmp = sh.add_worksheet(title="__tmp__", rows=1, cols=1)
+                sh.del_worksheet(ws)
+                ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
+                sh.del_worksheet(tmp)
+                return ws
+            else:
+                sh.del_worksheet(ws)
+        except Exception:
+            pass
+        ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
+        return ws
+    except Exception:
+        # Fallback: clear large range if deletion fails due to perms
+        ws = sh.worksheet(title) if title in [w.title for w in sh.worksheets()] else sh.add_worksheet(title=title, rows=rows, cols=cols)
+        ws.batch_clear(["A1:Z100000"])
+        return ws
+
+def write_frame_to_ws(sh, title, df: pd.DataFrame):
+    ws = drop_and_create(sh, title, rows=max(200, len(df)+10), cols=max(10, len(df.columns)+2))
     values = [list(df.columns)] + df.fillna("").astype(str).values.tolist()
     ws.update("A1", values, value_input_option="RAW")
 
-    # Trim stale cells if new sheet is smaller than previous
-    try:
-        old_vals = ws.get_all_values()
-        old_rows = len(old_vals); old_cols = max((len(r) for r in old_vals), default=0)
-        new_rows = len(values); new_cols = len(values[0]) if values else 0
-        def col_letter(n:int):
-            s=""
-            while n>0:
-                n,r = divmod(n-1,26); s = chr(65+r)+s
-            return s
-        ranges=[]
-        if old_rows>new_rows and old_cols>0:
-            ranges.append(f"A{new_rows+1}:{col_letter(max(old_cols,new_cols))}")
-        if old_cols>new_cols and new_rows>0:
-            ranges.append(f"{col_letter(new_cols+1)}1:{col_letter(old_cols)}{new_rows}")
-        if ranges:
-            ws.batch_clear(ranges)
-    except Exception:
-        pass
-
-# ========= Runner =========
-def run_scan():
+# =========================
+# Stage A — snapshots → ActiveNow
+# =========================
+def stage_a_activenow():
     # Universe
     symbols = fetch_active_symbols(UNIVERSE_CAP)
-    total_universe = len(symbols)
+    # Snapshots
+    snaps = fetch_snapshots_multi(symbols, chunk=SNAPSHOT_CHUNK)
+    rth = is_market_open_now()
 
-    # Fetch hourly bars (IEX)
-    bars_h = fetch_bars_multi_limit(symbols, timeframe="1Hour", limit=H1_LIMIT_BARS, chunk_size=CHUNK_SIZE)
-    counts = [len(df) for df in bars_h.values() if isinstance(df, pd.DataFrame)]
-    min_hbars = min(counts) if counts else 0
-
-    drops = {"insufficient_bars":0, "price":0, "rvol":0}
     rows = []
-
+    price_drops = 0
     for s in symbols:
-        df = bars_h.get(s)
-        if df is None or len(df) < max(21, H1_MIN_BARS_REQ):
-            drops["insufficient_bars"] += 1; continue
+        snap = snaps.get(s) or {}
+        lt = snap.get("latestTrade") or {}
+        mb = snap.get("minuteBar") or {}
+        db = snap.get("dailyBar") or {}
+        pdbar = snap.get("prevDailyBar") or {}
 
-        cl = df["close"].astype(float)
-        vol = df["volume"].astype(float).fillna(0)
-        last_close = float(cl.iloc[-1])
-        last_vol   = float(vol.iloc[-1])
+        # last price: latestTrade.p -> minuteBar.c -> dailyBar.c
+        p = None
+        try:
+            if lt.get("p") is not None: p = float(lt["p"])
+            elif mb.get("c") is not None: p = float(mb["c"])
+            elif db.get("c") is not None: p = float(db["c"])
+        except Exception:
+            p = None
+        if p is None or not (PRICE_MIN <= p <= PRICE_MAX):
+            price_drops += 1; continue
 
-        # Filter 1: Price
-        if not (PRICE_MIN <= last_close <= PRICE_MAX):
-            drops["price"] += 1; continue
+        # volumes
+        mv = float(mb.get("v") or 0.0)
+        dv = float(db.get("v") or 0.0)
+        active_vol = mv if (rth and mv > 0) else dv
+        vol_source = "minute" if (rth and mv > 0) else "daily"
 
-        # Filter 2: RVOL_hour (vs 20-hour simple avg)
-        base = float(vol.rolling(20, min_periods=20).mean().iloc[-1])
-        if not (base and base>0):
-            drops["rvol"] += 1; continue
-        rvol = last_vol / base
-        if rvol < RVOL_MIN:
-            drops["rvol"] += 1; continue
+        # flags (no lookback)
+        prev_high = pdbar.get("h")
+        today_high = db.get("h")
+
+        flag_pdh_break = bool(prev_high is not None and p > float(prev_high))
+        flag_day_high_prox = False
+        if today_high is not None:
+            try:
+                flag_day_high_prox = p >= float(today_high) * (1.0 - float(DHP_DELTA))
+            except Exception:
+                flag_day_high_prox = False
 
         rows.append({
             "symbol": s,
-            "close": last_close,
-            "vol_last": last_vol,
-            "avg_vol20": base,
-            "rvol_hour": float(rvol),
+            "price": p,
+            "minute_vol": mv,
+            "daily_vol": dv,
+            "active_vol": active_vol,
+            "vol_source": vol_source,
+            "flag_pdh_break": flag_pdh_break,
+            "flag_day_high_proximity": flag_day_high_prox
         })
 
     if not rows:
-        df_out = pd.DataFrame()
-    else:
-        df = pd.DataFrame(rows).sort_values("rvol_hour", ascending=False).reset_index(drop=True)
-        df_out = df.copy()
-        df_out.insert(0, "as_of_et", now_et_str())
+        return pd.DataFrame(), symbols, {"price_drops": price_drops, "rth": rth}
 
-    return total_universe, min_hbars, df_out, {"last_error": _last_data_error, "drops": drops}
+    df = pd.DataFrame(rows).sort_values(["active_vol","daily_vol","minute_vol"], ascending=[False, False, False]).reset_index(drop=True)
+    df_out = df.head(TOP_K).copy()
+    df_out.insert(0, "as_of_et", now_et_str())
+    return df_out, symbols, {"price_drops": price_drops, "rth": rth}
 
-# ========= Run =========
+# =========================
+# Stage B — bars → SignalsH1 / SignalsD1
+# =========================
+def stage_b_signals(top_symbols):
+    # ----- Hourly bars (H1) -----
+    bars_h = fetch_bars_multi(top_symbols, timeframe="1Hour", limit=H1_LIMIT, chunk=150)
+    # Identify empties (fallback to yfinance)
+    need_yf_h = [s for s in top_symbols if (bars_h.get(s) is None or bars_h.get(s).empty or len(bars_h.get(s)) < 12)]
+    if need_yf_h:
+        yf_h = fetch_yf_hourly(need_yf_h)
+        for s in need_yf_h:
+            if yf_h.get(s) is not None and not yf_h[s].empty:
+                bars_h[s] = yf_h[s]
+
+    # ----- Daily bars (D1) -----
+    bars_d = fetch_bars_multi(top_symbols, timeframe="1Day", limit=D1_LIMIT, chunk=150)
+    need_yf_d = [s for s in top_symbols if (bars_d.get(s) is None or bars_d.get(s).empty or len(bars_d.get(s)) < 210)]
+    if need_yf_d:
+        yf_d = fetch_yf_daily(need_yf_d)
+        for s in need_yf_d:
+            if yf_d.get(s) is not None and not yf_d[s].empty:
+                bars_d[s] = yf_d[s]
+
+    # ----- Compute H1 flags -----
+    rows_h1 = []
+    for s in top_symbols:
+        df = bars_h.get(s)
+        if df is None or df.empty or len(df) < 12:
+            continue
+        cl = df["close"].astype(float); hi = df["high"].astype(float); vol = df["volume"].astype(float)
+
+        # Donchian-10 breakout: close(t) > max(high[t-10 .. t-1])
+        hh10_prev = hi.shift(1).rolling(10, min_periods=10).max().iloc[-1]
+        donchian10_break = bool(np.isfinite(hh10_prev) and cl.iloc[-1] > hh10_prev)
+
+        # RSI(3) cross above 50
+        rsi3 = rsi(cl, 3)
+        rsi3_cross50 = bool(len(rsi3) >= 2 and rsi3.iloc[-2] <= 50 and rsi3.iloc[-1] > 50)
+
+        # EMA stack (optional info flag)
+        e10, e20, e50, e100 = ema(cl,10), ema(cl,20), ema(cl,50), ema(cl,100)
+        stack_h1_bull = bool(cl.iloc[-1] > e50.iloc[-1] > e100.iloc[-1] and e10.iloc[-1] > e20.iloc[-1])
+
+        # MACD zero-line cross while signal < 0 (attention flag)
+        ml, ms = macd_line_sig(cl)
+        macd_zero_cross_sig_neg = bool(len(ml)>=2 and (ml.iloc[-2] <= 0 < ml.iloc[-1]) and (ms.iloc[-1] < 0))
+
+        rows_h1.append({
+            "symbol": s,
+            "last_h1_close": float(cl.iloc[-1]),
+            "last_h1_vol": float(vol.iloc[-1]),
+            "flag_donchian10_breakout": donchian10_break,
+            "flag_rsi3_cross50": rsi3_cross50,
+            "stack_h1_bull": stack_h1_bull,
+            "flag_h1_macd_zero_cross_sig_neg": macd_zero_cross_sig_neg
+        })
+
+    df_h1 = pd.DataFrame(rows_h1)
+    if not df_h1.empty:
+        df_h1.insert(0, "as_of_et", now_et_str())
+
+    # ----- Compute D1 flag -----
+    rows_d1 = []
+    for s in top_symbols:
+        df = bars_d.get(s)
+        if df is None or df.empty or len(df) < 201:
+            continue
+        cl = df["close"].astype(float)
+        e200 = ema(cl,200)
+        # Cross up today: close[t] > EMA200[t] and close[t-1] <= EMA200[t-1]
+        flag = bool(cl.iloc[-1] > e200.iloc[-1] and cl.iloc[-2] <= e200.iloc[-2])
+        rows_d1.append({
+            "symbol": s,
+            "last_d1_close": float(cl.iloc[-1]),
+            "flag_d1_ema200_breakout": flag
+        })
+
+    df_d1 = pd.DataFrame(rows_d1)
+    if not df_d1.empty:
+        df_d1.insert(0, "as_of_et", now_et_str())
+
+    return df_h1, df_d1
+
+# =========================
+# Context (no lookback)
+# =========================
+CONTEXT_TICKERS = ["SPY", "VIXY", "XLF", "XLK", "XLY", "XLP", "XLV", "XLE", "XLI", "XLU",
+                   "XLRE", "XLB", "SMH", "XOP", "XBI", "XME", "KRE", "ITB", "IYT", "TAN"]
+
+def build_context():
+    snaps = fetch_snapshots_multi(CONTEXT_TICKERS, chunk=min(100, len(CONTEXT_TICKERS)))
+    rows = [{"key":"as_of_et", "value": now_et_str()},
+            {"key":"market_open", "value": str(is_market_open_now())}]
+    for s in CONTEXT_TICKERS:
+        snap = snaps.get(s) or {}
+        db = snap.get("dailyBar") or {}
+        pdbar = snap.get("prevDailyBar") or {}
+        try:
+            c = float(db.get("c") or np.nan)
+            pc = float(pdbar.get("c") or np.nan)
+            if np.isfinite(c) and np.isfinite(pc) and pc != 0:
+                pct = 100.0*(c-pc)/pc
+                rows.append({"key": f"{s}_1d_pct", "value": f"{pct:+.2f}%"})
+        except Exception:
+            pass
+    return pd.DataFrame(rows, columns=["key","value"])
+
+# =========================
+# Run
+# =========================
 left, right = st.columns([2,1])
 
-with st.spinner("Scanning…"):
-    total_universe, min_hbars, df_out, diag = run_scan()
-
-with right:
-    st.subheader("Run Summary")
-    st.write(f"**As of (ET):** {now_et_str()}")
-    st.write(f"**Universe cap:** {UNIVERSE_CAP:,}")
-    st.write(f"**Universe scanned:** {total_universe:,}")
-    st.write(f"**Min H1 bars (fetched):** {min_hbars}")
-    st.write("**Feed:** iex")
+with st.spinner("Stage A — scanning snapshots…"):
+    df_active, all_syms, a_diag = stage_a_activenow()
 
 with left:
-    st.subheader("Candidates (RVOL ≥ threshold; Price $5–$100)")
-    if df_out.empty:
-        st.warning("No matches under current thresholds.")
+    st.subheader(f"ActiveNow — Top {len(df_active) if not df_active.empty else 0} by active volume (Price ${PRICE_MIN:.0f}–${PRICE_MAX:.0f})")
+    if df_active.empty:
+        st.warning("No matches under current settings.")
     else:
-        fmt = {"close":"{:.2f}", "vol_last":"{:.0f}", "avg_vol20":"{:.0f}", "rvol_hour":"{:.2f}"}
-        st.dataframe(df_out.head(SHOW_LIMIT).style.format(fmt), use_container_width=True)
+        fmt = {"price":"{:.2f}","minute_vol":"{:.0f}","daily_vol":"{:.0f}","active_vol":"{:.0f}"}
+        st.dataframe(df_active.style.format(fmt), use_container_width=True)
 
-# Write to Sheets (overwrite) if we have rows
-if not df_out.empty:
+with right:
+    st.subheader("Run Summary (Stage A)")
+    st.write(f"**As of (ET):** {now_et_str()}")
+    st.write(f"**Universe cap:** {UNIVERSE_CAP:,}")
+    st.write(f"**Universe scanned:** {len(all_syms):,}")
+    st.write(f"**Market open:** {a_diag.get('rth')}")
+    st.write(f"**Price-band drops:** {a_diag.get('price_drops',0)}")
+
+# Write ActiveNow immediately (drop & recreate)
+try:
+    sh = get_gc()
+    if not df_active.empty:
+        write_frame_to_ws(sh, TAB_ACTIVENOW, df_active)
+        st.success(f"{TAB_ACTIVENOW} updated.")
+    else:
+        # Still drop & recreate empty with header to make state explicit
+        write_frame_to_ws(sh, TAB_ACTIVENOW, pd.DataFrame(columns=[
+            "as_of_et","symbol","price","minute_vol","daily_vol","active_vol","vol_source",
+            "flag_pdh_break","flag_day_high_proximity"
+        ]))
+        st.info(f"{TAB_ACTIVENOW} created (empty).")
+except Exception as e:
+    st.error(f"Failed to write {TAB_ACTIVENOW}: {e}")
+
+# Stage B — compute signals on survivors, then write tabs
+if not df_active.empty:
+    with st.spinner("Stage B — computing SignalsH1 / SignalsD1 on Top-K survivors…"):
+        top_syms = df_active["symbol"].tolist()
+        df_h1, df_d1 = stage_b_signals(top_syms)
+
+        # Show brief preview
+        st.subheader("Signals (preview)")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**SignalsH1**")
+            if df_h1.empty:
+                st.warning("SignalsH1: no rows.")
+            else:
+                st.dataframe(df_h1.head(20), use_container_width=True)
+        with col2:
+            st.markdown("**SignalsD1**")
+            if df_d1.empty:
+                st.warning("SignalsD1: no rows.")
+            else:
+                st.dataframe(df_d1.head(20), use_container_width=True)
+
+        # Write Sheets (drop & recreate)
+        try:
+            if not df_h1.empty:
+                write_frame_to_ws(sh, TAB_SIG_H1, df_h1)
+            else:
+                write_frame_to_ws(sh, TAB_SIG_H1, pd.DataFrame(columns=[
+                    "as_of_et","symbol","last_h1_close","last_h1_vol",
+                    "flag_donchian10_breakout","flag_rsi3_cross50","stack_h1_bull","flag_h1_macd_zero_cross_sig_neg"
+                ]))
+            st.success(f"{TAB_SIG_H1} refreshed.")
+        except Exception as e:
+            st.error(f"Failed to write {TAB_SIG_H1}: {e}")
+        try:
+            if not df_d1.empty:
+                write_frame_to_ws(sh, TAB_SIG_D1, df_d1)
+            else:
+                write_frame_to_ws(sh, TAB_SIG_D1, pd.DataFrame(columns=[
+                    "as_of_et","symbol","last_d1_close","flag_d1_ema200_breakout"
+                ]))
+            st.success(f"{TAB_SIG_D1} refreshed.")
+        except Exception as e:
+            st.error(f"Failed to write {TAB_SIG_D1}: {e}")
+
+# Context (small, no lookback)
+with st.spinner("Updating Context…"):
     try:
-        write_universe_safe(df_out)
-        st.success("Universe tab updated.")
+        df_ctx = build_context()
+        write_frame_to_ws(sh, TAB_CONTEXT, df_ctx)
+        st.success(f"{TAB_CONTEXT} refreshed.")
     except Exception as e:
-        st.error(f"Failed to write Universe: {e}")
-else:
-    st.info("No rows to write — Universe left unchanged.")
+        st.error(f"Failed to write {TAB_CONTEXT}: {e}")
 
 # Diagnostics
 with st.expander("🛠 Diagnostics", expanded=False):
-    st.markdown("**Drop reasons (counts)**")
-    st.json(diag.get("drops", {}))
-    le = diag.get("last_error", {})
-    if le and le.get("status") is not None:
-        st.markdown("**Last data error**")
-        st.write(f"Where: `{le.get('where')}`")
-        st.write(f"HTTP: `{le.get('status')}`")
-        st.code(str(le.get("message"))[:500])
+    if _last_data_error:
+        for k, v in _last_data_error.items():
+            st.write(f"**{k}** → {v}")
+    else:
+        st.write("No errors recorded.")
