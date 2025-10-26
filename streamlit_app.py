@@ -1,12 +1,12 @@
-# streamlit_app.py — US Universe Builder (Top 500 by 1h $ Amount) + Sector/Industry + Context
+# streamlit_app.py — US Universe Builder (Top 500 by 1h $ Amount) + Sector/Industry + Context (v2)
 # - Full US listings (NASDAQ/NYSE/NYSE American) from NASDAQ Trader
 # - Include ETFs, drop OTC
 # - Use last completed regular 1h bar (even when market is closed)
 # - Filter price $5–$100; rank by (close * volume); Top 500
 # - Universe sheet columns: date, time, ticker, price, volume, type, sector, industry (overwrite)
-# - Context sheet: VIX, HYG/LQD, XAUUSD=X, rotation (by transacted amount)
+# - Context sheet: VIX, HYG/LQD, XAUUSD=X (fallbacks), sentiment label, rotation (share % and counts)
 # - Dashboard: ET & MYT clocks, bar timestamp used
-# - Auto-refresh hourly; robust to empty frames and partial data
+# - Robust Yahoo helpers (skip empties), batched sector/industry enrichment w/ caching
 
 import os
 import io
@@ -15,7 +15,7 @@ import time
 import pytz
 import requests
 from datetime import datetime, timezone
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -45,7 +45,8 @@ TARGET_MINUTE = 25  # aim to run around HH:25
 VIX = "^VIX"
 HYG = "HYG"
 LQD = "LQD"
-GOLD = "XAUUSD=X"  # per your choice
+GOLD_PRIMARY = "XAUUSD=X"
+GOLD_FUTURES  = "GC=F"
 
 TZ_ET = pytz.timezone("America/New_York")
 TZ_MYT = pytz.timezone("Asia/Kuala_Lumpur")
@@ -283,14 +284,42 @@ def yf_1h_last_bar(tickers: List[str]) -> Tuple[pd.DataFrame, pd.Timestamp]:
     df = pd.DataFrame(rows, columns=["symbol","close","volume"])
     return df, (pd.Timestamp(last_ts_global) if last_ts_global is not None else None)
 
+# ---------- Sector / Industry enrichment ----------
+
 @st.cache_data(show_spinner=True, ttl=24*60*60)
-def get_sector_industry(symbol: str) -> Tuple[str, str]:
-    """Sector/industry lookup (cached). Fail-safe returns empty strings."""
+def get_sector_industry_cached(symbol: str) -> Tuple[str, str]:
+    """Per-symbol cached lookup. Returns ('','') if unavailable."""
     try:
         info = yf.Ticker(symbol).get_info()
-        return str(info.get("sector") or ""), str(info.get("industry") or "")
+        sec = str(info.get("sector") or "")
+        ind = str(info.get("industry") or "")
+        return sec, ind
     except Exception:
         return "", ""
+
+def enrich_sector_industry_batched(df_ranked: pd.DataFrame, sleep_between: float = 0.02) -> pd.DataFrame:
+    """
+    Fill sector/industry for the Top-N list.
+    - ETFs typically have blank sector/industry (left blank).
+    - Stocks: try cached lookup; if empty, do one soft retry (later runs will fill via cache).
+    """
+    sectors, industries = [], []
+    for sym, typ in zip(df_ranked["symbol"], df_ranked["type"]):
+        if typ == "etf":
+            sectors.append("")
+            industries.append("")
+            continue
+        sec, ind = get_sector_industry_cached(sym)
+        # Soft retry once if both blank (avoid hammering)
+        if not sec and not ind:
+            time.sleep(0.08)
+            sec, ind = get_sector_industry_cached(sym)
+        sectors.append(sec)
+        industries.append(ind)
+        time.sleep(sleep_between)
+    df_ranked["sector"] = sectors
+    df_ranked["industry"] = industries
+    return df_ranked
 
 # =========================
 # Context metrics
@@ -310,22 +339,89 @@ def _last_and_change_1h(ticker: str) -> Tuple[float, float]:
     chg = (last - prev) / prev * 100.0 if prev else float("nan")
     return last, chg
 
+def _gold_with_fallback() -> Tuple[str, float, float]:
+    """Try XAUUSD=X 1h; if NaN, try GC=F 1h; else fallback to daily for primary."""
+    last, ch = _last_and_change_1h(GOLD_PRIMARY)
+    source = GOLD_PRIMARY
+    if np.isnan(last) or np.isnan(ch):
+        last2, ch2 = _last_and_change_1h(GOLD_FUTURES)
+        if not np.isnan(last2):
+            return GOLD_FUTURES, last2, ch2
+        # daily fallback for primary
+        df = yf.download(GOLD_PRIMARY, interval="1d", period="5d", auto_adjust=True, progress=False)
+        if df is not None and not df.empty and "Close" in df.columns:
+            c = df["Close"].dropna()
+            if len(c) >= 1:
+                last = float(c.iloc[-1])
+                ch = float("nan")
+                source = GOLD_PRIMARY + " (1d)"
+    return source, last, ch
+
+def hyg_lqd_ratio_change_1h() -> Tuple[float, float]:
+    """Return (ratio_last, ratio_1h_change_pct) using synchronized 1h bars."""
+    df_h = yf.download(HYG, interval="1h", period="7d", auto_adjust=True, progress=False, prepost=False)
+    df_l = yf.download(LQD, interval="1h", period="7d", auto_adjust=True, progress=False, prepost=False)
+    if df_h is None or df_l is None or df_h.empty or df_l.empty:
+        return float("nan"), float("nan")
+    c_h = df_h["Close"].dropna()
+    c_l = df_l["Close"].dropna()
+    idx = c_h.index.intersection(c_l.index)
+    if len(idx) < 2:
+        return float("nan"), float("nan")
+    r = (c_h.loc[idx] / c_l.loc[idx]).dropna()
+    if len(r) < 2:
+        return float(r.iloc[-1]) if len(r) else float("nan"), float("nan")
+    last = float(r.iloc[-1])
+    prev = float(r.iloc[-2])
+    chg = (last - prev) / prev * 100.0 if prev else float("nan")
+    return last, chg
+
 def build_rotation_tables(universe_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Top sectors/industries by total transacted amount."""
+    """Top sectors/industries by total transacted amount + counts + share %."""
     if universe_df.empty:
         return pd.DataFrame(), pd.DataFrame()
-    agg_s = universe_df.groupby("sector", dropna=False)["transacted_amount"].sum().reset_index()
-    agg_i = universe_df.groupby("industry", dropna=False)["transacted_amount"].sum().reset_index()
-    agg_s = agg_s.sort_values("transacted_amount", ascending=False).head(10)
-    agg_i = agg_i.sort_values("transacted_amount", ascending=False).head(10)
-    return agg_s, agg_i
+    total_amt = universe_df["transacted_amount"].sum()
+    s = (universe_df.groupby("sector", dropna=False)
+         .agg(transacted_amount=("transacted_amount","sum"),
+              count=("symbol","count"))
+         .reset_index())
+    i = (universe_df.groupby("industry", dropna=False)
+         .agg(transacted_amount=("transacted_amount","sum"),
+              count=("symbol","count"))
+         .reset_index())
+    if total_amt and not np.isnan(total_amt):
+        s["share_pct"] = (s["transacted_amount"] / total_amt) * 100.0
+        i["share_pct"] = (i["transacted_amount"] / total_amt) * 100.0
+    else:
+        s["share_pct"] = np.nan
+        i["share_pct"] = np.nan
+    s = s.sort_values("transacted_amount", ascending=False).head(10)
+    i = i.sort_values("transacted_amount", ascending=False).head(10)
+    return s, i
+
+def label_sentiment(vix_last: float, hyg_lqd_chg_pct: float) -> str:
+    """Simple blended label: VIX regime + HYG/LQD change."""
+    if np.isnan(vix_last):
+        return "Tone: Unknown (no VIX)"
+    if vix_last < 13:
+        band = "Complacent"
+    elif vix_last < 20:
+        band = "Neutral"
+    elif vix_last < 30:
+        band = "Cautious"
+    else:
+        band = "Fear/Panic"
+    if not np.isnan(hyg_lqd_chg_pct):
+        tilt = "risk-on" if hyg_lqd_chg_pct > 0 else "risk-off" if hyg_lqd_chg_pct < 0 else "flat"
+        return f"Tone: {band} / {tilt}"
+    return f"Tone: {band}"
 
 # =========================
 # Streamlit UI
 # =========================
 st.set_page_config(page_title="US Universe Builder (Top 500 by 1h $ Amount)", layout="wide")
 st.title("🚀 US Universe — Top 500 by Hourly Transacted Amount (Regular Session)")
-st.caption("Includes ETFs, drops OTC • Price filter $5–$100 • Uses last completed regular 1h bar, even when market is closed.")
+st.caption("Includes ETFs, drops OTC • Price filter $5–$100 • Uses last completed regular 1h bar (ignores pre/post).")
 
 hourly_autorefresh()
 
@@ -385,15 +481,11 @@ with st.spinner("Pulling 1h regular-session bars (last completed bar)…"):
     # Rank and keep Top N
     df_ranked = df_1h.sort_values("transacted_amount", ascending=False).head(TOP_N).reset_index(drop=True)
 
-    # Enrich with sector/industry (cached per symbol)
-    sectors, industries = [], []
-    with st.spinner("Enriching Top symbols with sector & industry (cached)…"):
-        for sym in df_ranked["symbol"]:
-            sec, ind = get_sector_industry(sym)
-            sectors.append(sec)
-            industries.append(ind)
-    df_ranked["sector"] = sectors
-    df_ranked["industry"] = industries
+# =========================
+# Enrich with sector/industry (batched + cached)
+# =========================
+with st.spinner("Enriching Top symbols with sector & industry (cached)…"):
+    df_ranked = enrich_sector_industry_batched(df_ranked)
 
 # =========================
 # Prepare Universe output
@@ -411,21 +503,22 @@ universe_out = pd.DataFrame({
 })
 
 # =========================
-# Context snapshot (sentiment + rotation)
+# Context snapshot (sentiment + rotation, improved)
 # =========================
 with st.spinner("Building Context snapshot (VIX, HYG/LQD, Gold, rotation)…"):
     vix_last, vix_ch = _last_and_change_1h(VIX)
-    hyg_last, _ = _last_and_change_1h(HYG)
-    lqd_last, _ = _last_and_change_1h(LQD)
-    ratio = float("nan")
-    if isinstance(hyg_last, float) and isinstance(lqd_last, float) and (lqd_last not in (0.0, np.nan)):
-        ratio = hyg_last / lqd_last
-    gold_last, gold_ch = _last_and_change_1h(GOLD)
+    ratio_last, ratio_ch = hyg_lqd_ratio_change_1h()
+    gold_src, gold_last, gold_ch = _gold_with_fallback()
 
-    top_sectors, top_industries = build_rotation_tables(
+    # Rotation: sums by sector/industry using transacted_amount from df_ranked
+    rot_sect, rot_ind = build_rotation_tables(
         df_ranked[["symbol","transacted_amount","sector","industry"]]
     )
 
+    # Sentiment label
+    tone = label_sentiment(vix_last, ratio_ch)
+
+    # Flat key-value context
     context_rows = []
     ts_utc = utcnow().strftime("%Y-%m-%d %H:%M:%S")
     context_rows.append(["timestamp_utc", ts_utc])
@@ -435,19 +528,25 @@ with st.spinner("Building Context snapshot (VIX, HYG/LQD, Gold, rotation)…"):
     context_rows.append(["VIX_last", round(vix_last, 4) if pd.notna(vix_last) else ""])
     context_rows.append(["VIX_1h_change_pct", round(vix_ch, 4) if pd.notna(vix_ch) else ""])
 
-    context_rows.append(["HYG_last", round(hyg_last, 4) if pd.notna(hyg_last) else ""])
-    context_rows.append(["LQD_last", round(lqd_last, 4) if pd.notna(lqd_last) else ""])
-    context_rows.append(["HYG_LQD_ratio", round(ratio, 6) if pd.notna(ratio) else ""])
+    context_rows.append(["HYG_LQD_ratio_last", round(ratio_last, 6) if pd.notna(ratio_last) else ""])
+    context_rows.append(["HYG_LQD_ratio_1h_change_pct", round(ratio_ch, 4) if pd.notna(ratio_ch) else ""])
 
-    context_rows.append(["Gold_last_XAUUSD=X", round(gold_last, 4) if pd.notna(gold_last) else ""])
+    context_rows.append([f"Gold_last_{gold_src}", round(gold_last, 4) if pd.notna(gold_last) else ""])
     context_rows.append(["Gold_1h_change_pct", round(gold_ch, 4) if pd.notna(gold_ch) else ""])
 
-    for i, row in enumerate(top_sectors.itertuples(index=False), start=1):
-        context_rows.append([f"TopSector{i}_name", row.sector if pd.notna(row.sector) else ""])
-        context_rows.append([f"TopSector{i}_shareAmt", round(float(row.transacted_amount), 2)])
-    for i, row in enumerate(top_industries.itertuples(index=False), start=1):
-        context_rows.append([f"TopIndustry{i}_name", row.industry if pd.notna(row.industry) else ""])
-        context_rows.append([f"TopIndustry{i}_shareAmt", round(float(row.transacted_amount), 2)])
+    context_rows.append(["Sentiment", tone])
+
+    # Flatten top sectors/industries (by transacted amount) with share % and counts
+    for i, row in enumerate(rot_sect.itertuples(index=False), start=1):
+        name = row.sector if pd.notna(row.sector) else ""
+        context_rows.append([f"TopSector{i}_name", name])
+        context_rows.append([f"TopSector{i}_share_pct", round(float(row.share_pct), 2) if pd.notna(row.share_pct) else ""])
+        context_rows.append([f"TopSector{i}_count", int(row.count)])
+    for i, row in enumerate(rot_ind.itertuples(index=False), start=1):
+        name = row.industry if pd.notna(row.industry) else ""
+        context_rows.append([f"TopIndustry{i}_name", name])
+        context_rows.append([f"TopIndustry{i}_share_pct", round(float(row.share_pct), 2) if pd.notna(row.share_pct) else ""])
+        context_rows.append([f"TopIndustry{i}_count", int(row.count)])
 
     context_out = pd.DataFrame(context_rows, columns=["metric","value"])
 
