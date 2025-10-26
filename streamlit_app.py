@@ -1,12 +1,19 @@
-# streamlit_app.py — Stage A Universe Builder (Yahoo) + Hourly Up-Bias • Auto Sheet Overwrite
-# - Daily ADV + trend filter (Top 1000, $5–$1000) -> overwrite "Universe" once/day after close
-# - Hourly light 1h up-bias check on the Top 1000 (regular session only, no pre/post)
-# - Writes a timestamped summary to "Scanned Result" every run
-# - Designed to be the *feeder* for Stage B screener (separate app)
+# streamlit_app.py — US Universe Builder (Top 500 by hourly transacted amount) + Sector/Industry + Context
+# - Full US listings from NASDAQ Trader (include ETFs, drop OTC)
+# - 1h regular-session bars (no pre/post), last completed bar even if market closed
+# - Price filter $5–$100; rank by (close * volume); Top 500
+# - Universe sheet columns: date, time, ticker, price, volume, type, sector, industry (overwrite each run)
+# - Context sheet: VIX, HYG/LQD, XAUUSD=X (gold), and rotation (top sectors/industries by count & transacted amount)
+# - Dashboard clocks: US ET & Malaysia (MYT), bar timestamp used
+# - Auto-refresh hourly (best effort) and safe to run 24/7
 
 import os
-import time
+import io
 import json
+import time
+import math
+import pytz
+import requests
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Tuple
 
@@ -17,344 +24,424 @@ import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Optional hourly auto-refresh (won't crash if package not installed)
+# Optional hourly auto-refresh
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
     st_autorefresh = None
 
-# =========================
+# =================================
 # Config
-# =========================
+# =================================
 GOOGLE_SHEET_ID = "1zg3_-xhLi9KCetsA1KV0Zs7IRVIcwzWJ_s15CT2_eA4"
-UNIVERSE_SHEET_NAME = "Universe"
-RESULT_SHEET_NAME = "Scanned Result"
+UNIVERSE_SHEET = "Universe"
+CONTEXT_SHEET = "Context"
 
-# Universe build targets
+TOP_N = 500
 PRICE_MIN = 5.0
-PRICE_MAX = 1000.0
-TOP_N = 1000
+PRICE_MAX = 100.0
 
-# Timing: US equities (NYSE/Nasdaq) — close at 16:00 ET
-US_EASTERN_OFFSET = -4  # EDT ~ -4; (Cloud will handle DST imperfectly; we only need "post-close" buffer)
-DAILY_REBUILD_BUFFER_MIN = 15   # run daily rebuild ~15 minutes after close
-HOURLY_REFRESH_MINUTE_OFFSET = 5  # refresh at HH:05-ish to ensure bar finalized
+# Refresh minute target (run around HH:25 to ensure last 1h bar is finalized)
+TARGET_MINUTE = 25
 
-REGULAR_SESSION_PREPOST = False  # ignore pre/post for swing
+# Tickers for context panel
+VIX = "^VIX"
+HYG = "HYG"
+LQD = "LQD"
+GOLD = "XAUUSD=X"  # you asked for XAUUSD=X
 
-# =========================
-# Utilities
-# =========================
+# Timezones
+TZ_ET = pytz.timezone("America/New_York")
+TZ_MYT = pytz.timezone("Asia/Kuala_Lumpur")
+
+# =================================
+# Helpers: time & UI
+# =================================
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
-def utcnow_iso() -> str:
-    return utcnow().strftime("%Y-%m-%d %H:%M:%S %Z")
+def fmt_utc(ts: pd.Timestamp | datetime) -> Tuple[str, str]:
+    if isinstance(ts, pd.Timestamp):
+        ts = ts.to_pydatetime().replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.tz_convert("UTC").to_pydatetime()
+    d = ts.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    t = ts.astimezone(timezone.utc).strftime("%H:%M:%S")
+    return d, t
 
-def _local_us_et_now() -> datetime:
-    # Simple offset; OK for "post-close buffer" logic. (For precise DST, use pytz/zoneinfo if desired.)
-    return datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(hours=US_EASTERN_OFFSET)
+def et_now_str() -> str:
+    return datetime.now(TZ_ET).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# =========================
-# Google Sheets helpers
-# =========================
-def _get_gspread_client():
+def myt_now_str() -> str:
+    return datetime.now(TZ_MYT).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+def hourly_autorefresh():
+    if st_autorefresh:
+        st_autorefresh(interval=60*60*1000, key="hourly-refresh")
+    st.caption("⏱️ Auto-run hourly. Target: ~HH:{:02d} (regular-session 1h bar finalized).".format(TARGET_MINUTE))
+
+# =================================
+# Google Sheets auth
+# =================================
+def _get_gspread():
     raw = st.secrets.get("gcp_service_account")
     if not raw:
         raise RuntimeError("Missing [gcp_service_account] in secrets.")
-    info = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    if isinstance(raw, str):
+        info = json.loads(raw)
+    else:
+        info = dict(raw)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    credentials = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(credentials)
-
-@st.cache_data(show_spinner=False)
-def read_sheet_columnwise(sheet_id: str, tab_name: str) -> List[str]:
-    gc = _get_gspread_client()
-    ws = gc.open_by_key(sheet_id).worksheet(tab_name)
-    values = ws.get_all_values()
-    out = []
-    for row in values:
-        for cell in row:
-            s = (cell or "").strip().upper()
-            if s and all(ch.isalnum() or ch in (".","-","_") for ch in s):
-                out.append(s)
-    # dedupe preserving order
-    seen, uniq = set(), []
-    for t in out:
-        if t not in seen:
-            uniq.append(t); seen.add(t)
-    return uniq
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
 
 def write_sheet_overwrite(sheet_id: str, tab_name: str, df: pd.DataFrame):
-    gc = _get_gspread_client()
+    gc = _get_gspread()
     sh = gc.open_by_key(sheet_id)
     try:
         ws = sh.worksheet(tab_name)
         ws.clear()
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab_name, rows=str(max(len(df)+10, 1000)), cols=str(max(len(df.columns)+5, 10)))
-    vals = [list(df.columns)] + df.astype(object).where(pd.notnull(df), "").values.tolist()
-    ws.update("A1", vals, value_input_option="RAW")
+        ws = sh.add_worksheet(title=tab_name, rows=str(max(len(df)+10, 1000)),
+                              cols=str(max(len(df.columns)+5, 8)))
+    values = [list(df.columns)] + df.astype(object).where(pd.notnull(df), "").values.tolist()
+    ws.update("A1", values, value_input_option="RAW")
 
-def append_or_overwrite_results(sheet_id: str, tab_name: str, df: pd.DataFrame):
-    # overwrite with current run (keeps it simple + deterministic)
-    write_sheet_overwrite(sheet_id, tab_name, df)
+# =================================
+# Symbol universe (NASDAQ Trader)
+# =================================
+NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+OTHER_URL  = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 
-# =========================
-# Yahoo helpers
-# =========================
+@st.cache_data(show_spinner=True, ttl=24*60*60)
+def fetch_symbol_directory() -> pd.DataFrame:
+    """
+    Returns DataFrame with columns: symbol, exchange, is_etf (bool), is_test (bool), is_otc (bool)
+    Includes NASDAQ + NYSE/NYSE American/ARCA (excludes OTC).
+    """
+    def load_pipe_txt(url: str) -> pd.DataFrame:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        # Files are pipe-delimited with a footer line "File Creation Time..."
+        raw = r.text.strip().splitlines()
+        # Keep header row; drop last footer line if startswith 'File Creation Time'
+        if raw and raw[-1].lower().startswith("file creation time"):
+            raw = raw[:-1]
+        buf = io.StringIO("\n".join(raw))
+        df = pd.read_csv(buf, sep="|")
+        return df
+
+    nas = load_pipe_txt(NASDAQ_URL)
+    oth = load_pipe_txt(OTHER_URL)
+
+    # Normalize columns
+    # NASDAQ file has: Symbol, Security Name, Market Category, Test Issue (Y/N), Financial Status, ETF (Y/N), Round Lot Size, ...
+    nas = nas.rename(columns=str.strip)
+    nas_symbols = nas[~nas["Test Issue"].eq("Y")].copy()
+    nas_symbols["symbol"] = nas_symbols["Symbol"].str.upper().str.strip()
+    nas_symbols["exchange"] = "NASDAQ"
+    nas_symbols["is_etf"] = nas_symbols["ETF"].eq("Y")
+    nas_symbols["is_test"] = nas["Test Issue"].eq("Y")
+    nas_symbols["is_otc"] = False
+
+    # OTHER file has: ACT Symbol, Security Name, Exchange, CQS Symbol, ETF, Round Lot Size, Test Issue, NASDAQ Symbol
+    oth = oth.rename(columns=str.strip)
+    oth_symbols = oth[~oth["Test Issue"].eq("Y")].copy()
+    oth_symbols["symbol"] = oth_symbols["ACT Symbol"].str.upper().str.strip()
+    oth_symbols["exchange"] = oth_symbols["Exchange"].str.upper().str.strip()
+    oth_symbols["is_etf"] = oth_symbols["ETF"].eq("Y")
+    oth_symbols["is_test"] = oth_symbols["Test Issue"].eq("Y")
+    # Mark OTC if exchange says OTC, otherwise False
+    oth_symbols["is_otc"] = oth_symbols["exchange"].str.contains("OTC", na=False)
+
+    # Combine and drop OTC
+    df = pd.concat([
+        nas_symbols[["symbol","exchange","is_etf","is_test","is_otc"]],
+        oth_symbols[["symbol","exchange","is_etf","is_test","is_otc"]],
+    ], ignore_index=True)
+
+    # Deduplicate: keep first occurrence (usually primary)
+    df = df.drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
+
+    # Drop OTC and obvious non-primaries
+    df = df[(~df["is_otc"]) & (~df["is_test"])].reset_index(drop=True)
+    return df
+
+# =================================
+# Market data (Yahoo Finance)
+# =================================
 def _chunks(lst: List[str], n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
 @st.cache_data(show_spinner=True)
-def yf_download_daily(tickers: List[str], period: str = "1y") -> Dict[str, pd.DataFrame]:
-    """
-    Download daily bars in batches (auto_adjust = True).
-    Returns symbol -> DataFrame columns: Open, High, Low, Close, Volume (lower-case renamed).
-    """
-    out: Dict[str, pd.DataFrame] = {}
-    if not tickers:
-        return out
+def yf_daily_last_close(tickers: List[str]) -> pd.DataFrame:
+    """Get last valid daily close for a large list quickly (filters price window fast)."""
+    out = []
     for batch in _chunks(tickers, 150):
-        data = yf.download(" ".join(batch), interval="1d", period=period, group_by="ticker",
-                           auto_adjust=True, threads=True, progress=False, prepost=False)
+        data = yf.download(" ".join(batch), interval="1d", period="5d",
+                           group_by="ticker", auto_adjust=True, threads=True,
+                           progress=False, prepost=False)
         if isinstance(data.columns, pd.MultiIndex):
             for sym in batch:
                 if sym in data.columns.get_level_values(0):
                     df = data[sym].rename(columns=str.lower)
-                    if not df.empty:
-                        out[sym] = df[["open","high","low","close","volume"]].dropna()
+                    if not df.empty and "close" in df:
+                        last = float(df["close"].dropna().iloc[-1])
+                        out.append((sym, last))
         else:
             df = data.rename(columns=str.lower)
-            if not df.empty:
-                out[batch[0]] = df[["open","high","low","close","volume"]].dropna()
+            if not df.empty and "close" in df:
+                last = float(df["close"].dropna().iloc[-1])
+                out.append((batch[0], last))
         time.sleep(0.03)
-    return out
+    return pd.DataFrame(out, columns=["symbol","daily_last_close"])
 
 @st.cache_data(show_spinner=True)
-def yf_download_1h_light(tickers: List[str], period: str = "30d") -> Dict[str, pd.DataFrame]:
+def yf_1h_last_bar(tickers: List[str]) -> Tuple[pd.DataFrame, pd.Timestamp]:
     """
-    Download 1h bars for a shortlist (Top 1000). Regular session only (prepost=False).
-    Returns symbol -> DataFrame (open, high, low, close, volume).
+    Fetch 1h regular-session bars for a shortlist and return:
+    - DataFrame with columns [symbol, close, volume] for the last completed bar
+    - The last-bar timestamp (UTC) we used (from the data)
     """
-    out: Dict[str, pd.DataFrame] = {}
-    if not tickers:
-        return out
+    rows = []
+    last_ts = None
     for batch in _chunks(tickers, 80):
-        data = yf.download(" ".join(batch), interval="1h", period=period, group_by="ticker",
-                           auto_adjust=True, threads=True, progress=False, prepost=REGULAR_SESSION_PREPOST)
+        data = yf.download(" ".join(batch), interval="1h", period="7d",
+                           group_by="ticker", auto_adjust=True, threads=True,
+                           progress=False, prepost=False)
+        # Determine per-batch last completed timestamp
+        def get_last_ts(dfidx):
+            if isinstance(dfidx, pd.DatetimeIndex) and len(dfidx) > 0:
+                return dfidx.tz_localize("UTC") if dfidx.tz is None else dfidx.tz_convert("UTC")
+            return None
+
+        batch_ts = None
         if isinstance(data.columns, pd.MultiIndex):
+            # Multi-ticker
             for sym in batch:
                 if sym in data.columns.get_level_values(0):
                     df = data[sym].rename(columns=str.lower)
-                    if not df.empty:
-                        out[sym] = df[["open","high","low","close","volume"]].dropna()
+                    df = df[["close","volume"]].dropna()
+                    if df.empty: 
+                        continue
+                    # Last row is last completed regular 1h bar
+                    ts = df.index
+                    batch_ts = get_last_ts(ts)
+                    last_row = df.iloc[-1]
+                    rows.append((sym, float(last_row["close"]), float(last_row["volume"])))
         else:
+            # Single-ticker scenario fallback
             df = data.rename(columns=str.lower)
+            df = df[["close","volume"]].dropna()
             if not df.empty:
-                out[batch[0]] = df[["open","high","low","close","volume"]].dropna()
+                ts = df.index
+                batch_ts = get_last_ts(ts)
+                rows.append((batch[0], float(df.iloc[-1]["close"]), float(df.iloc[-1]["volume"])))
+        if batch_ts is not None and len(batch_ts) > 0:
+            last_ts = batch_ts[-1]
         time.sleep(0.05)
-    return out
+    df = pd.DataFrame(rows, columns=["symbol","close","volume"])
+    return df, (pd.Timestamp(last_ts) if last_ts is not None else None)
 
-# =========================
-# Stage A: Daily universe build
-# =========================
-def sma(series: pd.Series, n: int) -> pd.Series:
-    return series.rolling(n, min_periods=n).mean()
-
-def build_universe_daily(seed_tickers: List[str]) -> pd.DataFrame:
+@st.cache_data(show_spinner=True, ttl=24*60*60)
+def get_sector_industry(symbol: str) -> Tuple[str, str]:
     """
-    Build liquid up-trend universe on DAILY data.
-    - price in [PRICE_MIN, PRICE_MAX]
-    - rank by ADV (close*volume)
-    - up-trend: close>SMA200, SMA50>SMA200, SMA50 slope > 0 (last 5 vs prior 5)
-    Returns DataFrame with columns: symbol, last_close, adv, sma50, sma200, sma50_slope_pos, kept, rank
+    Lightweight sector/industry lookup for a single symbol (cached).
+    Uses yfinance.get_info (may occasionally be slow/None); failures return empty strings.
     """
-    daily = yf_download_daily(seed_tickers, period="1y")
-    rows = []
-    for sym, df in daily.items():
-        if df.empty or "close" not in df or "volume" not in df:
-            continue
-        c = df["close"]; v = df["volume"]
-        last_close = float(c.iloc[-1])
-        if not (PRICE_MIN <= last_close <= PRICE_MAX):
-            continue
-        adv = float((c * v).mean())
-        s50 = sma(c, 50)
-        s200 = sma(c, 200)
-        if pd.isna(s200.iloc[-1]) or pd.isna(s50.iloc[-1]):
-            continue
-        up_trend = (last_close > s200.iloc[-1]) and (s50.iloc[-1] > s200.iloc[-1])
+    try:
+        info = yf.Ticker(symbol).get_info()
+        sector = info.get("sector") or ""
+        industry = info.get("industry") or ""
+        return str(sector), str(industry)
+    except Exception:
+        return "", ""
 
-        # simple slope over last ~5 trading days vs prior 5
-        if len(s50.dropna()) >= 15:
-            recent = s50.tail(5).mean()
-            prev = s50.tail(10).head(5).mean()
-            slope_pos = bool(recent > prev)
-        else:
-            slope_pos = False
-
-        kept = bool(up_trend and slope_pos)
-        rows.append({
-            "symbol": sym,
-            "last_close": last_close,
-            "adv": adv,
-            "sma50": float(s50.iloc[-1]),
-            "sma200": float(s200.iloc[-1]),
-            "sma50_slope_pos": slope_pos,
-            "kept": kept
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    # Keep only "kept", then rank by ADV and cap to TOP_N
-    df = df[df["kept"]].copy()
-    if df.empty:
-        return df
-    df = df.sort_values("adv", ascending=False).reset_index(drop=True)
-    df["rank"] = np.arange(1, len(df)+1)
-    df = df.head(TOP_N)
-    return df[["symbol","last_close","adv","sma50","sma200","sma50_slope_pos","rank"]]
-
-# =========================
-# Stage A-light: Hourly up-bias (cheap)
-# =========================
-def compute_hourly_bias(df_1h: pd.DataFrame) -> float:
+# =================================
+# Context metrics
+# =================================
+def _last_and_change_1h(ticker: str) -> Tuple[float, float]:
     """
-    Return a small bias score [0..1] from 1h bars:
-    - recent momentum: close > SMA20 > SMA50 (uses last 50 bars)
-    - optional bonus if last close > previous close
+    Return (last_close, 1h_change_pct). Uses last two 1h bars (regular).
     """
-    if df_1h is None or df_1h.empty or len(df_1h) < 50:
-        return 0.0
-    close = df_1h["close"]
-    sma20 = close.rolling(20).mean()
-    sma50 = close.rolling(50).mean()
-    last = close.iloc[-1]
-    prev = close.iloc[-2]
-    cond_trend = (last > sma20.iloc[-1] > sma50.iloc[-1])
-    bonus = 0.2 if (last > prev) else 0.0
-    return float((1.0 if cond_trend else 0.0) + bonus)
+    df = yf.download(ticker, interval="1h", period="7d", auto_adjust=True, progress=False, prepost=False)
+    if df.empty or "Close" not in df.columns:
+        return float("nan"), float("nan")
+    c = df["Close"].dropna()
+    if len(c) < 2:
+        return float(c.iloc[-1]) if len(c) else float("nan"), float("nan")
+    last = float(c.iloc[-1])
+    prev = float(c.iloc[-2])
+    chg = (last - prev) / prev * 100.0 if prev != 0 else float("nan")
+    return last, chg
 
-def attach_hourly_bias(top_symbols: List[str]) -> pd.DataFrame:
-    if not top_symbols:
-        return pd.DataFrame(columns=["symbol","hourly_bias"])
-    bars = yf_download_1h_light(top_symbols, period="30d")
-    rows = []
-    for sym in top_symbols:
-        df = bars.get(sym)
-        score = compute_hourly_bias(df) if df is not None else 0.0
-        rows.append({"symbol": sym, "hourly_bias": round(score, 3)})
-    return pd.DataFrame(rows)
+def build_rotation_tables(universe_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    From the Top-500 universe with sector/industry and transacted amount,
+    compute Top sectors/industries by total transacted amount.
+    """
+    if universe_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    agg = universe_df.groupby("sector", dropna=False)["transacted_amount"].sum().reset_index()
+    agg = agg.sort_values("transacted_amount", ascending=False)
+    agg_ind = universe_df.groupby("industry", dropna=False)["transacted_amount"].sum().reset_index()
+    agg_ind = agg_ind.sort_values("transacted_amount", ascending=False)
+    # Keep top 10 for context display
+    return agg.head(10), agg_ind.head(10)
 
-# =========================
-# Auto-refresh logic
-# =========================
-def hourly_autorefresh():
-    # Try to refresh every hour at ~HH:05
-    if st_autorefresh:
-        st_autorefresh(interval=60*60*1000, key="hourly-refresh")
-    # Else: best-effort banner showing the intended cadence
-    st.caption("⏱️ Auto-refresh cadence: hourly (~HH:05) — if not auto, click 'Rerun'.")
-
-def should_rebuild_daily_now() -> bool:
-    et_now = _local_us_et_now()
-    # After US close + buffer OR first run of the day
-    closed_buffer = et_now.hour > 16 or (et_now.hour == 16 and et_now.minute >= DAILY_REBUILD_BUFFER_MIN)
-    last_day = st.session_state.get("last_daily_rebuild_day")
-    today = et_now.date()
-    if last_day != today and closed_buffer:
-        return True
-    # Also, on very first run (nothing built yet)
-    if last_day is None:
-        return True
-    return False
-
-def mark_daily_rebuilt():
-    et_now = _local_us_et_now()
-    st.session_state["last_daily_rebuild_day"] = et_now.date()
-
-# =========================
+# =================================
 # Streamlit UI
-# =========================
-st.set_page_config(page_title="Stage A — Universe Builder (Yahoo)", layout="wide")
-st.title("📈 Stage A — Yahoo Universe Builder (Top 1000, Up-Trend) + Hourly Up-Bias")
-st.caption("Daily: build/overwrite 'Universe' (Top 1000 by ADV, $5–$1000, up-trend). Hourly: add a light 1h bias score (no pre/post).")
+# =================================
+st.set_page_config(page_title="US Universe Builder (Top 500 by 1h $ Amount)", layout="wide")
+st.title("🚀 US Universe — Top 500 by Hourly Transacted Amount (Regular Session)")
+st.caption("Includes ETFs, drops OTC. Price filter $5–$100. Uses last completed regular 1h bar even when market is closed.")
 
 hourly_autorefresh()
 
-with st.expander("Info & Criteria", expanded=True):
-    st.markdown("""
-**Universe Build (Daily, once per day after close)**
-- Price filter: **$5 to $1000**
-- Liquidity: **Top 1000 by ADV** (mean of **Close × Volume** over ~1 year daily)
-- Up-trend (daily): **Close > SMA200**, **SMA50 > SMA200**, **SMA50 rising** (recent 5d vs prior 5d)
-- Writes back to Google Sheet: **Universe** (auto-overwrite)
+# Clocks
+col_a, col_b, col_c = st.columns(3)
+with col_a:
+    st.metric("US Eastern", et_now_str())
+with col_b:
+    st.metric("Malaysia (MYT)", myt_now_str())
+with col_c:
+    st.caption("Bar timestamp and run details shown below.")
 
-**Hourly Up-Bias (light)**
-- 1h (regular session only): **Close > SMA20 > SMA50**, +0.2 bonus if last close > previous close
-- Writes a timestamped summary to **Scanned Result**
-    """)
+# =================================
+# Build the symbol universe (listings)
+# =================================
+with st.spinner("Fetching US listings (NASDAQ/NYSE/NYSE American)…"):
+    listings = fetch_symbol_directory()
+    # Keep everything except OTC/test; ETF flag is in is_etf
+    tickers_all = listings["symbol"].tolist()
+    st.caption(f"Listings loaded: {len(tickers_all)} symbols (incl. ETFs, excl. OTC/Test).")
 
-# Load seed tickers (initial run or if Universe is currently empty)
-try:
-    seed = read_sheet_columnwise(GOOGLE_SHEET_ID, UNIVERSE_SHEET_NAME)
-except Exception as e:
-    st.error(f"Failed to read 'Universe' sheet: {e}")
-    seed = []
+# =================================
+# Stage: Filter by daily price first (fast), then pull 1h for those in range
+# =================================
+with st.spinner("Fast price filter on daily bars…"):
+    df_daily = yf_daily_last_close(tickers_all)
+    if df_daily.empty:
+        st.error("Failed to retrieve daily prices; cannot proceed.")
+        st.stop()
+    df_daily = df_daily[(df_daily["daily_last_close"] >= PRICE_MIN) & (df_daily["daily_last_close"] <= PRICE_MAX)]
+    symbols_price_ok = df_daily["symbol"].tolist()
+    st.caption(f"Symbols within ${PRICE_MIN}-{PRICE_MAX} by last daily close: {len(symbols_price_ok)}")
 
-# Decide daily rebuild
-if should_rebuild_daily_now():
-    if not seed:
-        st.warning("Universe sheet empty; please add a broad US list (e.g., your maintained symbols).")
-    else:
-        with st.spinner("Building daily universe (Top 1000 by ADV + up-trend)…"):
-            df_uni = build_universe_daily(seed)
-        if df_uni.empty:
-            st.error("Daily universe build produced no symbols. (Seed may be too narrow or filters too strict.)")
-        else:
-            # Overwrite Universe
-            write_sheet_overwrite(GOOGLE_SHEET_ID, UNIVERSE_SHEET_NAME, df_uni[["symbol","last_close","adv","sma50","sma200","sma50_slope_pos","rank"]])
-            mark_daily_rebuilt()
-            st.success(f"Universe overwritten with {len(df_uni)} symbols at {utcnow_iso()}.")
+# =================================
+# 1h bars for price-eligible shortlist
+# =================================
+with st.spinner("Pulling 1h regular-session bars (last completed bar)…"):
+    df_1h, last_bar_ts = yf_1h_last_bar(symbols_price_ok)
+    if df_1h.empty or last_bar_ts is None:
+        st.error("No 1h bars available. Market likely closed for an extended period or data source unavailable.")
+        st.stop()
+    # Compute transacted amount, then rank
+    df_1h["transacted_amount"] = df_1h["close"] * df_1h["volume"]
+    # Merge ETF flag
+    etf_map = dict(zip(listings["symbol"], listings["is_etf"]))
+    exch_map = dict(zip(listings["symbol"], listings["exchange"]))
+    df_1h["is_etf"] = df_1h["symbol"].map(etf_map).fillna(False)
+    df_1h["type"] = np.where(df_1h["is_etf"], "etf", "stock")
+    df_1h["exchange"] = df_1h["symbol"].map(exch_map)
 
-# Use current Universe (post-rebuild or existing)
-try:
-    universe_now = read_sheet_columnwise(GOOGLE_SHEET_ID, UNIVERSE_SHEET_NAME)
-except Exception as e:
-    st.error(f"Failed to read 'Universe' sheet after rebuild: {e}")
-    universe_now = []
+    # Rank and keep Top N
+    df_ranked = df_1h.sort_values("transacted_amount", ascending=False).head(TOP_N).reset_index(drop=True)
 
-# Limit to TOP_N if sheet contains more
-universe_now = universe_now[:TOP_N]
+    # Sector/industry only for finalists (cached per symbol)
+    sectors, industries = [], []
+    with st.spinner("Enriching Top symbols with sector & industry (cached)…"):
+        for sym in df_ranked["symbol"]:
+            sec, ind = get_sector_industry(sym)
+            sectors.append(sec)
+            industries.append(ind)
+    df_ranked["sector"] = sectors
+    df_ranked["industry"] = industries
 
-# Hourly up-bias summary (only if we have symbols)
-summary_rows = []
-if universe_now:
-    with st.spinner(f"Fetching 1h (regular session) for {len(universe_now)} symbols to compute light up-bias…"):
-        df_bias = attach_hourly_bias(universe_now)
-    # Merge (some rows might be missing if yfinance returns nothing for a symbol)
-    out = pd.DataFrame({"symbol": universe_now})
-    out = out.merge(df_bias, on="symbol", how="left").fillna({"hourly_bias": 0.0})
-    out["timestamp_utc"] = utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    out = out[["timestamp_utc","symbol","hourly_bias"]]
-    st.subheader("Hourly Up-Bias (light) on Current Universe")
-    st.dataframe(out.head(200), use_container_width=True)
+# =================================
+# Prepare Universe output format
+# =================================
+bar_date, bar_time = fmt_utc(last_bar_ts)
+universe_out = pd.DataFrame({
+    "date": [bar_date]*len(df_ranked),
+    "time": [bar_time]*len(df_ranked),
+    "ticker": df_ranked["symbol"],
+    "price": np.round(df_ranked["close"].astype(float), 4),
+    "volume": df_ranked["volume"].astype(np.int64, errors="ignore"),
+    "type": df_ranked["type"],
+    "sector": df_ranked["sector"],
+    "industry": df_ranked["industry"],
+})
 
-    # Write summary to Scanned Result (overwrite with latest snapshot)
+# =================================
+# Context snapshot (sentiment + rotation)
+# =================================
+with st.spinner("Building Context snapshot (VIX, HYG/LQD, Gold, rotation)…"):
+    vix_last, vix_ch = _last_and_change_1h(VIX)
+    hyg_last, _ = _last_and_change_1h(HYG)
+    lqd_last, _ = _last_and_change_1h(LQD)
+    ratio = (hyg_last / lqd_last) if (isinstance(hyg_last, float) and isinstance(lqd_last, float) and lqd_last not in (0.0, np.nan)) else float("nan")
+    # compute 1h change for ratio via small helper: pull both then diff; we approximated above (ok for snapshot)
+    gold_last, gold_ch = _last_and_change_1h(GOLD)
+
+    # Rotation: sums by sector/industry using transacted_amount from df_ranked
+    top_sectors, top_industries = build_rotation_tables(df_ranked[["symbol","transacted_amount","sector","industry"]])
+
+    # Context table (flat)
+    context_rows = []
+    ts_utc = utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    context_rows.append(["timestamp_utc", ts_utc])
+    context_rows.append(["bar_date_utc", bar_date])
+    context_rows.append(["bar_time_utc", bar_time])
+
+    context_rows.append(["VIX_last", round(vix_last, 4) if pd.notna(vix_last) else ""])
+    context_rows.append(["VIX_1h_change_pct", round(vix_ch, 4) if pd.notna(vix_ch) else ""])
+
+    context_rows.append(["HYG_last", round(hyg_last, 4) if pd.notna(hyg_last) else ""])
+    context_rows.append(["LQD_last", round(lqd_last, 4) if pd.notna(lqd_last) else ""])
+    context_rows.append(["HYG_LQD_ratio", round(ratio, 6) if pd.notna(ratio) else ""])
+
+    context_rows.append(["Gold_last_XAUUSD=X", round(gold_last, 4) if pd.notna(gold_last) else ""])
+    context_rows.append(["Gold_1h_change_pct", round(gold_ch, 4) if pd.notna(gold_ch) else ""])
+
+    # Flatten top sectors/industries (by transacted amount)
+    for i, row in enumerate(top_sectors.itertuples(index=False), start=1):
+        context_rows.append([f"TopSector{i}_name", row.sector if pd.notna(row.sector) else ""])
+        context_rows.append([f"TopSector{i}_shareAmt", round(float(row.transacted_amount), 2)])
+    for i, row in enumerate(top_industries.itertuples(index=False), start=1):
+        context_rows.append([f"TopIndustry{i}_name", row.industry if pd.notna(row.industry) else ""])
+        context_rows.append([f"TopIndustry{i}_shareAmt", round(float(row.transacted_amount), 2)])
+
+    context_out = pd.DataFrame(context_rows, columns=["metric","value"])
+
+# =================================
+# Write to Google Sheets (overwrite each run)
+# =================================
+col1, col2 = st.columns(2)
+with col1:
+    st.subheader("Universe — Top 500 by Hourly Transacted Amount")
+    st.caption(f"Bar used (UTC): {bar_date} {bar_time}")
+    st.dataframe(universe_out.head(30), use_container_width=True)
+
+with col2:
+    st.subheader("Context — Sentiment & Rotation (snapshot)")
+    st.dataframe(context_out, use_container_width=True)
+
+with st.spinner("Writing Universe to Google Sheet (overwrite)…"):
     try:
-        append_or_overwrite_results(GOOGLE_SHEET_ID, RESULT_SHEET_NAME, out)
-        st.success(f"Snapshot written to '{RESULT_SHEET_NAME}' at {utcnow_iso()}.")
+        write_sheet_overwrite(GOOGLE_SHEET_ID, UNIVERSE_SHEET, universe_out)
+        st.success(f"Universe overwritten ({len(universe_out)} rows).")
     except Exception as e:
-        st.error(f"Failed to write 'Scanned Result': {e}")
-else:
-    st.info("No symbols found in 'Universe'. Add seed tickers first, or wait for the next daily rebuild.")
+        st.error(f"Failed to write Universe: {e}")
+
+with st.spinner("Writing Context to Google Sheet (overwrite)…"):
+    try:
+        write_sheet_overwrite(GOOGLE_SHEET_ID, CONTEXT_SHEET, context_out)
+        st.success("Context overwritten.")
+    except Exception as e:
+        st.error(f"Failed to write Context: {e}")
 
 st.markdown("---")
-st.caption("Notes: pre/post **ignored** for stability; hourly refresh scheduled ~HH:05. This app feeds Stage B (1h strategy screener).")
+st.caption("Run complete • Last bar (regular 1h) is used even when market is closed • Pre/post ignored for consistency.")
