@@ -2,8 +2,8 @@ streamlit
 streamlit-autorefresh
 pandas
 numpy
-requests
 yfinance
+requests
 gspread
 google-auth
 pytz
